@@ -28,12 +28,6 @@ What can be changed: Pretty much anything else.
 
 TBA
 
-# Why Sokoban?
-
-* Sokoban is PSPACE-complete; it can't be brute-forced and genuinely requires strong reasoning capabilities.
-* Small contamination risk: We generate fresh puzzles, so unlike Go or GSM8k there is little risk the base model has memorized them.
-* Diverse reasoning paths are encouraged, as Puzzles typically permit multiple solutions. Ideal for measuring the model's diversity. 
-
 # How to run
 
 ```bash
@@ -47,6 +41,19 @@ modal run --detach modal_app.py
 ```
 
 The run uses the `sokoban-speedrun` Modal volume (mounted at `/vol`) as its working directory, so push the datasets there once with `modal volume put sokoban-speedrun datasets /datasets`.
+
+# FAQ
+
+## Why Sokoban?
+
+* Sokoban is PSPACE-complete; it can't be brute-forced and genuinely requires strong reasoning capabilities.
+* Small contamination risk: We generate fresh puzzles, so unlike Go or GSM8k there is little risk the base model has memorized them.
+* Diverse reasoning paths are encouraged, as Puzzles typically permit multiple solutions. Ideal for measuring the model's diversity. 
+
+## Why handroll your own asnyc RL stack?
+
+* Using an existing framework might help in the short term, but it comes with a lot of machinery and overhead that isn't needed here. General-purpose frameworks are built to support every RL scenario and layers of abstraction between you and the training loop. 
+* Our (initial) setup is minimal: torchrun launches a handful of data-parallel trainer ranks alongside one vLLM generator on its own GPUs of the same 8×H100 node, and the trainer broadcasts fresh weights to vLLM over NCCL. This makes it small enough to read end to end. 
 
 # Shoutouts 
 
