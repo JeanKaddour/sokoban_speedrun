@@ -1,6 +1,6 @@
 """
 Sokoban Speedrun
-Run it directly (`python run_rl.py ...`), as a module (`python -m run_rl ...`), or under torchrun
+Run it directly (`python speedrun.py ...`), as a module (`python -m speedrun ...`), or under torchrun
 for the multi-trainer data-parallel pipeline. The vLLM child process produces
 rollouts on-policy while a CISPO trainer learns from them:
 - sample several completions per puzzle, reward Sokoban solutions verified by Reasoning Gym
@@ -1334,7 +1334,7 @@ def run_pipeline(
     )
     # The recipe fills one NODE_GPUS-GPU node: torchrun WORLD_SIZE is the trainer count T
     # (1 when launched without torchrun), and the vLLM generators take the rest, M = NODE_GPUS - T.
-    # That makes `torchrun --nproc_per_node=T -m run_rl` the whole launch, no GPU-split flags.
+    # That makes `torchrun --nproc_per_node=T -m speedrun` the whole launch, no GPU-split flags.
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     # world_size == T trainer ranks. Rank 0 (master_process) is the only rank that owns the vLLM
     # child / weight-sync / queues / wandb; ranks 1..T-1 are pure compute workers that only join

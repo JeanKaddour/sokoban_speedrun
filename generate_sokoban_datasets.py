@@ -128,7 +128,7 @@ def write_jsonl(path: Path, entries: list[dict[str, Any]], *, overwrite: bool) -
 
 
 def run_verification(train_output: Path, eval_output: Path) -> None:
-    runner = Path(__file__).resolve().parent / "run_rl.py"
+    runner = Path(__file__).resolve().parent / "speedrun.py"
     command = [
         sys.executable,
         str(runner),
@@ -142,7 +142,7 @@ def run_verification(train_output: Path, eval_output: Path) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Generate fixed Sokoban JSONL datasets for run_rl.py")
+    parser = argparse.ArgumentParser(description="Generate fixed Sokoban JSONL datasets for speedrun.py")
     parser.add_argument("--train-size", type=int, default=500)
     parser.add_argument("--eval-size", type=int, default=500)
     parser.add_argument("--train-seed", type=int, default=42)
@@ -165,7 +165,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--verify",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Run run_rl.py --verify-datasets-only after writing the files",
+        help="Run speedrun.py --verify-datasets-only after writing the files",
     )
     return parser
 

@@ -56,7 +56,7 @@ image = (
         "PIPELINE_NTRAINERS": str(PIPELINE_NTRAINERS),
         "PIPELINE_TOTAL": str(PIPELINE_TOTAL),
     })
-    .add_local_python_source("run_rl")
+    .add_local_python_source("speedrun")
 )
 
 
@@ -81,7 +81,7 @@ def _pipeline_ddp_command(args: list[str], nproc: int) -> list[str]:
     """Build the torchrun command for the multi-trainer pipeline launch.
 
     Launches `nproc` data-parallel trainer ranks via torch.distributed.run (so
-    WORLD_SIZE == nproc), each running `run_rl` in --pipeline mode. Rank 0 spawns
+    WORLD_SIZE == nproc), each running `speedrun` in --pipeline mode. Rank 0 spawns
     the single vLLM child on the remaining GPUs. Kept pure (no side effects) so
     the command shape is unit-testable without a GPU container.
     """
@@ -99,7 +99,7 @@ def _pipeline_ddp_command(args: list[str], nproc: int) -> list[str]:
         "--standalone",
         f"--nproc_per_node={nproc}",
         "-m",
-        "run_rl",
+        "speedrun",
         *_training_args(pipeline_args),
     ]
 
@@ -109,7 +109,7 @@ def _pipeline_command(args: list[str], pipeline_ngpu: int = PIPELINE_NGPU) -> li
 
     `pipeline_ngpu` is the total Modal GPU count: one trainer GPU plus the vLLM
     data-parallel workers. If the caller did not pass --vllm-dp explicitly, make
-    run_rl match the allocation instead of falling back to its larger parser default.
+    speedrun.py match the allocation instead of falling back to its larger parser default.
     """
     if pipeline_ngpu < 2:
         raise ValueError("single-pipeline launch needs at least 2 GPUs (1 trainer + >=1 vLLM)")
@@ -118,7 +118,7 @@ def _pipeline_command(args: list[str], pipeline_ngpu: int = PIPELINE_NGPU) -> li
         pipeline_args = ["--pipeline", *pipeline_args]
     if not _has_option(pipeline_args, "--vllm-dp"):
         pipeline_args.extend(["--vllm-dp", str(pipeline_ngpu - 1)])
-    return [sys.executable, "-m", "run_rl", *_training_args(pipeline_args)]
+    return [sys.executable, "-m", "speedrun", *_training_args(pipeline_args)]
 
 
 def _nvidia_ld_library_path() -> str:
@@ -210,7 +210,7 @@ def main(*arglist: str) -> None:
         should_spawn = True
     ddp_pipeline = False
     if "--ddp" in args:
-        args.remove("--ddp")  # modal-routing flag only; not passed to run_rl
+        args.remove("--ddp")  # modal-routing flag only; not passed to speedrun.py
         ddp_pipeline = True
     # Async/pipeline is the only training mode: --ddp routes to the multi-trainer DDP
     # pipeline (torchrun on T trainer GPUs), otherwise the single-trainer pipeline.

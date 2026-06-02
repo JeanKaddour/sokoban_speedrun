@@ -37,7 +37,7 @@ TBA
 # How to run
 
 ```bash
-torchrun --standalone --nproc_per_node=4 -m run_rl
+torchrun --standalone --nproc_per_node=4 -m speedrun
 ```
 
 If you'd rather not manage a node yourself, `modal_app.py` rents the same 8×H100 box on [Modal](https://modal.com) and runs the identical launcher:
