@@ -52,4 +52,5 @@ The run uses the `sokoban-speedrun` Modal volume (mounted at `/vol`) as its work
 
 * [nanochat](https://github.com/karpathy/nanochat): We forked [chat_rl.py](https://github.com/karpathy/nanochat/blob/master/scripts/chat_rl.py) 
 * [modded-nanoGPT](https://github.com/KellerJordan/modded-nanogpt): The OG of LLM speedruns
+* [nanoRL](https://joshuaharrissite.substack.com/p/nanorl): Fundoku RL LLM speedrun
 * [ScaleRL](https://arxiv.org/abs/2510.13786): Our initial recipe took a lot of inspiration from theirs
