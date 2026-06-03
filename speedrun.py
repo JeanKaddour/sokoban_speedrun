@@ -150,13 +150,20 @@ async def generate_group(engine, prompt_token_ids: list[int], num_samples: int, 
     async for out in engine.generate(prompt, sp, str(uuid.uuid4())):
         final = out
     assert final is not None and final.finished
+    # vLLM 0.22 can occasionally surface a None/empty completion in final.outputs (e.g. an
+    # aborted sample); drop them so one bad sample can't crash the whole run. A fully-empty
+    # group returns [] and is dropped downstream as zero-variance.
+    outputs = [co for co in final.outputs if co is not None and co.token_ids is not None]
+    dropped = len(final.outputs) - len(outputs)
+    if dropped:
+        print(f"[generate_group] dropped {dropped}/{len(final.outputs)} None/empty vLLM completion(s)", flush=True)
     return [
         {
             "token_ids": list(co.token_ids),
             "logprobs": extract_sampled_logprobs(co),
             "finish_reason": co.finish_reason,
         }
-        for co in final.outputs
+        for co in outputs
     ]
 
 
@@ -205,7 +212,9 @@ async def _drain_prompts(engine, prompt_q, result_q, state, inflight: int):
             for task in done:
                 exc = task.exception()
                 if exc is not None:
-                    result_q.put({"type": MSG_ERROR, "msg": f"generation failed: {exc!r}"})
+                    import traceback
+                    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+                    result_q.put({"type": MSG_ERROR, "msg": f"generation failed: {exc!r}\n{tb}"})
         else:
             await asyncio.sleep(0.02)
 
@@ -1273,6 +1282,248 @@ def task_reward(task, conversation, completion) -> float:
     return float(task.reward(conversation, completion))
 
 
+# ---------------------------------------------------------------------------
+# Held-out evaluation (the leaderboard metric). Decoupled from the training
+# signal: a fixed, held-out, reproducible pass@1/pass@k on the eval set, sized
+# for a tight CI. See run_standalone_eval / `--eval-only`.
+# ---------------------------------------------------------------------------
+
+def _pass_at_k_unbiased(n: int, c: int, k: int) -> float:
+    """Unbiased pass@k estimator (Chen et al., 2021): probability that at least one of k
+    samples drawn without replacement from n total (c correct) is correct."""
+    if k > n:
+        raise ValueError(f"pass@k requires k<=n, got k={k}, n={n}")
+    if n - c < k:
+        return 1.0
+    prod = 1.0
+    for i in range(n - c + 1, n + 1):
+        prod *= 1.0 - k / i
+    return 1.0 - prod
+
+
+def _wilson_ci(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score interval for a binomial proportion (used for the greedy k==1 case)."""
+    if n <= 0:
+        return (0.0, 1.0)
+    phat = successes / n
+    denom = 1.0 + z * z / n
+    center = (phat + z * z / (2 * n)) / denom
+    half = (z / denom) * math.sqrt(phat * (1.0 - phat) / n + z * z / (4 * n * n))
+    return (max(0.0, center - half), min(1.0, center + half))
+
+
+def _bootstrap_ci(values: list[float], *, n_boot: int = 10000, seed: int = 0,
+                  alpha: float = 0.05) -> tuple[float, float]:
+    """Percentile bootstrap CI for the mean of per-puzzle solve fractions. Puzzle-level
+    resampling captures both between-puzzle and within-puzzle (sampling) variance."""
+    n = len(values)
+    if n == 0:
+        return (0.0, 0.0)
+    try:
+        import numpy as _np
+        rng = _np.random.default_rng(seed)
+        arr = _np.asarray(values, dtype=float)
+        means = arr[rng.integers(0, n, size=(n_boot, n))].mean(axis=1)
+        return (float(_np.quantile(means, alpha / 2)), float(_np.quantile(means, 1.0 - alpha / 2)))
+    except Exception:
+        rng = random.Random(seed)
+        means = sorted(sum(values[rng.randrange(n)] for _ in range(n)) / n for _ in range(n_boot))
+        return (means[int((alpha / 2) * n_boot)], means[min(n_boot - 1, int((1.0 - alpha / 2) * n_boot))])
+
+
+async def run_held_out_eval(
+    engine,
+    tokenizer,
+    eval_task,
+    *,
+    k: int,
+    sampling: dict,
+    prompt_style: str = "rg",
+    enable_thinking: bool = True,
+    indices: list[int] | None = None,
+    pass_at_ks: tuple[int, ...] = (1, 4, 8, 16),
+    concurrency: int = 128,
+    progress_every: int = 200,
+) -> dict:
+    """Evaluate the policy served by `engine` on `eval_task`: k samples per puzzle, each scored
+    with reasoning_gym's binary solve check via `eval_task.evaluate`. Returns pass@1, unbiased
+    pass@k, per-puzzle solve fractions and a confidence interval. Pure measurement (no logprobs,
+    no training); reuses the same prompt/scoring path as the trainer for an apples-to-apples set."""
+    if indices is None:
+        indices = list(range(len(eval_task)))
+    eval_sampling = dict(sampling)
+    eval_sampling["logprobs"] = 0  # eval needs no per-token logprobs
+    sem = asyncio.Semaphore(concurrency)
+    n_total = len(indices)
+    done = 0
+
+    async def _one(idx: int) -> dict:
+        nonlocal done
+        conv = eval_task[idx]
+        prompt_ids = encode_prompt(tokenizer, conv["question"], enable_thinking, prompt_style)
+        async with sem:
+            samples = await generate_group(engine, prompt_ids.tolist(), k, eval_sampling)
+        c = extract_fail = length_trunc = 0
+        for s in samples:
+            completion = tokenizer.decode(s["token_ids"], skip_special_tokens=True)
+            if extract_sokoban_answer(completion) is None:
+                extract_fail += 1
+            if s.get("finish_reason") == "length":
+                length_trunc += 1
+            c += eval_task.evaluate(conv, completion)
+        done += 1
+        if progress_every and done % progress_every == 0:
+            print(f"  eval progress: {done}/{n_total} puzzles", flush=True)
+        return {"n": len(samples), "c": c, "extract_fail": extract_fail, "length_trunc": length_trunc}
+
+    results = await asyncio.gather(*[_one(i) for i in indices])
+
+    per_puzzle = [r["c"] / r["n"] if r["n"] else 0.0 for r in results]
+    n_puzzles = len(per_puzzle)
+    total_samples = sum(r["n"] for r in results)
+    total_solved = sum(r["c"] for r in results)
+    pass_at_1 = sum(per_puzzle) / max(1, n_puzzles)  # puzzle-weighted (== solved/total when n_i==k)
+
+    pass_at_k = {
+        j: sum(_pass_at_k_unbiased(r["n"], r["c"], j) for r in results) / max(1, n_puzzles)
+        for j in pass_at_ks if j <= k
+    }
+
+    if n_puzzles > 1:
+        var = sum((v - pass_at_1) ** 2 for v in per_puzzle) / (n_puzzles - 1)
+        se = math.sqrt(var / n_puzzles)
+    else:
+        se = 0.0
+
+    if k == 1:
+        ci_low, ci_high = _wilson_ci(total_solved, total_samples)
+    else:
+        ci_low, ci_high = _bootstrap_ci(per_puzzle, seed=int(sampling.get("seed") or 0))
+
+    return {
+        "n_puzzles": n_puzzles,
+        "k": k,
+        "pass_at_1": pass_at_1,
+        "pass_at_k": pass_at_k,
+        "per_puzzle_solve_frac": per_puzzle,
+        "ci_low": ci_low,
+        "ci_high": ci_high,
+        "se": se,
+        "n_extract_fail": sum(r["extract_fail"] for r in results),
+        "n_length_trunc": sum(r["length_trunc"] for r in results),
+        "sampling": eval_sampling,
+    }
+
+
+def _git_commit() -> str | None:
+    try:
+        import subprocess
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(Path(__file__).resolve().parent),
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return None
+
+
+def run_standalone_eval(args: argparse.Namespace) -> None:
+    """Authoritative held-out evaluation of a checkpoint (or the base model), decoupled from
+    training: builds its own vLLM engine sized for the full rollout budget, runs the leaderboard
+    pass@1/pass@k protocol on the fixed eval set, and writes a per-run JSON. No torchrun/DDP."""
+    eval_task = load_sokoban_jsonl_dataset(args.eval_data, split_name="eval")
+    model_path = str(args.eval_checkpoint) if args.eval_checkpoint else args.model
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=args.trust_remote_code)
+    if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    indices = None
+    if args.eval_limit is not None and args.eval_limit > 0:
+        indices = list(range(min(args.eval_limit, len(eval_task))))
+
+    sampling = dict(
+        temperature=args.eval_temperature,
+        top_p=args.eval_top_p,
+        top_k=args.eval_top_k,
+        max_tokens=args.eval_max_tokens,
+        seed=args.eval_seed,
+        logprobs=0,
+    )
+
+    print(
+        f"[eval] model={model_path} eval_data={args.eval_data} "
+        f"n={len(indices) if indices is not None else len(eval_task)} k={args.eval_k} "
+        f"max_tokens={args.eval_max_tokens} sampling=temp{args.eval_temperature}/top_p{args.eval_top_p}/"
+        f"top_k{args.eval_top_k}/seed{args.eval_seed}",
+        flush=True,
+    )
+
+    async def _run() -> dict:
+        engine = build_async_engine(
+            model_path,
+            num_dp=args.eval_vllm_dp,
+            dtype="bfloat16",
+            max_model_len=args.eval_max_model_len,
+            gpu_memory_utilization=args.eval_gpu_mem_util,
+            seed=args.eval_seed,
+        )
+        try:
+            return await run_held_out_eval(
+                engine, tokenizer, eval_task,
+                k=args.eval_k, sampling=sampling,
+                prompt_style=args.prompt_style, enable_thinking=args.enable_thinking,
+                indices=indices,
+            )
+        finally:
+            try:
+                engine.shutdown()
+            except Exception:
+                pass
+
+    result = asyncio.run(_run())
+
+    step = args.eval_step
+    if step is None:
+        m = re.search(r"step_?(\d+)", model_path)
+        step = int(m.group(1)) if m else None
+
+    record = {
+        "seed": args.eval_seed,
+        "run": args.run,
+        "step": step,
+        "checkpoint": model_path,
+        "model": args.model,
+        "eval_data": str(args.eval_data),
+        "git_commit": _git_commit(),
+        **{key: result[key] for key in (
+            "n_puzzles", "k", "pass_at_1", "pass_at_k", "ci_low", "ci_high", "se",
+            "n_extract_fail", "n_length_trunc", "sampling", "per_puzzle_solve_frac",
+        )},
+    }
+
+    if args.eval_output is not None:
+        out_path = Path(args.eval_output)
+    else:
+        run_name = args.run if (args.run and args.run != "dummy") else "eval"
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", run_name)
+        suffix = f"step{step:06d}" if step is not None else "latest"
+        out_path = args.output_dir / safe / f"eval_{suffix}.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as fh:
+        json.dump(record, fh, indent=2)
+        fh.write("\n")
+
+    pk = " ".join(f"pass@{j}={result['pass_at_k'][j]:.4f}" for j in sorted(result["pass_at_k"]))
+    print(
+        f"[eval] {model_path} | n={result['n_puzzles']} k={result['k']} | "
+        f"pass@1={result['pass_at_1']:.4f} (95% CI [{result['ci_low']:.4f}, {result['ci_high']:.4f}], "
+        f"se={result['se']:.4f}) | {pk} | "
+        f"extract_fail={result['n_extract_fail']} length_trunc={result['n_length_trunc']} | -> {out_path}",
+        flush=True,
+    )
+
+
 def _await_status(status_q, expected_type, timeout: float = 600.0):
     import time as _time
     deadline = _time.time() + timeout
@@ -1558,6 +1809,12 @@ def run_pipeline(
             finish_reasons: list[str | None] = []
             staleness: list[int] = []
             group_solved: list[float] = []      # 1.0 if any sample in the group solved
+            # Unbiased online proxy: counted over ALL fresh (non-stale) generated groups,
+            # BEFORE the zero-variance filter that biases reward/solved_frac & group_pass_at_k.
+            groups_seen_total = 0
+            samples_seen_total = 0
+            samples_solved_total = 0
+            groups_any_solved_total = 0
             gen_tokens_total = 0
             prefill_tokens_total = 0
             puzzles_used = 0
@@ -1607,6 +1864,11 @@ def run_pipeline(
                             seqs.append(seq); blps.append(lp); comps.append(comp); fins.append(s.get("finish_reason"))
                         rewards_t = torch.tensor(rewards, dtype=torch.float32)
                         adv = rewards_t - rewards_t.mean()
+                        # Unbiased online proxy (before any filter): solved == reward 1.0, matching evaluate().
+                        groups_seen_total += 1
+                        samples_seen_total += len(rewards)
+                        samples_solved_total += sum(1 for r in rewards if r == 1.0)
+                        groups_any_solved_total += 1 if any(r == 1.0 for r in rewards) else 0
                         is_zero_var = args.zero_variance_filter and not group_has_signal(rewards)
                         if rollout_fh is not None:
                             status = "zero_variance" if is_zero_var else "trained"
@@ -1828,6 +2090,10 @@ def run_pipeline(
                         "reward/std": float(rewards_all.std(unbiased=False)),
                         "reward/solved_frac": float((rewards_all > 0.5).float().mean()),
                         "reward/group_pass_at_k": float(sum(group_solved) / max(1, len(group_solved))),
+                        # Unbiased proxies over all fresh generated groups (pre-filter). Use these,
+                        # not solved_frac/group_pass_at_k, to gauge live progress; see run_held_out_eval.
+                        "reward/online_solved_frac_unfiltered": samples_solved_total / max(1, samples_seen_total),
+                        "reward/online_group_any_solved_unfiltered": groups_any_solved_total / max(1, groups_seen_total),
                         "adv/raw_std": float(adv_raw.std(unbiased=False)),
                         "adv/norm_std": float(adv_all.std(unbiased=False)),
                         "loss": loss_sum,
@@ -2017,7 +2283,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device-batch-size", type=int, default=8, help="Max forward/backward batch size during training")
     parser.add_argument("--examples-per-step", type=int, default=48, help="Sokoban puzzles per optimizer step")
     parser.add_argument("--num-samples", type=int, default=16, help="Samples per Sokoban puzzle")
-    parser.add_argument("--max-new-tokens", type=int, default=1024)
+    parser.add_argument("--max-new-tokens", type=int, default=6144,
+                        help="Rollout generation budget per puzzle (README spec). Qwen3-4B runs with "
+                             "thinking enabled, so it needs room to finish reasoning AND emit the answer; "
+                             "too small => 100%% length-truncation => 0 reward => no training signal.")
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top-k", type=int, default=0, help="Top-k sampling; 0 disables")
     parser.add_argument("--top-p", type=float, default=0.7, help="Nucleus sampling threshold; 0 disables")
@@ -2040,7 +2309,9 @@ def build_parser() -> argparse.ArgumentParser:
         default="sequence",
         help="Normalize policy-gradient loss by rollout tokens or by each sequence before averaging.",
     )
-    parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True,
+                        help="Trade compute for activation memory. On by default: the fp32 trainer GPU "
+                             "(params+Adam+grad ~64GB) plus 6144-token rollouts otherwise OOMs.")
     parser.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--prompt-style",
@@ -2048,7 +2319,6 @@ def build_parser() -> argparse.ArgumentParser:
         default="rg",
         help="nanochat uses the raw puzzle; rg matches the reasoning_gym task framing/format; sokoban/brief/reason/instruct require reasoning before the final-answer marker",
     )
-    parser.add_argument("--eval-every", type=int, default=100, help="Evaluate every N steps; 0 disables")
     parser.add_argument("--save-every", type=int, default=60, help="Save every N steps; 0 disables periodic saves")
     parser.add_argument("--save-final", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
@@ -2075,8 +2345,9 @@ def build_parser() -> argparse.ArgumentParser:
                              "Debug guard; small overhead. No-op at world_size==1.")
     parser.add_argument("--cispo-eps", type=float, default=4.0,
                         help="CISPO upper clip epsilon_max for the importance weight")
-    parser.add_argument("--max-model-len", type=int, default=4096,
-                        help="vLLM max_model_len (prompt + generation) for the generators")
+    parser.add_argument("--max-model-len", type=int, default=8192,
+                        help="vLLM max_model_len (prompt + generation) for the generators; must cover "
+                             "prompt (~700) + --max-new-tokens (6144).")
     parser.add_argument("--zero-variance-filter", action=argparse.BooleanOptionalAction, default=True,
                         help="Drop puzzle groups whose rewards are all equal (zero advantage). "
                              "Disable to keep them (e.g. plumbing smoke tests where the model gets no reward).")
@@ -2085,12 +2356,43 @@ def build_parser() -> argparse.ArgumentParser:
                              "reason, staleness, disposition) to <output-dir>/<run>/rollouts.jsonl for later analysis.")
     parser.add_argument("--wandb-rollout-samples", type=int, default=8,
                         help="Rollouts sampled per step (spread by reward) into a browsable W&B Table; 0 disables.")
+
+    # Standalone held-out evaluation (the authoritative leaderboard metric). Runs in its own
+    # process with a dedicated vLLM engine sized for the full rollout budget; no torchrun/DDP.
+    parser.add_argument("--eval-only", action="store_true",
+                        help="Evaluate a checkpoint (or the base model) on the held-out set and exit.")
+    parser.add_argument("--eval-checkpoint", type=Path, default=None,
+                        help="Checkpoint dir to evaluate; defaults to --model (evaluate the base model).")
+    parser.add_argument("--eval-k", type=int, default=16,
+                        help="Samples per puzzle for --eval-only; k=16 enables pass@{1,4,8,16}.")
+    parser.add_argument("--eval-max-tokens", type=int, default=6144,
+                        help="Generation budget per puzzle for --eval-only (leaderboard protocol).")
+    parser.add_argument("--eval-max-model-len", type=int, default=8192,
+                        help="vLLM max_model_len for the eval engine; must be >= prompt + --eval-max-tokens.")
+    parser.add_argument("--eval-temperature", type=float, default=0.8, help="--eval-only sampling temperature.")
+    parser.add_argument("--eval-top-p", type=float, default=0.7, help="--eval-only nucleus sampling threshold.")
+    parser.add_argument("--eval-top-k", type=int, default=0, help="--eval-only top-k (0 disables).")
+    parser.add_argument("--eval-seed", type=int, default=12345,
+                        help="Sampling/bootstrap seed for --eval-only (vary per leaderboard seed; keep eval DATA fixed).")
+    parser.add_argument("--eval-output", type=Path, default=None,
+                        help="Per-run eval JSON path; default <output-dir>/<run>/eval_step<NNN>.json.")
+    parser.add_argument("--eval-step", type=int, default=None,
+                        help="Step number recorded in the eval JSON; parsed from the checkpoint dir name if omitted.")
+    parser.add_argument("--eval-vllm-dp", type=int, default=1, help="Data-parallel GPUs for the eval engine.")
+    parser.add_argument("--eval-gpu-mem-util", type=float, default=0.85,
+                        help="gpu_memory_utilization for the eval engine.")
+    parser.add_argument("--eval-limit", type=int, default=None,
+                        help="Evaluate only the first N puzzles (smoke tests); default = full eval set.")
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.eval_only:
+        run_standalone_eval(args)
+        return
 
     if args.verify_datasets_only:
         train_task = load_sokoban_jsonl_dataset(
