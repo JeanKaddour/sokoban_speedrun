@@ -26,7 +26,9 @@ What can be changed: Pretty much anything else.
 
 # World record history
 
-TBA
+| # | Record time | Description | Date | Log | Contributors |
+| - | - | - | - | - | - |
+| 1 | TBD | Async CISPO baseline | TBD | TBD | @JeanKaddour |
 
 # How to run
 
