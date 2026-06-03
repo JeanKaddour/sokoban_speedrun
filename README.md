@@ -8,14 +8,14 @@ Motivation: A lot of LLM RL papers don't reproduce and there are many high-varia
 
 ## Rules
 
-The primary metric is the pass@1 solve-rate, averaged over `{N_SEEDS}` seeds, but contributors are encouraged to also report pass@k for {4,8,16}. 
+The primary metric is the pass@1 solve-rate, averaged over `5` seeds, but contributors are encouraged to also report pass@k for {4,8,16}. 
 
-A new record must reach `{TARGET}` with statistical significance `p<0.01` over the prior record.
+A new record must reach `TARGET` with statistical significance `p<0.01` over the prior record.
 
 What is fixed: 
 - Base model: Qwen3-4B
-- Training dataset: A fixed set of `{N_TRAIN}` puzzles, frozen and published [here](https://github.com/JeanKaddour/sokoban_speedrun/blob/main/datasets/sokoban_train.jsonl). Regenerable using [ReasoningGym](https://github.com/JeanKaddour/sokoban_speedrun/blob/main/datasets/generate_sokoban_datasets.py).
-- Eval: A fixed, held-out set of `{N_EVAL}` puzzles, disjoint from the training set. 
+- Training dataset: A fixed set of `10,000` puzzles, frozen and published [here](https://github.com/JeanKaddour/sokoban_speedrun/blob/main/datasets/sokoban_train.jsonl).
+- Eval: A fixed, held-out set of `2,000` puzzles, disjoint from the training set. 
 - Rollout budget: 6144 tokens per puzzle, single-turn, thinking included.
 
 What can be changed: Pretty much anything else.
@@ -32,17 +32,26 @@ What can be changed: Pretty much anything else.
 
 # How to run
 
+On an 8-GPU node (the trainer takes GPU 0, vLLM generators take the rest):
+
 ```bash
 torchrun --standalone --nproc_per_node=4 -m speedrun
 ```
 
-If you'd rather not manage a node yourself, `modal_app.py` rents the same 8×H100 box on [Modal](https://modal.com) and runs the identical launcher:
+## Modal
+
+If you'd rather not manage a node yourself, `modal_app.py` rents an 8×H100 box on [Modal](https://modal.com) and launches `speedrun.py` with its defaults (it passes no arguments):
 
 ```bash
+# one-time: push the fixed datasets to the Modal volume
+modal volume put nanochat-rl-hf datasets/sokoban_train.jsonl /datasets/sokoban_train.jsonl
+modal volume put nanochat-rl-hf datasets/sokoban_eval.jsonl  /datasets/sokoban_eval.jsonl
+
+# launch (use --detach so the run survives the client disconnecting)
 modal run --detach modal_app.py
 ```
 
-The run uses the `sokoban-speedrun` Modal volume (mounted at `/vol`) as its working directory, so push the datasets there once with `modal volume put sokoban-speedrun datasets /datasets`.
+The function runs `python -m speedrun` from the `nanochat-rl-hf` volume (mounted at `/vol`), so its relative paths resolve there: datasets at `/vol/datasets/`, with checkpoints and rollouts written to `/vol/outputs/` and committed every 60s.
 
 # FAQ
 
