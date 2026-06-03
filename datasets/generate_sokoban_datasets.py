@@ -127,8 +127,40 @@ def write_jsonl(path: Path, entries: list[dict[str, Any]], *, overwrite: bool) -
             fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+def _gamestr_set(path: Path, entries: list[dict[str, Any]] | None) -> set[str]:
+    """Normalized gamestr keys for a split, from in-memory entries or by reading the file."""
+    if entries is not None:
+        return {normalize_board_text(e["metadata"]["gamestr"]) for e in entries}
+    keys: set[str] = set()
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            if line.strip():
+                keys.add(normalize_board_text(json.loads(line)["metadata"]["gamestr"]))
+    return keys
+
+
+def assert_disjoint(
+    args: argparse.Namespace,
+    train_entries: list[dict[str, Any]] | None,
+    eval_entries: list[dict[str, Any]] | None,
+) -> None:
+    """Assert no puzzle (by normalized gamestr) appears in both train and eval."""
+    if not args.train_output.exists() or not args.eval_output.exists():
+        print("skip --assert-disjoint: both split files must exist", flush=True)
+        return
+    train_keys = _gamestr_set(args.train_output, train_entries)
+    eval_keys = _gamestr_set(args.eval_output, eval_entries)
+    overlap = train_keys & eval_keys
+    if overlap:
+        raise ValueError(
+            f"train/eval overlap on {len(overlap)} puzzle(s); splits must be disjoint "
+            f"(use distinct --train-seed/--eval-seed)"
+        )
+    print(f"disjoint OK: train={len(train_keys)} eval={len(eval_keys)} share 0 puzzles", flush=True)
+
+
 def run_verification(train_output: Path, eval_output: Path) -> None:
-    runner = Path(__file__).resolve().parent / "speedrun.py"
+    runner = Path(__file__).resolve().parent.parent / "speedrun.py"
     command = [
         sys.executable,
         str(runner),
@@ -162,6 +194,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-output", type=Path, default=Path("datasets/sokoban_eval.jsonl"))
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
+        "--splits",
+        choices=["both", "train", "eval"],
+        default="both",
+        help="Which split(s) to (re)generate. 'eval' regenerates only the held-out set, "
+        "leaving the published train file untouched.",
+    )
+    parser.add_argument(
+        "--assert-disjoint",
+        action="store_true",
+        help="After writing, assert no metadata.gamestr is shared between the train and eval files.",
+    )
+    parser.add_argument(
         "--verify",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -192,7 +236,12 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.train_output == args.eval_output:
         raise ValueError("--train-output and --eval-output must be different files")
     if not args.overwrite:
-        existing = [str(path) for path in (args.train_output, args.eval_output) if path.exists()]
+        targets = []
+        if args.splits in ("both", "train"):
+            targets.append(args.train_output)
+        if args.splits in ("both", "eval"):
+            targets.append(args.eval_output)
+        existing = [str(path) for path in targets if path.exists()]
         if existing:
             raise FileExistsError(
                 "output file already exists; pass --overwrite to replace: " + ", ".join(existing)
@@ -204,39 +253,47 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     validate_args(args)
 
-    train_entries = generate_split(
-        size=args.train_size,
-        seed=args.train_seed,
-        min_w=args.min_w,
-        max_w=args.max_w,
-        min_h=args.min_h,
-        max_h=args.max_h,
-        min_boxes=args.min_boxes,
-        max_boxes=args.max_boxes,
-        max_depth=args.max_depth,
-        min_moves=args.train_min_moves,
-        oversample_factor=args.oversample_factor,
-        max_candidates=args.max_candidates,
-    )
-    eval_entries = generate_split(
-        size=args.eval_size,
-        seed=args.eval_seed,
-        min_w=args.min_w,
-        max_w=args.max_w,
-        min_h=args.min_h,
-        max_h=args.max_h,
-        min_boxes=args.min_boxes,
-        max_boxes=args.max_boxes,
-        max_depth=args.max_depth,
-        min_moves=args.eval_min_moves,
-        oversample_factor=args.oversample_factor,
-        max_candidates=args.max_candidates,
-    )
+    train_entries: list[dict[str, Any]] | None = None
+    eval_entries: list[dict[str, Any]] | None = None
 
-    write_jsonl(args.train_output, train_entries, overwrite=args.overwrite)
-    write_jsonl(args.eval_output, eval_entries, overwrite=args.overwrite)
-    print(f"Wrote train={len(train_entries)} to {args.train_output}", flush=True)
-    print(f"Wrote eval={len(eval_entries)} to {args.eval_output}", flush=True)
+    if args.splits in ("both", "train"):
+        train_entries = generate_split(
+            size=args.train_size,
+            seed=args.train_seed,
+            min_w=args.min_w,
+            max_w=args.max_w,
+            min_h=args.min_h,
+            max_h=args.max_h,
+            min_boxes=args.min_boxes,
+            max_boxes=args.max_boxes,
+            max_depth=args.max_depth,
+            min_moves=args.train_min_moves,
+            oversample_factor=args.oversample_factor,
+            max_candidates=args.max_candidates,
+        )
+        write_jsonl(args.train_output, train_entries, overwrite=args.overwrite)
+        print(f"Wrote train={len(train_entries)} to {args.train_output}", flush=True)
+
+    if args.splits in ("both", "eval"):
+        eval_entries = generate_split(
+            size=args.eval_size,
+            seed=args.eval_seed,
+            min_w=args.min_w,
+            max_w=args.max_w,
+            min_h=args.min_h,
+            max_h=args.max_h,
+            min_boxes=args.min_boxes,
+            max_boxes=args.max_boxes,
+            max_depth=args.max_depth,
+            min_moves=args.eval_min_moves,
+            oversample_factor=args.oversample_factor,
+            max_candidates=args.max_candidates,
+        )
+        write_jsonl(args.eval_output, eval_entries, overwrite=args.overwrite)
+        print(f"Wrote eval={len(eval_entries)} to {args.eval_output}", flush=True)
+
+    if args.assert_disjoint:
+        assert_disjoint(args, train_entries, eval_entries)
 
     if args.verify:
         run_verification(args.train_output, args.eval_output)
