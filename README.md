@@ -59,6 +59,7 @@ The function runs `python -m speedrun` from the `nanochat-rl-hf` volume (mounted
 * Sokoban is PSPACE-complete; it can't be brute-forced and genuinely requires strong reasoning capabilities.
 * Small contamination risk: We generate fresh puzzles, so unlike Go or GSM8k there is little risk the base model has memorized them.
 * Diverse reasoning paths are encouraged, as Puzzles typically permit multiple solutions. Ideal for measuring the model's diversity. 
+* Simple enough to yield meaningful RL gains in `O(10)` GPU hours
 
 ## Why handroll your own asnyc RL stack?
 
