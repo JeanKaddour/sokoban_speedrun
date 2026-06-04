@@ -74,11 +74,13 @@ def generate_split(
     min_moves: int,
     oversample_factor: int,
     max_candidates: int,
+    exclude: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     if size < 1:
         raise ValueError("split size must be at least 1")
     candidate_size = size
-    if min_moves > 0:
+    # Oversample to leave headroom for the min-moves, solvability, and exclude (disjointness) filters.
+    if min_moves > 0 or exclude:
         candidate_size = min(max(size * oversample_factor, size), max_candidates)
     if candidate_size < size:
         raise ValueError("--max-candidates must be at least the requested split size")
@@ -106,13 +108,15 @@ def generate_split(
         moves = normalize_sokoban_moves(entry["answer"])
         if moves is None or scorer.score_answer(answer=moves, entry=entry) != 1.0:
             continue
+        if exclude is not None and normalize_board_text(entry["metadata"]["gamestr"]) in exclude:
+            continue  # incidental collision with the excluded (e.g. train) split — keep splits disjoint
         entries.append(entry)
         if len(entries) >= size:
             break
 
     if len(entries) < size:
         raise ValueError(
-            f"only generated {len(entries)} examples after min-moves={min_moves}; "
+            f"only generated {len(entries)} examples after min-moves={min_moves}/exclude; "
             "increase --max-candidates, lower the move floor, or relax puzzle difficulty"
         )
     return entries
@@ -178,7 +182,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-size", type=int, default=500)
     parser.add_argument("--eval-size", type=int, default=500)
     parser.add_argument("--train-seed", type=int, default=42)
-    parser.add_argument("--eval-seed", type=int, default=43)
+    # reasoning_gym seeds per item as ~(seed+index), so adjacent seeds yield near-identical puzzle
+    # streams: eval-seed 43 overlapped train-seed 42 (10k items => effective seeds ~42..10041) on
+    # ~99% of puzzles. The eval seed MUST be far outside [train_seed, train_seed+train_size]; use a
+    # large value (verify with --assert-disjoint).
+    parser.add_argument("--eval-seed", type=int, default=10_000_000)
     parser.add_argument("--min-w", type=int, default=6)
     parser.add_argument("--max-w", type=int, default=8)
     parser.add_argument("--min-h", type=int, default=6)
@@ -275,6 +283,14 @@ def main(argv: list[str] | None = None) -> None:
         print(f"Wrote train={len(train_entries)} to {args.train_output}", flush=True)
 
     if args.splits in ("both", "eval"):
+        # Make eval disjoint from train BY CONSTRUCTION: exclude any puzzle (by normalized gamestr)
+        # that appears in train. A far --eval-seed avoids the bulk seed-range overlap, but a few
+        # incidental collisions remain at 10k+2k scale; this filter drops them as they're generated.
+        exclude = None
+        if train_entries is not None:
+            exclude = _gamestr_set(args.train_output, train_entries)
+        elif args.train_output.exists():
+            exclude = _gamestr_set(args.train_output, None)
         eval_entries = generate_split(
             size=args.eval_size,
             seed=args.eval_seed,
@@ -288,6 +304,7 @@ def main(argv: list[str] | None = None) -> None:
             min_moves=args.eval_min_moves,
             oversample_factor=args.oversample_factor,
             max_candidates=args.max_candidates,
+            exclude=exclude,
         )
         write_jsonl(args.eval_output, eval_entries, overwrite=args.overwrite)
         print(f"Wrote eval={len(eval_entries)} to {args.eval_output}", flush=True)
