@@ -35,6 +35,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 IGNORE_INDEX = -100
 NODE_GPUS = 8  # the speedrun targets one 8xH100 node; trainers + vLLM generators must fit within it
+# Interruption-based length control (ScaleRL A.10): appended to a still-thinking rollout that hit the
+# generation cap, to force it to stop reasoning and emit a final answer instead of hard-truncating to 0.
+INTERRUPTION_TEXT = " Okay, time is up. Let me stop thinking and formulate a final answer now.\n</think>\n\n"
 WEIGHT_SYNC_TIMEOUT_S = 300.0  # bound the rank-0 weight broadcast so a dead vLLM child can't hang the trainer
 ROLLOUT_GET_TIMEOUT_S = 300.0  # bound result-queue waits so a silent vLLM child crash can't stall the trainer
 MSG_GENERATE = "generate"
@@ -129,42 +132,102 @@ def extract_sampled_logprobs(completion_output) -> list[float]:
     return [co.logprobs[i][tok_id].logprob for i, tok_id in enumerate(co.token_ids)]
 
 
-async def generate_group(engine, prompt_token_ids: list[int], num_samples: int, sampling: dict) -> list[dict]:
-    """Generate num_samples completions for one prompt."""
+async def _vllm_generate(engine, prompt_token_ids, n, *, temperature, top_p, top_k, max_tokens, logprobs, seed):
     from vllm import SamplingParams
     from vllm.inputs import TokensPrompt
     from vllm.sampling_params import RequestOutputKind
 
     sp = SamplingParams(
-        n=num_samples,
-        temperature=sampling.get("temperature", 0.8),
-        top_p=sampling.get("top_p", 1.0),
-        top_k=sampling.get("top_k", 0),
-        max_tokens=sampling.get("max_tokens", 1024),
-        logprobs=sampling.get("logprobs", 0),
-        seed=sampling.get("seed"),
-        output_kind=RequestOutputKind.FINAL_ONLY,
+        n=n, temperature=temperature, top_p=top_p, top_k=top_k, max_tokens=max_tokens,
+        logprobs=logprobs, seed=seed, output_kind=RequestOutputKind.FINAL_ONLY,
     )
-    prompt = TokensPrompt(prompt_token_ids=list(prompt_token_ids))
     final = None
-    async for out in engine.generate(prompt, sp, str(uuid.uuid4())):
+    async for out in engine.generate(TokensPrompt(prompt_token_ids=list(prompt_token_ids)), sp, str(uuid.uuid4())):
         final = out
     assert final is not None and final.finished
-    # vLLM 0.22 can occasionally surface a None/empty completion in final.outputs (e.g. an
-    # aborted sample); drop them so one bad sample can't crash the whole run. A fully-empty
-    # group returns [] and is dropped downstream as zero-variance.
+    # vLLM 0.22 can occasionally surface a None/empty completion in final.outputs (e.g. an aborted
+    # sample); drop them so one bad sample can't crash the whole run.
     outputs = [co for co in final.outputs if co is not None and co.token_ids is not None]
     dropped = len(final.outputs) - len(outputs)
     if dropped:
         print(f"[generate_group] dropped {dropped}/{len(final.outputs)} None/empty vLLM completion(s)", flush=True)
-    return [
-        {
-            "token_ids": list(co.token_ids),
-            "logprobs": extract_sampled_logprobs(co),
-            "finish_reason": co.finish_reason,
-        }
-        for co in outputs
-    ]
+    return outputs
+
+
+async def generate_group(engine, prompt_token_ids: list[int], num_samples: int, sampling: dict) -> list[dict]:
+    """Generate num_samples completions for one prompt.
+
+    Each returned dict: token_ids, logprobs (one per token), finish_reason, and loss_mask (one bool
+    per token; False marks injected interruption-marker tokens that must NOT carry policy gradient).
+    With sampling['interrupt'] set, any sample that hits the token cap while still thinking is
+    continued once more after an injected end-of-thinking marker, so it emits a scoreable answer
+    (ScaleRL A.10 interruption-based length control) instead of hard-truncating to reward 0."""
+    temperature = sampling.get("temperature", 0.8)
+    top_p = sampling.get("top_p", 1.0)
+    top_k = sampling.get("top_k", 0)
+    logprobs = sampling.get("logprobs", 0)
+    seed = sampling.get("seed")
+    outputs = await _vllm_generate(
+        engine, prompt_token_ids, num_samples,
+        temperature=temperature, top_p=top_p, top_k=top_k,
+        max_tokens=sampling.get("max_tokens", 1024), logprobs=logprobs, seed=seed,
+    )
+
+    interrupt = sampling.get("interrupt")
+    results: list[dict] = []
+    pending: list[tuple[int, list[int], list[float]]] = []  # (result index, phase-1 tokens, phase-1 logprobs)
+    for co in outputs:
+        toks = list(co.token_ids)
+        lps = extract_sampled_logprobs(co)
+        if interrupt and co.finish_reason == "length":
+            # Still thinking at the cap: queue a forced-answer continuation. Placeholder filled below.
+            pending.append((len(results), toks, lps))
+            results.append(None)
+        else:
+            # loss_mask is attached only when interruption is active; absent => None downstream
+            # (every generated token trainable), keeping the non-interruption path byte-identical.
+            res = {"token_ids": toks, "logprobs": lps, "finish_reason": co.finish_reason}
+            if interrupt:
+                res["loss_mask"] = [True] * len(toks)
+            results.append(res)
+
+    if interrupt and pending:
+        marker = list(interrupt["marker_ids"])
+        answer_max = int(interrupt["answer_max_tokens"])
+        max_model_len = int(interrupt.get("max_model_len", 0))
+
+        async def _continue(idx: int, phase1: list[int], phase1_lps: list[float]):
+            # Clamp the forced-answer budget so the phase-2 prompt never exceeds max_model_len
+            # (vLLM would otherwise abort the request and crash the run). If there's no room, keep
+            # phase-1 as-is (a length-truncated rollout, same as without interruption).
+            budget = answer_max
+            if max_model_len:
+                budget = min(answer_max, max_model_len - len(prompt_token_ids) - len(phase1) - len(marker))
+            if budget <= 0:
+                results[idx] = {"token_ids": phase1, "logprobs": phase1_lps,
+                                "finish_reason": "length", "loss_mask": [True] * len(phase1)}
+                return
+            cont = await _vllm_generate(
+                engine, list(prompt_token_ids) + phase1 + marker, 1,
+                temperature=temperature, top_p=top_p, top_k=top_k,
+                max_tokens=budget, logprobs=logprobs, seed=seed,
+            )
+            ans_toks = list(cont[0].token_ids) if cont else []
+            ans_lps = extract_sampled_logprobs(cont[0]) if cont else []
+            ans_fr = cont[0].finish_reason if cont else "length"
+            results[idx] = {
+                # Marker tokens are injected context: kept in the sequence (the answer was generated
+                # conditioned on them) but flagged non-trainable via loss_mask. Their logprob slot is a
+                # placeholder (0.0) — the trainer masks those positions out entirely.
+                "token_ids": phase1 + marker + ans_toks,
+                "logprobs": phase1_lps + [0.0] * len(marker) + ans_lps,
+                "finish_reason": ans_fr,
+                "loss_mask": [True] * len(phase1) + [False] * len(marker) + [True] * len(ans_toks),
+            }
+
+        await asyncio.gather(*[_continue(i, p1, lp) for (i, p1, lp) in pending])
+
+    return results
 
 
 def _safe_get(q):
@@ -344,6 +407,9 @@ class RolloutExample:
     weight_version: int
     puzzle_id: int
     completion: str = ""
+    # False at injected interruption-marker positions (forced, not sampled => no policy gradient);
+    # None means every generated token is trainable. Aligned 1:1 with behavior_logprobs.
+    loss_mask: list[bool] | None = None
 
 
 @dataclass(frozen=True)
@@ -554,7 +620,13 @@ def local_and_global_counts(local_examples: list["RolloutExample"]) -> tuple[int
     to the unpadded full-batch gradient in both normalization branches.
     """
     local_sample_count = sum(1 for e in local_examples if e.behavior_logprobs)
-    local_token_count = sum(len(e.behavior_logprobs) for e in local_examples)
+    # Count only gradient-carrying tokens: injected interruption markers sit in behavior_logprobs as
+    # placeholders but are masked out of the loss, so exclude them to keep the token normalizer and
+    # the train-throughput counters honest (no-op when loss_mask is None, i.e. interruption off).
+    local_token_count = sum(
+        (sum(e.loss_mask) if e.loss_mask is not None else len(e.behavior_logprobs))
+        for e in local_examples
+    )
     return local_sample_count, local_token_count
 
 
@@ -1028,19 +1100,23 @@ def trim_sequence_after_answer(tokenizer, sequence: torch.Tensor, prefix_length:
 
 
 def trim_generated_with_logprobs(tokenizer, sequence: torch.Tensor, prefix_length: int,
-                                 behavior_logprobs: list[float]) -> tuple[torch.Tensor, list[float]]:
-    """Trim a full sequence after its first parseable answer and truncate the behavior
-    logprobs to match the kept generated tokens."""
+                                 behavior_logprobs: list[float], loss_mask: list[bool] | None = None
+                                 ) -> tuple[torch.Tensor, list[float], list[bool] | None]:
+    """Trim a full sequence after its first parseable answer and truncate the behavior logprobs
+    (and the optional per-token loss mask) to match the kept generated tokens."""
     trimmed = trim_sequence_after_answer(tokenizer, sequence, prefix_length)
     kept_gen = int(trimmed.numel()) - prefix_length
-    return trimmed, behavior_logprobs[:kept_gen]
+    trimmed_mask = loss_mask[:kept_gen] if loss_mask is not None else None
+    return trimmed, behavior_logprobs[:kept_gen], trimmed_mask
 
 
-def make_rl_batch_varprefix(sequences, prefixes, pad_token_id, device):
+def make_rl_batch_varprefix(sequences, prefixes, pad_token_id, device, masks=None):
     if not sequences:
         raise ValueError("Cannot create an RL batch from zero sequences")
     if len(sequences) != len(prefixes):
         raise ValueError("sequences and prefixes must align")
+    if masks is not None and len(masks) != len(sequences):
+        raise ValueError("masks must align with sequences")
     max_length = max(int(seq.numel()) for seq in sequences)
     if max_length < 2:
         raise ValueError("Sequences must contain at least two tokens")
@@ -1054,6 +1130,13 @@ def make_rl_batch_varprefix(sequences, prefixes, pad_token_id, device):
         real[row, :n] = True
         if n > pfx:
             gen[row, pfx:n] = True
+            # Drop injected (interruption-marker) positions from the training targets: present in
+            # `real` (attended to as context) but excluded from `gen`/labels so they carry no gradient.
+            m = masks[row] if masks is not None else None
+            if m is not None:
+                if len(m) != n - pfx:
+                    raise ValueError(f"row {row}: loss_mask len {len(m)} != generated len {n - pfx}")
+                gen[row, pfx:n] &= torch.tensor(m, dtype=torch.bool, device=device)
     input_ids = ids[:, :-1]
     labels = ids[:, 1:].clone().masked_fill(~gen[:, 1:], IGNORE_INDEX)
     return input_ids, real[:, :-1], labels
@@ -1663,6 +1746,19 @@ def run_pipeline(
     next_puzzle_id = 0
     sampling = dict(temperature=args.temperature, top_p=args.top_p, top_k=args.top_k,
                     max_tokens=args.max_new_tokens)
+    if args.interruption:
+        marker_ids = tokenizer(INTERRUPTION_TEXT, add_special_tokens=False)["input_ids"]
+        sampling["interrupt"] = {"marker_ids": list(marker_ids), "answer_max_tokens": args.interrupt_answer_tokens,
+                                 "max_model_len": args.max_model_len}
+        # Guard: the phase-2 prompt is prompt + max_new_tokens + marker + answer; leave headroom for the
+        # prompt so it fits max_model_len (the per-request clamp in generate_group is the runtime backstop).
+        need = args.max_new_tokens + len(marker_ids) + args.interrupt_answer_tokens
+        if args.max_model_len < need + 256:
+            raise ValueError(
+                f"--max-model-len {args.max_model_len} too small for --interruption: needs >= prompt + "
+                f"max-new-tokens({args.max_new_tokens}) + marker({len(marker_ids)}) + "
+                f"interrupt-answer-tokens({args.interrupt_answer_tokens}); raise --max-model-len.")
+        print0(f"Interruption-based length control ON: marker={len(marker_ids)} tok, answer budget={args.interrupt_answer_tokens}")
     wandb_run = DummyWandb()
     model_perf_info = None
     rollout_fh = None
@@ -1852,16 +1948,17 @@ def run_pipeline(
                                     f"step {step}: rejected {consecutive_rejected} consecutive rollout groups "
                                     f"(staleness bound too tight or rewards degenerate); aborting")
                             continue
-                        rewards, seqs, blps, comps, fins = [], [], [], [], []
+                        rewards, seqs, blps, comps, fins, lms = [], [], [], [], [], []
                         for s in msg["samples"]:
                             seq = torch.cat([meta["prompt_ids"], torch.tensor(s["token_ids"], dtype=torch.long)])
+                            lm = s.get("loss_mask")
                             if args.trim_after_answer:
-                                seq, lp = trim_generated_with_logprobs(tokenizer, seq, meta["prefix_length"], s["logprobs"])
+                                seq, lp, lm = trim_generated_with_logprobs(tokenizer, seq, meta["prefix_length"], s["logprobs"], lm)
                             else:
                                 lp = s["logprobs"]
                             comp = decode_completion(tokenizer, seq, meta["prefix_length"])
                             rewards.append(task_reward(train_task, meta["conversation"], comp))
-                            seqs.append(seq); blps.append(lp); comps.append(comp); fins.append(s.get("finish_reason"))
+                            seqs.append(seq); blps.append(lp); comps.append(comp); fins.append(s.get("finish_reason")); lms.append(lm)
                         rewards_t = torch.tensor(rewards, dtype=torch.float32)
                         adv = rewards_t - rewards_t.mean()
                         # Unbiased online proxy (before any filter): solved == reward 1.0, matching evaluate().
@@ -1892,10 +1989,11 @@ def run_pipeline(
                         consecutive_rejected = 0
                         group_solved.append(1.0 if max(rewards) > 0.5 else 0.0)
                         prefill_tokens_total += meta["prefix_length"]
-                        for seq, r, a, lp, comp, fin in zip(seqs, rewards, adv.tolist(), blps, comps, fins):
+                        for seq, r, a, lp, comp, fin, lm in zip(seqs, rewards, adv.tolist(), blps, comps, fins, lms):
                             step_examples.append(RolloutExample(
                                 sequence=seq, prefix_length=meta["prefix_length"], reward=r, advantage=a,
-                                behavior_logprobs=lp, weight_version=version, puzzle_id=pid, completion=comp))
+                                behavior_logprobs=lp, weight_version=version, puzzle_id=pid, completion=comp,
+                                loss_mask=lm))
                             finish_reasons.append(fin)
                             staleness.append(current_version - version)
                             gen_tokens_total += len(lp)
@@ -1981,7 +2079,8 @@ def run_pipeline(
                 mb = my_shard[start:start + args.device_batch_size]
                 seqs = [e.sequence for e in mb]
                 prefixes = [e.prefix_length for e in mb]
-                input_ids, attention_mask, labels = make_rl_batch_varprefix(seqs, prefixes, pad_token_id, device)
+                masks = [e.loss_mask for e in mb]
+                input_ids, attention_mask, labels = make_rl_batch_varprefix(seqs, prefixes, pad_token_id, device, masks=masks)
                 beh = build_behavior_logprob_tensor_varprefix(seqs, [e.behavior_logprobs for e in mb], prefixes, device)
                 mb_stats: dict = {}
                 loss = chunked_cispo_loss(
@@ -2253,6 +2352,13 @@ def load_model_and_tokenizer(args: argparse.Namespace, device: torch.device):
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model.config.use_cache = False
 
+    if args.compile:
+        # Compile the transformer BODY only (the fp32 head + chunked CE stay eager — they run under
+        # their own checkpoint with autocast disabled). dynamic=True avoids recompiles on the varying
+        # per-microbatch sequence lengths (var-prefix batches); watch train_s for recompile churn.
+        model.model = torch.compile(model.model, dynamic=True)
+        print0("torch.compile enabled on the transformer body (dynamic=True)")
+
     return model, tokenizer
 
 
@@ -2286,7 +2392,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-new-tokens", type=int, default=6144,
                         help="Rollout generation budget per puzzle (README spec). Qwen3-4B runs with "
                              "thinking enabled, so it needs room to finish reasoning AND emit the answer; "
-                             "too small => 100%% length-truncation => 0 reward => no training signal.")
+                             "too small => 100%% length-truncation => 0 reward => no training signal. With "
+                             "--interruption this is the thinking budget before the forced-answer continuation.")
+    parser.add_argument("--interruption", action=argparse.BooleanOptionalAction, default=False,
+                        help="Interruption-based length control (ScaleRL A.10): when a rollout reaches "
+                             "--max-new-tokens still thinking, append an end-of-thinking marker and force a "
+                             "short final answer instead of hard-truncating to reward 0. The injected marker "
+                             "tokens are masked out of the policy-gradient loss. Needs --max-model-len >= "
+                             "prompt + max-new-tokens + marker + interrupt-answer-tokens.")
+    parser.add_argument("--interrupt-answer-tokens", type=int, default=512,
+                        help="Token budget for the forced final answer after an interruption.")
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top-k", type=int, default=0, help="Top-k sampling; 0 disables")
     parser.add_argument("--top-p", type=float, default=0.7, help="Nucleus sampling threshold; 0 disables")
@@ -2312,6 +2427,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True,
                         help="Trade compute for activation memory. On by default: the fp32 trainer GPU "
                              "(params+Adam+grad ~64GB) plus 6144-token rollouts otherwise OOMs.")
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False,
+                        help="torch.compile the transformer body (dynamic shapes) to cut the fp32 train "
+                             "step. Off by default; verify grad_norm/loss match eager and watch for "
+                             "recompile churn (variable sequence lengths) before trusting it.")
     parser.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--prompt-style",
