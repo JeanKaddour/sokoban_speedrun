@@ -15,8 +15,7 @@ A new record must reach `TARGET` with statistical significance `p<0.01` over the
 What is fixed: 
 - Base model: Qwen3-4B
 - Training dataset: A fixed set of `10,000` puzzles, frozen and published [here](https://github.com/JeanKaddour/sokoban_speedrun/blob/main/datasets/sokoban_train.jsonl).
-- Eval: A fixed, held-out set of `2,000` puzzles, disjoint from the training set. 
-- Rollout budget: 6144 tokens per puzzle, single-turn, thinking included.
+- Eval: A fixed, held-out set of `128` puzzles, disjoint from the training set (regenerable larger via `generate_sokoban_datasets.py --eval-size N --eval-seed 10000000 --assert-disjoint`). 
 
 What can be changed: Pretty much anything else.
 - RL algorithm, loss function, etc.
