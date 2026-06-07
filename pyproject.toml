@@ -19,24 +19,13 @@ dependencies = [
     "wandb>=0.17.0",
 ]
 
-[dependency-groups]
-dev = [
-    "pytest>=8.0.0",
-]
 # torch/torchvision/torchaudio 2.11.0 resolve from the default PyPI index, which is the
 # CUDA-13 build — matching vLLM 0.22.0's cu13 kernels (vLLM 0.22 ships only a cu13 wheel).
 # A cu128 torch against vLLM's cu13 kernels silently disables vLLM's CUDA-graph/compiled
 # fast path and tanks decode throughput ~30x, so we must keep the CUDA build matched.
 
-# This repo is a set of standalone scripts (speedrun.py, compute_significance.py), not an
-# installable package: uv only manages the dependency environment, and the Modal image adds
-# speedrun.py via add_local_python_source. So mark the project virtual (no build backend).
+# This repo is a set of standalone scripts (speedrun.py, modal_app.py), not an installable
+# package: uv only manages the dependency environment, and the Modal image adds speedrun.py
+# via add_local_python_source. So mark the project virtual (no build backend).
 [tool.uv]
 package = false
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["."]
-python_files = ["test_*.py"]
-python_classes = ["Test*"]
-python_functions = ["test_*"]
