@@ -99,25 +99,31 @@ def generate_split(
     )
     scorer = build_scorer()
     entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for i in range(len(dataset)):
         entry = clean_entry(dict(dataset[i]))
         if "gamestr" not in entry["metadata"]:
             raise ValueError(f"generated entry {i} is missing metadata.gamestr")
+        board_key = normalize_board_text(entry["metadata"]["gamestr"])
+        if board_key in seen:
+            continue
         if reference_move_count(entry) < min_moves:
             continue
         moves = normalize_sokoban_moves(entry["answer"])
         if moves is None or scorer.score_answer(answer=moves, entry=entry) != 1.0:
             continue
-        if exclude is not None and normalize_board_text(entry["metadata"]["gamestr"]) in exclude:
+        if exclude is not None and board_key in exclude:
             continue  # incidental collision with the excluded (e.g. train) split — keep splits disjoint
         entries.append(entry)
+        seen.add(board_key)
         if len(entries) >= size:
             break
 
     if len(entries) < size:
         raise ValueError(
             f"only generated {len(entries)} examples after min-moves={min_moves}/exclude; "
-            "increase --max-candidates, lower the move floor, or relax puzzle difficulty"
+            "increase --max-candidates, lower the move floor, relax puzzle difficulty, "
+            "or allow a larger board/box search space"
         )
     return entries
 
