@@ -85,7 +85,10 @@ RECIPE = [
     "--lr-schedule", "constant",
     "--grad-clip", "0.5",            # tighter than default 1.0 (run1 showed 1.0 is no backstop)
     "--cispo-eps", "4.0",            # ScaleRL-faithful CISPO upper IS cap; inert in practice (clip ~never fires)
-    "--loss-normalization", "prompt",  # ScaleRL §3.2: prompt-average (per-group token-avg, then avg over prompts)
+    "--loss-normalization", "sequence",  # sample-level (GRPO). NOTE: prompt-level (ScaleRL §3.2) caused a length
+                                         # runaway in this sprint regime (run odxkh0nl: budget 5632/batch 128 has
+                                         # no headroom, so prompt-level's length-push blew truncation past ScaleRL
+                                         # §A.15's <5% stability line). prompt-level needs a low-truncation regime.
     "--max-staleness", "4",          # less off-policy than ScaleRL's 8 (run2-proven stability lever)
     "--inflight-requests", "96",     # measured generator-throughput sweet spot (~22k tok/s); non-monotonic
     "--vllm-gpu-mem-util", "0.9",
@@ -3604,11 +3607,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--loss-normalization",
         choices=["token", "sequence", "prompt"],
-        default="prompt",
-        help="Policy-gradient loss aggregation: 'token' (per-token over the whole batch, DAPO), "
-             "'sequence' (per-sequence mean then averaged over samples, GRPO sample-level), or "
-             "'prompt' (per-prompt-group token-average then averaged over prompts, ScaleRL §3.2 — "
-             "the default, matching the J_ScaleRL objective).",
+        default="sequence",
+        help="Policy-gradient loss aggregation: 'sequence' (per-sequence mean then averaged over samples, "
+             "GRPO sample-level — the default, stable in this sprint regime), 'token' (per-token over the whole "
+             "batch, DAPO), or 'prompt' (per-prompt-group token-average then averaged over prompts, ScaleRL §3.2 "
+             "/ J_ScaleRL — only safe in a low-truncation regime; see run odxkh0nl).",
     )
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True,
                         help="Trade compute for activation memory. On by default: the fp32 trainer GPU "
