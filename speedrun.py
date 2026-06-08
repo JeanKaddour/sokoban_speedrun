@@ -46,6 +46,8 @@ TRUNC_EWMA_ALPHA = 0.3        # weight on the current step (0.7 on history): smo
 TRUNC_WARN_EWMA = 0.05        # ScaleRL's "keep <5%" line — log a warning at/above it
 GNORM_EWMA_ALPHA = 0.3
 GNORM_WARN_EWMA = 1.0         # ~2-4x healthy: log a gradient-climbing warning at/above it
+ALLPASS_WARN_FRAC = 0.5      # all-pass zero-variance drops >= this share of fresh groups => train set
+                             # being mastered (curriculum starvation / wasted generation); warn at/above it
 WEIGHT_SYNC_TIMEOUT_S = 300.0  # bound the rank-0 weight broadcast so a dead vLLM child can't hang the trainer
 ROLLOUT_GET_TIMEOUT_S = 300.0  # bound result-queue waits so a silent vLLM child crash can't stall the trainer
 MSG_GENERATE = "generate"
@@ -1599,6 +1601,11 @@ def policy_gradient_loss_from_token_logprobs(
                 stats["is_ratio_sum"] = ((raw_ratio * valid).sum()).detach()
                 stats["is_clipped_count"] = (((log_ratio > math.log(cispo_eps)) & valid).sum()).detach()
                 stats["valid_tokens"] = valid.sum().detach()
+                # Train/infer mismatch diagnostics (vLLM bf16 behavior vs fp32 trainer recompute):
+                # Σ log_ratio gives the mean log-ratio drift; Σ w² (with Σ w = is_ratio_sum) gives the
+                # effective sample size (Σw)²/(N·Σw²). Both on-device, no GPU sync (see comment above).
+                stats["log_ratio_sum"] = ((log_ratio * valid).sum()).detach()
+                stats["is_ratio_sq_sum"] = (((raw_ratio * raw_ratio) * valid).sum()).detach()
     else:
         token_weight = advantage_weight              # (B, 1) broadcasts
     weighted_logprobs = token_logprobs * token_weight
@@ -2888,6 +2895,7 @@ def run_pipeline(
             groups_zv_allpass = 0
             groups_stale = 0
             consecutive_rejected = 0
+            consecutive_rejected_max = 0
             reject_limit = max(256, args.examples_per_step * 64)
             t_collect = 0.0
             t_result_queue_wait = 0.0
@@ -2930,6 +2938,7 @@ def run_pipeline(
                         if not is_fresh_enough(version, current_version, args.max_staleness):
                             groups_stale += 1
                             consecutive_rejected += 1
+                            consecutive_rejected_max = max(consecutive_rejected_max, consecutive_rejected)
                             if consecutive_rejected > reject_limit:
                                 raise _abort_step(
                                     f"step {step}: rejected {consecutive_rejected} consecutive rollout groups "
@@ -2985,6 +2994,7 @@ def run_pipeline(
                             else:
                                 groups_zv_allfail += 1
                             consecutive_rejected += 1
+                            consecutive_rejected_max = max(consecutive_rejected_max, consecutive_rejected)
                             if consecutive_rejected > reject_limit:
                                 raise _abort_step(
                                     f"step {step}: rejected {consecutive_rejected} consecutive rollout groups "
@@ -3099,6 +3109,10 @@ def run_pipeline(
             is_ratio_acc_t = torch.zeros((), dtype=torch.float32, device=device)
             is_clip_acc_t = torch.zeros((), dtype=torch.float32, device=device)
             is_tok_acc_t = torch.zeros((), dtype=torch.long, device=device)
+            # Mismatch diagnostics (see the stats block in policy_gradient_loss_from_token_logprobs):
+            # Σ log_ratio for mean drift, Σ w² for ESS. All-reduced with the IS accumulators below.
+            log_ratio_acc_t = torch.zeros((), dtype=torch.float32, device=device)
+            is_ratio_sq_acc_t = torch.zeros((), dtype=torch.float32, device=device)
             num_microbatches = 0
             # ---- Phase E (ALL RANKS): backward over THIS rank's shard with normalizer=1.0 and
             # the GLOBAL counts (identical loss-call args to the single-GPU path). The microbatch
@@ -3155,6 +3169,8 @@ def run_pipeline(
                     is_ratio_acc_t = is_ratio_acc_t + mb_stats["is_ratio_sum"].to(torch.float32)
                     is_clip_acc_t = is_clip_acc_t + mb_stats["is_clipped_count"].to(torch.float32)
                     is_tok_acc_t = is_tok_acc_t + tok.to(torch.long)
+                    log_ratio_acc_t = log_ratio_acc_t + mb_stats["log_ratio_sum"].to(torch.float32)
+                    is_ratio_sq_acc_t = is_ratio_sq_acc_t + mb_stats["is_ratio_sq_sum"].to(torch.float32)
                 num_microbatches += 1
             # ---- Phase E (end): manual DP grad reduction — all_reduce(SUM) every param grad so
             # each rank holds the full-batch gradient Σ_r grad(per-shard loss), exactly the
@@ -3163,6 +3179,17 @@ def run_pipeline(
                 t_allreduce_start = time.monotonic()
                 all_reduce_grads_sum(model)
                 t_grad_allreduce = time.monotonic() - t_allreduce_start
+                # Reduce the diagnostic accumulators to GLOBAL sums in the all-ranks region (one
+                # extra small all-reduce). Without this they were rank-0-local, so is_ratio/* only
+                # reflected rank 0's shard; the new ESS/drift metrics need the full-batch view too.
+                diag_t = torch.stack([
+                    is_ratio_acc_t, is_clip_acc_t, is_tok_acc_t.to(torch.float32),
+                    log_ratio_acc_t, is_ratio_sq_acc_t,
+                ])
+                dist.all_reduce(diag_t, op=dist.ReduceOp.SUM)
+                is_ratio_acc_t, is_clip_acc_t = diag_t[0], diag_t[1]
+                is_tok_acc_t = diag_t[2].to(torch.long)
+                log_ratio_acc_t, is_ratio_sq_acc_t = diag_t[3], diag_t[4]
             # ---- Phase F (ALL RANKS): clip + step on the global gradient; identical grads +
             # identical AdamW state keep every rank's params byte-identical afterward. ----
             t_optimizer_start = time.monotonic()
@@ -3174,6 +3201,8 @@ def run_pipeline(
             is_ratio_acc = float(is_ratio_acc_t.detach())
             is_clip_acc = float(is_clip_acc_t.detach())
             is_tok_acc = int(is_tok_acc_t.detach())
+            log_ratio_acc = float(log_ratio_acc_t.detach())
+            is_ratio_sq_acc = float(is_ratio_sq_acc_t.detach())
             grad_norm = float(grad_norm_t.detach())
             t_train = time.monotonic() - t_train_start
 
@@ -3273,6 +3302,11 @@ def run_pipeline(
                         "groups/zero_variance_allfail_frac": groups_zv_allfail / max(1, groups_seen_total),
                         "groups/zero_variance_allpass_frac": groups_zv_allpass / max(1, groups_seen_total),
                         "groups/stale_dropped": groups_stale,
+                        # Signal yield this step: accepted groups / all fresh groups seen. Falls as the
+                        # train set is mastered (all-pass drops climb) or staleness tightens; the
+                        # high-water mark foreshadows the reject_limit hard abort.
+                        "groups/acceptance_ratio": puzzles_used / max(1, groups_seen_total),
+                        "groups/consecutive_rejected_max": consecutive_rejected_max,
                         "seqs": n_seqs,
                         "reward/mean": float(rewards_all.mean()),
                         "reward/std": float(rewards_all.std(unbiased=False)),
@@ -3295,6 +3329,14 @@ def run_pipeline(
                         "train/device_batch_size": args.device_batch_size,
                         "is_ratio/mean": (is_ratio_acc / is_tok_acc) if is_tok_acc else 0.0,
                         "is_ratio/clipped_frac": (is_clip_acc / is_tok_acc) if is_tok_acc else 0.0,
+                        # Effective sample size fraction (Σw)²/(N·Σw²) over valid tokens: 1.0 == on
+                        # policy, →0 as the bf16-behavior/fp32-trainer mismatch + staleness widen.
+                        "is_ratio/ess_frac": (
+                            (is_ratio_acc * is_ratio_acc) / (is_tok_acc * is_ratio_sq_acc)
+                            if is_tok_acc and is_ratio_sq_acc > 0.0 else 0.0
+                        ),
+                        # Mean log(pi_theta / pi_behavior) over valid tokens (signed drift; ~0 = matched).
+                        "mismatch/mean_log_ratio": (log_ratio_acc / is_tok_acc) if is_tok_acc else 0.0,
                         "gen/mean_tokens": float(gen_lens.mean()),
                         "gen/max_tokens": float(gen_lens.max()),
                         "gen/total_tokens": int(gen_tokens_total),
@@ -3403,6 +3445,10 @@ def run_pipeline(
                     if gnorm_ewma >= GNORM_WARN_EWMA:
                         print0(f"WARNING step {step}: grad_norm_ewma={gnorm_ewma:.2f} "
                                f">= {GNORM_WARN_EWMA:.1f} (gradient climbing; run1-style explosion risk)")
+                    if metrics["groups/zero_variance_allpass_frac"] >= ALLPASS_WARN_FRAC:
+                        print0(f"WARNING step {step}: groups/zero_variance_allpass_frac="
+                               f"{metrics['groups/zero_variance_allpass_frac']:.2f} >= {ALLPASS_WARN_FRAC:.2f} "
+                               f"(train set being mastered; curriculum starvation / wasted generation)")
                 except BaseException:
                     if has_next_step:
                         _broadcast_poison(poison_sent)
