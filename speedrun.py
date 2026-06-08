@@ -42,28 +42,10 @@ NODE_GPUS = 8  # the speedrun targets one 8xH100 node; trainers + vLLM generator
 # Interruption-based length control (ScaleRL A.10): appended to a still-thinking rollout that hit the
 # generation cap, to force it to stop reasoning and emit a final answer instead of hard-truncating to 0.
 INTERRUPTION_TEXT = " Okay, time is up. Let me stop thinking and formulate a final answer now.\n</think>\n\n"
-# Truncation-spiral guard (ScaleRL A.15): a rising length-truncation fraction is the leading,
-# irrecoverable instability signal — once it sustains past ~10-15% the run diverges (gradient
-# explosion) and never recovers. We track an EWMA of gen/length_trunc_frac and HARD-ABORT before
-# the weights are corrupted, preserving the last good checkpoint. WARN earlier so it's visible.
-TRUNC_EWMA_ALPHA = 0.3        # weight on the current step (0.7 on history): catches a *sustained* climb, not a transient
+TRUNC_EWMA_ALPHA = 0.3        # weight on the current step (0.7 on history): smooths to a *sustained* climb, not a transient
 TRUNC_WARN_EWMA = 0.05        # ScaleRL's "keep <5%" line — log a warning at/above it
-TRUNC_ABORT_EWMA = 0.12       # mid of the 10-15% irrecoverable band — abort ONLY if gnorm is also elevated
-                              # (see the abort site): under --interruption + a tight think-cap, BENIGN
-                              # cap-binding pushes truncation to ~0.10-0.15 with a flat gnorm, which is NOT a
-                              # spiral. The real ScaleRL A.15 spiral is truncation climbing WITH gnorm/IS drift,
-                              # so the truncation abort is gnorm-gated to avoid false-aborting a healthy run.
-TRUNC_GUARD_GRACE_STEPS = 5   # arm the abort this many steps PAST warmup, so the EWMA reflects steady-state,
-                              # not the high cold-start truncation that's expected (and harmless) early on
-# Gradient-explosion guard. The truncation guard above is blind to run1's ACTUAL collapse mode (gnorm
-# 0.4->4.9 with IS drifting to 0.93) — and is doubly blind under --interruption, where forced answers
-# finish as "stop" rather than "length". CISPO only clips the UPPER IS ratio, so a gnorm blowup is otherwise
-# unbounded. Track an EWMA of grad_norm and HARD-ABORT a sustained explosion (and any non-finite grad_norm),
-# preserving the last checkpoint. Healthy gnorm is ~0.25-0.5 (run1/run2), so the thresholds sit far above it.
 GNORM_EWMA_ALPHA = 0.3
-GNORM_WARN_EWMA = 1.0         # ~2-4x healthy: early divergence warning
-GNORM_ABORT_EWMA = 2.5        # ~5-10x healthy and well into run1's 0.4->4.9 climb: irrecoverable, abort
-GNORM_GUARD_GRACE_STEPS = 3   # arm a few steps past warmup so the EWMA seeds on post-warmup (peak-LR) gnorm
+GNORM_WARN_EWMA = 1.0         # ~2-4x healthy: log a gradient-climbing warning at/above it
 WEIGHT_SYNC_TIMEOUT_S = 300.0  # bound the rank-0 weight broadcast so a dead vLLM child can't hang the trainer
 ROLLOUT_GET_TIMEOUT_S = 300.0  # bound result-queue waits so a silent vLLM child crash can't stall the trainer
 MSG_GENERATE = "generate"
@@ -3258,19 +3240,19 @@ def run_pipeline(
                         rollout_seconds=t_collect,
                     ))
 
-                    # Truncation-spiral guard (ScaleRL A.15). Update the smoothed truncation
-                    # fraction and surface it; the hard-abort is below, after the step's
-                    # checkpoint save so the last good state is preserved before we raise. During
-                    # warmup the EWMA just tracks the raw (high, expected) cold-start truncation and
-                    # is re-seeded at the first post-warmup step, so that history can't trip the abort.
+                    # Truncation EWMA (ScaleRL A.15 leading-spiral indicator): logged to W&B and
+                    # WARN-only (no hard-abort). During warmup the EWMA just tracks the raw (high,
+                    # expected) cold-start truncation and is re-seeded at the first post-warmup step,
+                    # so that history doesn't skew the steady-state value.
                     if step <= args.warmup_steps:
                         trunc_ewma = metrics["gen/length_trunc_frac"]
                     else:
                         trunc_ewma = (1.0 - TRUNC_EWMA_ALPHA) * trunc_ewma + TRUNC_EWMA_ALPHA * metrics["gen/length_trunc_frac"]
                     metrics["gen/length_trunc_ewma"] = trunc_ewma
 
-                    # Gradient-explosion guard (run1's collapse mode). Mirror the truncation EWMA: seed on
-                    # warmup, smooth after. A non-finite grad_norm is immediate divergence.
+                    # Grad-norm EWMA (run1's collapse mode was gnorm 0.4->4.9): logged + WARN-only.
+                    # Mirror the truncation EWMA: seed on warmup, smooth after. A non-finite grad_norm
+                    # is immediate divergence and still hard-aborts (NaN poisons the weights).
                     gnorm_val = float(grad_norm)
                     gnorm_finite = (gnorm_val == gnorm_val) and gnorm_val not in (float("inf"), float("-inf"))
                     if not gnorm_finite:
@@ -3316,28 +3298,9 @@ def run_pipeline(
                         if step == num_steps - 1 and args.save_final:
                             # Official record clock stops here: the final checkpoint has finished writing.
                             run_logger.log_final_checkpoint(checkpoint_dir)
-                    # Truncation-spiral guard: warn whenever the smoothed truncation is elevated,
-                    # and hard-abort once it crosses the irrecoverable band. The abort arms only a
-                    # few steps PAST warmup (TRUNC_GUARD_GRACE_STEPS), by which point the EWMA reflects
-                    # steady-state truncation rather than the expected cold-start spike. The raise is
-                    # caught just below, which broadcasts the poison sentinel so workers raise in lockstep.
                     if trunc_ewma >= TRUNC_WARN_EWMA:
                         print0(f"WARNING step {step}: gen/length_trunc_ewma={trunc_ewma:.3f} "
                                f">= {TRUNC_WARN_EWMA:.2f} (truncation climbing; ScaleRL A.15 spiral risk)")
-                    # gnorm-GATED: a real spiral is truncation climbing TOGETHER WITH gradient elevation.
-                    # Benign cap-binding (high truncation, flat gnorm under --interruption + a tight cap) must
-                    # NOT abort — the standalone gnorm guard below is the primary instability detector.
-                    if (step >= args.warmup_steps + TRUNC_GUARD_GRACE_STEPS
-                            and trunc_ewma >= TRUNC_ABORT_EWMA and gnorm_ewma >= GNORM_WARN_EWMA):
-                        raise _abort_step(
-                            f"truncation spiral: gen/length_trunc_ewma={trunc_ewma:.3f} >= "
-                            f"{TRUNC_ABORT_EWMA:.2f} WITH grad_norm_ewma={gnorm_ewma:.2f} >= {GNORM_WARN_EWMA:.1f} "
-                            f"at step {step} (ScaleRL A.15 irrecoverable instability) — aborting; "
-                            f"resume from the last saved checkpoint"
-                        )
-                    # Gradient-explosion guard: warn on a climbing gnorm, hard-abort a sustained explosion
-                    # or any non-finite grad_norm (run1's collapse: gnorm 0.4->4.9). Armed past warmup so the
-                    # EWMA seeds on peak-LR gnorm first.
                     if not gnorm_finite:
                         raise _abort_step(
                             f"non-finite grad_norm ({grad_norm}) at step {step} — divergence; "
@@ -3346,12 +3309,6 @@ def run_pipeline(
                     if gnorm_ewma >= GNORM_WARN_EWMA:
                         print0(f"WARNING step {step}: grad_norm_ewma={gnorm_ewma:.2f} "
                                f">= {GNORM_WARN_EWMA:.1f} (gradient climbing; run1-style explosion risk)")
-                    if step >= args.warmup_steps + GNORM_GUARD_GRACE_STEPS and gnorm_ewma >= GNORM_ABORT_EWMA:
-                        raise _abort_step(
-                            f"gradient explosion: grad_norm_ewma={gnorm_ewma:.2f} >= "
-                            f"{GNORM_ABORT_EWMA:.1f} at step {step} (run1-style collapse) — "
-                            f"aborting; resume from the last saved checkpoint"
-                        )
                 except BaseException:
                     if has_next_step:
                         _broadcast_poison(poison_sent)
