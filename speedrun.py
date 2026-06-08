@@ -24,6 +24,7 @@ import threading
 import time
 import uuid
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -123,8 +124,16 @@ def build_async_engine(
     gpu_memory_utilization: float = 0.85,
     seed: int = 0,
     enforce_eager: bool = False,
-    max_num_seqs: int = 512,
-    max_num_batched_tokens: int = 8192,
+    max_num_seqs: int | None = None,
+    max_num_batched_tokens: int | None = None,
+    max_num_scheduled_tokens: int | None = None,
+    max_num_partial_prefills: int | None = None,
+    max_long_partial_prefills: int | None = None,
+    long_prefill_token_threshold: int | None = None,
+    enable_chunked_prefill: bool | None = None,
+    scheduler_reserve_full_isl: bool | None = None,
+    stream_interval: int | None = None,
+    performance_mode: str | None = None,
 ):
     """Construct the in-process vLLM AsyncLLM with native NCCL weight transfer enabled."""
     os.environ.setdefault("VLLM_USE_DEEP_GEMM", "0")
@@ -132,21 +141,40 @@ def build_async_engine(
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.v1.engine.async_llm import AsyncLLM
 
-    engine_args = AsyncEngineArgs(
-        model=model,
-        tensor_parallel_size=1,
-        data_parallel_size=num_dp,
-        gpu_memory_utilization=gpu_memory_utilization,
-        dtype=dtype,
-        enforce_eager=enforce_eager,
-        distributed_executor_backend=None,
-        max_model_len=max_model_len,
-        enable_log_requests=False,
-        max_num_seqs=max_num_seqs,
-        max_num_batched_tokens=max_num_batched_tokens,
-        seed=seed,
-        weight_transfer_config=WeightTransferConfig(backend="nccl"),
-    )
+    engine_kwargs = {
+        "model": model,
+        "tensor_parallel_size": 1,
+        "data_parallel_size": num_dp,
+        "gpu_memory_utilization": gpu_memory_utilization,
+        "dtype": dtype,
+        "enforce_eager": enforce_eager,
+        "distributed_executor_backend": None,
+        "max_model_len": max_model_len,
+        "enable_log_requests": False,
+        "seed": seed,
+        "weight_transfer_config": WeightTransferConfig(backend="nccl"),
+    }
+    if max_num_seqs is not None:
+        engine_kwargs["max_num_seqs"] = max_num_seqs
+    if max_num_batched_tokens is not None:
+        engine_kwargs["max_num_batched_tokens"] = max_num_batched_tokens
+    if max_num_scheduled_tokens is not None:
+        engine_kwargs["max_num_scheduled_tokens"] = max_num_scheduled_tokens
+    if max_num_partial_prefills is not None:
+        engine_kwargs["max_num_partial_prefills"] = max_num_partial_prefills
+    if max_long_partial_prefills is not None:
+        engine_kwargs["max_long_partial_prefills"] = max_long_partial_prefills
+    if long_prefill_token_threshold is not None:
+        engine_kwargs["long_prefill_token_threshold"] = long_prefill_token_threshold
+    if enable_chunked_prefill is not None:
+        engine_kwargs["enable_chunked_prefill"] = enable_chunked_prefill
+    if scheduler_reserve_full_isl is not None:
+        engine_kwargs["scheduler_reserve_full_isl"] = scheduler_reserve_full_isl
+    if stream_interval is not None:
+        engine_kwargs["stream_interval"] = stream_interval
+    if performance_mode is not None:
+        engine_kwargs["performance_mode"] = performance_mode
+    engine_args = AsyncEngineArgs(**engine_kwargs)
     return AsyncLLM.from_engine_args(engine_args)
 
 
@@ -381,8 +409,16 @@ async def _child_main_async(cfg, prompt_q, result_q, control_q, status_q):
         gpu_memory_utilization=cfg["gpu_memory_utilization"],
         seed=cfg["seed"],
         enforce_eager=cfg.get("enforce_eager", False),
-        max_num_seqs=cfg.get("max_num_seqs", 512),
-        max_num_batched_tokens=cfg.get("max_num_batched_tokens", 8192),
+        max_num_seqs=cfg.get("max_num_seqs"),
+        max_num_batched_tokens=cfg.get("max_num_batched_tokens"),
+        max_num_scheduled_tokens=cfg.get("max_num_scheduled_tokens"),
+        max_num_partial_prefills=cfg.get("max_num_partial_prefills"),
+        max_long_partial_prefills=cfg.get("max_long_partial_prefills"),
+        long_prefill_token_threshold=cfg.get("long_prefill_token_threshold"),
+        enable_chunked_prefill=cfg.get("enable_chunked_prefill"),
+        scheduler_reserve_full_isl=cfg.get("scheduler_reserve_full_isl"),
+        stream_interval=cfg.get("stream_interval"),
+        performance_mode=cfg.get("performance_mode"),
     )
     state = {"weight_version": 0, "paused": False, "stop": False}
     status_q.put({"type": MSG_ENGINE_READY})
@@ -623,11 +659,17 @@ def _pipeline_has_next_step(step: int, num_steps: int) -> bool:
 def build_optimizer(parameters: Iterator[torch.nn.Parameter], args: argparse.Namespace) -> torch.optim.Optimizer:
     if args.optimizer != "adamw":
         raise ValueError(f"Unsupported optimizer {args.optimizer!r}; only 'adamw' is implemented")
+    params = list(parameters)
+    # fused=True single-kernels the update over the ~64GB of fp32 param/grad/state traffic
+    # (~0.5-1s/step at 4B params) instead of the multi-kernel foreach path. Same update math
+    # (not bitwise). CUDA-only, so fall back to the default path on CPU (tests / --device cpu).
+    use_fused = bool(params) and all(p.is_cuda for p in params)
     return torch.optim.AdamW(
-        parameters,
+        params,
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
         eps=args.adam_eps,
+        fused=use_fused if use_fused else None,
     )
 
 
@@ -699,6 +741,55 @@ def pad_shards_to_equal(
     padded = list(step_examples) + [pad_example] * pad_count
     per_rank = len(padded) // world_size
     return [padded[r * per_rank:(r + 1) * per_rank] for r in range(world_size)]
+
+
+def sort_and_shard_for_microbatching(
+    examples: list["RolloutExample"],
+    advantages: list[float],
+    world_size: int,
+    pad_example: "RolloutExample",
+) -> tuple[list[list["RolloutExample"]], list[list[float]]]:
+    """Length-sort the full step batch and deal it across ranks for minimal padding + balanced load.
+
+    The trained advantage is the batch-normalized adv_all value, NOT example.advantage (which
+    still holds the pre-normalization group-centered value), and the train loop indexes it
+    positionally — so (example, advantage) travel as joint pairs here and cannot desync.
+
+    1. Sort pairs by sequence length DESCENDING: adjacent device_batch_size slices then pad to
+       near-equal lengths (cuts the ~9% pad-token waste of arrival-order pairing to ~2%), and
+       the 2-token pad examples land at the short end next to the shortest real sequences.
+    2. Snake-deal the sorted list across ranks (even round left-to-right, odd round right-to-
+       left) so every rank gets the same length PROFILE — a contiguous split of a sorted list
+       would concentrate the long sequences on one rank (~11% imbalance) and the Phase-E/F
+       collectives sync on the slowest rank.
+    3. Pad every rank to the same count with `pad_example` (zero gradient by construction, see
+       make_pad_example) so no rank stalls the grad all-reduce.
+
+    Gradient-identical to the unsorted contiguous path up to fp summation order: the CISPO loss
+    is per-sequence separable with step-GLOBAL normalizers (Phase D), so neither order, pairing,
+    nor rank assignment changes the summed gradient.
+    """
+    if world_size < 1:
+        raise ValueError("world_size must be at least 1")
+    if len(examples) != len(advantages):
+        raise ValueError("examples and advantages must align")
+    if pad_example.advantage != 0.0:
+        raise ValueError("pad_example must have advantage == 0.0 (zero gradient)")
+    pairs = sorted(zip(examples, advantages),
+                   key=lambda pair: int(pair[0].sequence.numel()), reverse=True)
+    rank_pairs: list[list[tuple["RolloutExample", float]]] = [[] for _ in range(world_size)]
+    for index, pair in enumerate(pairs):
+        round_index, position = divmod(index, world_size)
+        rank = position if round_index % 2 == 0 else world_size - 1 - position
+        rank_pairs[rank].append(pair)
+    per_rank = max(len(rp) for rp in rank_pairs)
+    shards: list[list["RolloutExample"]] = []
+    adv_shards: list[list[float]] = []
+    for rp in rank_pairs:
+        padded = rp + [(pad_example, 0.0)] * (per_rank - len(rp))
+        shards.append([example for example, _ in padded])
+        adv_shards.append([advantage for _, advantage in padded])
+    return shards, adv_shards
 
 
 def local_and_global_counts(local_examples: list["RolloutExample"]) -> tuple[int, int]:
@@ -1293,7 +1384,11 @@ def process_rollout_sample(
     )
 
 
-def make_rl_batch_varprefix(sequences, prefixes, pad_token_id, device, masks=None):
+def build_rl_batch_varprefix_cpu(sequences, prefixes, pad_token_id, masks=None, pin_memory=False):
+    """CPU half of make_rl_batch_varprefix: pad/concat + mask construction with NO CUDA calls
+    beyond optional pinned allocation, so a prefetch thread can build the NEXT microbatch while
+    the current one's fwd/bwd runs; the train loop then issues one non_blocking H2D copy per
+    tensor instead of the old per-row pageable copies. Values are identical to the old path."""
     if not sequences:
         raise ValueError("Cannot create an RL batch from zero sequences")
     if len(sequences) != len(prefixes):
@@ -1303,11 +1398,12 @@ def make_rl_batch_varprefix(sequences, prefixes, pad_token_id, device, masks=Non
     max_length = max(int(seq.numel()) for seq in sequences)
     if max_length < 2:
         raise ValueError("Sequences must contain at least two tokens")
-    ids = torch.full((len(sequences), max_length), pad_token_id, dtype=torch.long, device=device)
-    real = torch.zeros_like(ids, dtype=torch.bool)
-    gen = torch.zeros_like(ids, dtype=torch.bool)
+    ids = torch.full((len(sequences), max_length), pad_token_id, dtype=torch.long,
+                     pin_memory=pin_memory)
+    real = torch.zeros((len(sequences), max_length), dtype=torch.bool, pin_memory=pin_memory)
+    gen = torch.zeros((len(sequences), max_length), dtype=torch.bool)
     for row, (seq, pfx) in enumerate(zip(sequences, prefixes)):
-        seq = seq.to(device=device, dtype=torch.long)
+        seq = seq.to(device="cpu", dtype=torch.long)
         n = int(seq.numel())
         ids[row, :n] = seq
         real[row, :n] = True
@@ -1319,17 +1415,30 @@ def make_rl_batch_varprefix(sequences, prefixes, pad_token_id, device, masks=Non
             if m is not None:
                 if len(m) != n - pfx:
                     raise ValueError(f"row {row}: loss_mask len {len(m)} != generated len {n - pfx}")
-                gen[row, pfx:n] &= torch.tensor(m, dtype=torch.bool, device=device)
+                gen[row, pfx:n] &= torch.tensor(m, dtype=torch.bool)
     input_ids = ids[:, :-1]
-    labels = ids[:, 1:].clone().masked_fill(~gen[:, 1:], IGNORE_INDEX)
+    # ids[:, :-1] / real[:, :-1] are views of pinned storage and stay pinned; a plain .clone()
+    # for labels would allocate UNPINNED memory and silently degrade its non_blocking H2D copy,
+    # so copy into an explicitly (optionally pinned) buffer instead.
+    labels = torch.empty((len(sequences), max_length - 1), dtype=torch.long, pin_memory=pin_memory)
+    labels.copy_(ids[:, 1:])
+    labels.masked_fill_(~gen[:, 1:], IGNORE_INDEX)
     return input_ids, real[:, :-1], labels
 
 
-def build_behavior_logprob_tensor_varprefix(sequences, behavior_logprobs, prefixes, device):
+def make_rl_batch_varprefix(sequences, prefixes, pad_token_id, device, masks=None):
+    input_ids, attention_mask, labels = build_rl_batch_varprefix_cpu(
+        sequences, prefixes, pad_token_id, masks=masks)
+    return input_ids.to(device), attention_mask.to(device), labels.to(device)
+
+
+def build_behavior_logprob_tensor_varprefix_cpu(sequences, behavior_logprobs, prefixes,
+                                                pin_memory=False):
+    """CPU half of build_behavior_logprob_tensor_varprefix (see build_rl_batch_varprefix_cpu)."""
     if not (len(sequences) == len(behavior_logprobs) == len(prefixes)):
         raise ValueError("sequences, behavior_logprobs, and prefixes must align")
     max_length = max(int(seq.numel()) for seq in sequences)
-    out = torch.zeros((len(sequences), max_length - 1), dtype=torch.float32, device=device)
+    out = torch.zeros((len(sequences), max_length - 1), dtype=torch.float32, pin_memory=pin_memory)
     for row, (seq, blp, pfx) in enumerate(zip(sequences, behavior_logprobs, prefixes)):
         gen_len = int(seq.numel()) - pfx
         if gen_len <= 0:
@@ -1337,8 +1446,29 @@ def build_behavior_logprob_tensor_varprefix(sequences, behavior_logprobs, prefix
         if len(blp) != gen_len:
             raise ValueError(f"row {row}: {len(blp)} logprobs for {gen_len} generated tokens")
         start = pfx - 1
-        out[row, start:start + gen_len] = torch.tensor(blp, dtype=torch.float32, device=device)
+        out[row, start:start + gen_len] = torch.tensor(blp, dtype=torch.float32)
     return out
+
+
+def build_behavior_logprob_tensor_varprefix(sequences, behavior_logprobs, prefixes, device):
+    return build_behavior_logprob_tensor_varprefix_cpu(
+        sequences, behavior_logprobs, prefixes).to(device)
+
+
+def tensorize_microbatch_cpu(microbatch, pad_token_id, pin_memory=False):
+    """Build one microbatch's training tensors on host memory (optionally pinned).
+
+    Runs on the tensorize prefetch thread: pure CPU tensor construction, no CUDA kernels and
+    no dist.* collectives (the trainer NCCL group is single-threaded on the main thread; pinned
+    allocation via cudaHostAlloc is thread-safe and not a collective)."""
+    seqs = [e.sequence for e in microbatch]
+    prefixes = [e.prefix_length for e in microbatch]
+    masks = [e.loss_mask for e in microbatch]
+    input_ids, attention_mask, labels = build_rl_batch_varprefix_cpu(
+        seqs, prefixes, pad_token_id, masks=masks, pin_memory=pin_memory)
+    beh = build_behavior_logprob_tensor_varprefix_cpu(
+        seqs, [e.behavior_logprobs for e in microbatch], prefixes, pin_memory=pin_memory)
+    return input_ids, attention_mask, labels, beh
 
 
 def token_logprobs_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -1986,6 +2116,14 @@ def _eval_one_checkpoint(args: argparse.Namespace, model_path: str, multi: bool)
             enforce_eager=args.eval_vllm_enforce_eager,
             max_num_seqs=args.eval_vllm_max_num_seqs,
             max_num_batched_tokens=args.eval_vllm_max_num_batched_tokens,
+            max_num_scheduled_tokens=args.eval_vllm_max_num_scheduled_tokens,
+            max_num_partial_prefills=args.eval_vllm_max_num_partial_prefills,
+            max_long_partial_prefills=args.eval_vllm_max_long_partial_prefills,
+            long_prefill_token_threshold=args.eval_vllm_long_prefill_token_threshold,
+            enable_chunked_prefill=args.eval_vllm_enable_chunked_prefill,
+            scheduler_reserve_full_isl=args.eval_vllm_scheduler_reserve_full_isl,
+            stream_interval=args.eval_vllm_stream_interval,
+            performance_mode=args.eval_vllm_performance_mode,
         )
         try:
             return await run_held_out_eval(
@@ -2342,6 +2480,14 @@ def run_pipeline(
             enforce_eager=args.vllm_enforce_eager,
             max_num_seqs=args.vllm_max_num_seqs,
             max_num_batched_tokens=args.vllm_max_num_batched_tokens,
+            max_num_scheduled_tokens=args.vllm_max_num_scheduled_tokens,
+            max_num_partial_prefills=args.vllm_max_num_partial_prefills,
+            max_long_partial_prefills=args.vllm_max_long_partial_prefills,
+            long_prefill_token_threshold=args.vllm_long_prefill_token_threshold,
+            enable_chunked_prefill=args.vllm_enable_chunked_prefill,
+            scheduler_reserve_full_isl=args.vllm_scheduler_reserve_full_isl,
+            stream_interval=args.vllm_stream_interval,
+            performance_mode=args.vllm_performance_mode,
         )
         child = ctx.Process(target=engine_child_main, args=(cfg, prompt_q, result_q, control_q, status_q))
         _start_process_with_cuda_visible_devices(child, visible)
@@ -2605,6 +2751,21 @@ def run_pipeline(
         dist.broadcast_object_list(payload, src=0)
         _raise_for_pipeline_init_status(payload[0])
 
+    # Single worker that double-buffers Phase E's microbatch host tensors (every rank tensorizes
+    # its own shard). One worker is deliberate: prefetch depth 1 is enough to hide the CPU build
+    # behind fwd/bwd, and the thread must never issue dist.* collectives (tensorize_microbatch_cpu
+    # is pure host-side work).
+    tensorize_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tensorize")
+    # Rank-0-only pool that fans process_rollout_sample out across a group's samples: the trim
+    # binary search re-decodes multi-thousand-token prefixes ~12x per answered sample, and fast-
+    # tokenizer decode releases the GIL; scoring is thread-safe (reasoning_gym builds a fresh Game
+    # per score_answer call — verified no shared mutable state). map() preserves sample order, and
+    # exceptions surface on iteration exactly like the old serial loop (same Phase-A blanket handler).
+    decode_pool = (
+        ThreadPoolExecutor(max_workers=max(1, min(args.num_samples, 8)), thread_name_prefix="decode")
+        if master_process else None
+    )
+
     try:
         # RANK-0 INIT STATUS (all ranks, world_size>1 only): workers must not enter the
         # loop's first Phase-C scatter until rank 0 has finished the slow rank-0-only setup.
@@ -2724,17 +2885,17 @@ def run_pipeline(
                                     f"(staleness bound too tight or rewards degenerate); aborting")
                             continue
                         t_process_start = time.monotonic()
-                        processed_samples = [
-                            process_rollout_sample(
+                        processed_samples = list(decode_pool.map(
+                            lambda sample: process_rollout_sample(
                                 tokenizer,
                                 meta["prompt_ids"],
                                 meta["prefix_length"],
                                 sample,
                                 meta["conversation"],
                                 trim_after_answer=args.trim_after_answer,
-                            )
-                            for sample in msg["samples"]
-                        ]
+                            ),
+                            msg["samples"],
+                        ))
                         t_decode_trim_score += time.monotonic() - t_process_start
                         rewards = [sample.reward for sample in processed_samples]
                         fins = [sample.finish_reason for sample in processed_samples]
@@ -2806,17 +2967,15 @@ def run_pipeline(
                         torch.tensor([e.advantage for e in step_examples], dtype=torch.float32, device=device))
                     adv_all_list = adv_all.detach().cpu().tolist()
                     training_step_examples = strip_rollout_completions(step_examples)
-                    if world_size > 1:
-                        pad_example = make_pad_example(pad_token_id)
-                        shards = pad_shards_to_equal(training_step_examples, world_size, pad_example)
-                        per_rank = len(shards[0])
-                        # Advantages aligned to the padded layout: real examples keep their full-batch
-                        # normalized advantage; pad examples carry advantage 0.0 (zero gradient).
-                        padded_adv = adv_all_list + [0.0] * (world_size * per_rank - len(adv_all_list))
-                        adv_shards = [padded_adv[r * per_rank:(r + 1) * per_rank] for r in range(world_size)]
-                    else:
-                        shards = [training_step_examples]
-                        adv_shards = [adv_all_list]
+                    # Length-sort + snake-deal the (example, normalized-advantage) PAIRS across
+                    # ranks before the scatter: adjacent microbatch slices get near-equal lengths
+                    # (minimal padding) and every rank the same length profile (no straggler at the
+                    # Phase-E/F collectives). Examples and advantages travel jointly so their
+                    # positional alignment — which the train loop relies on — holds by construction.
+                    # Gradient-identical up to fp order (see sort_and_shard_for_microbatching).
+                    shards, adv_shards = sort_and_shard_for_microbatching(
+                        training_step_examples, adv_all_list, world_size,
+                        make_pad_example(pad_token_id))
                 except BaseException:
                     # Broadcast the poison sentinel (exactly once) so workers blocked at Phase C
                     # unblock and raise in lockstep, then re-raise the original error on rank 0.
@@ -2842,8 +3001,11 @@ def run_pipeline(
                     full_adv[ddp_rank * per_rank:(ddp_rank + 1) * per_rank],
                     dtype=torch.float32, device=device)
             else:
+                # adv_shards[0], NOT adv_all: the shard is length-sorted, and adv_all is still in
+                # collection order — indexing it positionally against the sorted shard would
+                # silently train on mis-assigned advantages.
                 my_shard = shards[0]
-                my_adv = adv_all
+                my_adv = torch.tensor(adv_shards[0], dtype=torch.float32, device=device)
 
             # ---- CISPO training step ----
             t_train_start = time.monotonic()
@@ -2872,15 +3034,32 @@ def run_pipeline(
             is_tok_acc_t = torch.zeros((), dtype=torch.long, device=device)
             num_microbatches = 0
             # ---- Phase E (ALL RANKS): backward over THIS rank's shard with normalizer=1.0 and
-            # the GLOBAL counts (identical loss-call args to the single-GPU path). ----
-            for start in range(0, total, args.device_batch_size):
-                mb = my_shard[start:start + args.device_batch_size]
-                seqs = [e.sequence for e in mb]
-                prefixes = [e.prefix_length for e in mb]
-                masks = [e.loss_mask for e in mb]
+            # the GLOBAL counts (identical loss-call args to the single-GPU path). The microbatch
+            # tensors are double-buffered: a single prefetch thread builds microbatch i+1's host
+            # tensors (pinned) while microbatch i runs fwd/bwd, and the main thread does one
+            # non_blocking H2D copy per tensor — identical values, no per-row pageable copies.
+            # The prefetch thread makes no CUDA-kernel or dist.* calls (see tensorize_microbatch_cpu);
+            # all H2D copies stay on the main thread's default stream, preserving kernel order.
+            pin_host = device.type == "cuda"
+            microbatches = [my_shard[s:s + args.device_batch_size]
+                            for s in range(0, total, args.device_batch_size)]
+            pending_host = (
+                tensorize_pool.submit(tensorize_microbatch_cpu, microbatches[0], pad_token_id, pin_host)
+                if microbatches else None
+            )
+            for mb_index, mb in enumerate(microbatches):
+                start = mb_index * args.device_batch_size
                 t_tensorize_start = time.monotonic()
-                input_ids, attention_mask, labels = make_rl_batch_varprefix(seqs, prefixes, pad_token_id, device, masks=masks)
-                beh = build_behavior_logprob_tensor_varprefix(seqs, [e.behavior_logprobs for e in mb], prefixes, device)
+                ids_host, attn_host, labels_host, beh_host = pending_host.result()
+                if mb_index + 1 < len(microbatches):
+                    pending_host = tensorize_pool.submit(
+                        tensorize_microbatch_cpu, microbatches[mb_index + 1], pad_token_id, pin_host)
+                # Pinned + non_blocking: torch's caching host allocator event-tracks the source
+                # buffers, so they are not recycled before the async copy completes.
+                input_ids = ids_host.to(device, non_blocking=True)
+                attention_mask = attn_host.to(device, non_blocking=True)
+                labels = labels_host.to(device, non_blocking=True)
+                beh = beh_host.to(device, non_blocking=True)
                 t_batch_tensorize += time.monotonic() - t_tensorize_start
                 mb_stats: dict = {}
                 loss = chunked_cispo_loss(
@@ -3178,6 +3357,9 @@ def run_pipeline(
                         _broadcast_poison(poison_sent)
                     raise
     finally:
+        tensorize_pool.shutdown(wait=False, cancel_futures=True)
+        if decode_pool is not None:
+            decode_pool.shutdown(wait=False, cancel_futures=True)
         # RANK-0-ONLY teardown: only rank 0 owns the child/queues/wsync/wandb. Workers just
         # destroy the trainer process group. compute_cleanup() is a no-op when uninitialized.
         if master_process and control_q is not None:
@@ -3227,6 +3409,18 @@ def get_lr_multiplier(
     return max(0.0, 1.0 - decay_progress)
 
 
+def strip_compiled_state_dict_keys(state_dict: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove torch.compile's `_orig_mod.` segment from state-dict keys.
+
+    With --compile, model.model is an OptimizedModule, so the raw state dict names body
+    keys `model._orig_mod.layers...`. transformers does NOT strip that prefix on load, so
+    from_pretrained would silently random-init the entire body (warning only) and any eval
+    of the checkpoint would score garbage. Mirrors PipelineWeightSync._named_parameters,
+    which is what keeps the live vLLM weight sync compile-safe; no-op when --compile is off.
+    """
+    return {name.replace("_orig_mod.", ""): value for name, value in state_dict.items()}
+
+
 def save_hf_checkpoint(
     model,
     tokenizer,
@@ -3235,7 +3429,13 @@ def save_hf_checkpoint(
 ) -> Path:
     checkpoint_dir = output_dir / f"step_{step:06d}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(checkpoint_dir)
+    state_dict = strip_compiled_state_dict_keys(model.state_dict())
+    # Belt-and-braces: a compiled-module prefix in the saved keys means from_pretrained
+    # would silently drop those weights — refuse to write such a checkpoint.
+    leaked = [name for name in state_dict if "_orig_mod" in name]
+    if leaked:
+        raise RuntimeError(f"compiled-module prefix leaked into checkpoint keys: {leaked[:3]}")
+    model.save_pretrained(checkpoint_dir, state_dict=state_dict)
     tokenizer.save_pretrained(checkpoint_dir)
     return checkpoint_dir
 
@@ -3380,10 +3580,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vllm-enforce-eager", action=argparse.BooleanOptionalAction, default=False,
                         help="Pass enforce_eager=True to the rollout vLLM engine. This can reduce cold-start "
                              "CUDA graph capture time but may lower steady-state generation throughput; off by default.")
-    parser.add_argument("--vllm-max-num-seqs", type=int, default=512,
-                        help="vLLM scheduler max_num_seqs for rollout generation.")
-    parser.add_argument("--vllm-max-num-batched-tokens", type=int, default=8192,
-                        help="vLLM scheduler max_num_batched_tokens for rollout generation.")
+    parser.add_argument("--vllm-max-num-seqs", type=int, default=None,
+                        help="Optional vLLM scheduler max_num_seqs for rollout generation. "
+                             "Unset preserves vLLM's auto default.")
+    parser.add_argument("--vllm-max-num-batched-tokens", type=int, default=None,
+                        help="Optional vLLM scheduler max_num_batched_tokens for rollout generation. "
+                             "Unset preserves vLLM's auto default.")
+    parser.add_argument("--vllm-max-num-scheduled-tokens", type=int, default=None,
+                        help="Optional vLLM scheduler max_num_scheduled_tokens for rollout generation. "
+                             "Unset defaults to max_num_batched_tokens.")
+    parser.add_argument("--vllm-max-num-partial-prefills", type=int, default=None,
+                        help="Optional vLLM chunked-prefill concurrency for rollout generation.")
+    parser.add_argument("--vllm-max-long-partial-prefills", type=int, default=None,
+                        help="Optional vLLM max concurrent long partial prefills for rollout generation.")
+    parser.add_argument("--vllm-long-prefill-token-threshold", type=int, default=None,
+                        help="Optional vLLM token threshold for treating a prefill as long.")
+    parser.add_argument("--vllm-enable-chunked-prefill", action=argparse.BooleanOptionalAction, default=None,
+                        help="Optionally force vLLM chunked prefill on/off for rollout generation. "
+                             "Unset preserves vLLM's default.")
+    parser.add_argument("--vllm-scheduler-reserve-full-isl", action=argparse.BooleanOptionalAction, default=None,
+                        help="Optionally force vLLM scheduler_reserve_full_isl on/off for rollout generation. "
+                             "Unset preserves vLLM's default.")
+    parser.add_argument("--vllm-stream-interval", type=int, default=None,
+                        help="Optional vLLM streaming interval for rollout generation.")
+    parser.add_argument("--vllm-performance-mode", choices=["balanced", "interactivity", "throughput"], default=None,
+                        help="Optional vLLM performance_mode for rollout generation. "
+                             "Unset preserves vLLM's default.")
     parser.add_argument("--inflight-requests", type=int, default=16,
                         help="Target number of puzzle generations kept in flight")
     parser.add_argument("--max-staleness", type=int, default=4,
@@ -3478,10 +3700,33 @@ def build_parser() -> argparse.ArgumentParser:
                         help="gpu_memory_utilization for the eval engine.")
     parser.add_argument("--eval-vllm-enforce-eager", action=argparse.BooleanOptionalAction, default=False,
                         help="Pass enforce_eager=True to the standalone eval vLLM engine.")
-    parser.add_argument("--eval-vllm-max-num-seqs", type=int, default=512,
-                        help="vLLM scheduler max_num_seqs for the standalone eval engine.")
-    parser.add_argument("--eval-vllm-max-num-batched-tokens", type=int, default=8192,
-                        help="vLLM scheduler max_num_batched_tokens for the standalone eval engine.")
+    parser.add_argument("--eval-vllm-max-num-seqs", type=int, default=None,
+                        help="Optional vLLM scheduler max_num_seqs for the standalone eval engine. "
+                             "Unset preserves vLLM's auto default.")
+    parser.add_argument("--eval-vllm-max-num-batched-tokens", type=int, default=None,
+                        help="Optional vLLM scheduler max_num_batched_tokens for the standalone eval engine. "
+                             "Unset preserves vLLM's auto default.")
+    parser.add_argument("--eval-vllm-max-num-scheduled-tokens", type=int, default=None,
+                        help="Optional vLLM scheduler max_num_scheduled_tokens for the standalone eval engine. "
+                             "Unset defaults to max_num_batched_tokens.")
+    parser.add_argument("--eval-vllm-max-num-partial-prefills", type=int, default=None,
+                        help="Optional vLLM chunked-prefill concurrency for the standalone eval engine.")
+    parser.add_argument("--eval-vllm-max-long-partial-prefills", type=int, default=None,
+                        help="Optional vLLM max concurrent long partial prefills for the standalone eval engine.")
+    parser.add_argument("--eval-vllm-long-prefill-token-threshold", type=int, default=None,
+                        help="Optional vLLM token threshold for treating an eval prefill as long.")
+    parser.add_argument("--eval-vllm-enable-chunked-prefill", action=argparse.BooleanOptionalAction, default=None,
+                        help="Optionally force vLLM chunked prefill on/off for the standalone eval engine. "
+                             "Unset preserves vLLM's default.")
+    parser.add_argument("--eval-vllm-scheduler-reserve-full-isl", action=argparse.BooleanOptionalAction, default=None,
+                        help="Optionally force vLLM scheduler_reserve_full_isl on/off for the standalone eval engine. "
+                             "Unset preserves vLLM's default.")
+    parser.add_argument("--eval-vllm-stream-interval", type=int, default=None,
+                        help="Optional vLLM streaming interval for the standalone eval engine.")
+    parser.add_argument("--eval-vllm-performance-mode", choices=["balanced", "interactivity", "throughput"],
+                        default=None,
+                        help="Optional vLLM performance_mode for the standalone eval engine. "
+                             "Unset preserves vLLM's default.")
     parser.add_argument("--eval-limit", type=int, default=None,
                         help="Evaluate only the first N puzzles (smoke tests); default = full eval set.")
     return parser
@@ -3500,14 +3745,41 @@ def _validate_sampling_args(args: argparse.Namespace) -> None:
         value = getattr(args, name)
         if value is not None and value < 0:
             raise ValueError(f"--{name.replace('_', '-')} must be non-negative")
-    for name in (
+    _validate_vllm_scheduler_args(args)
+
+
+def _validate_vllm_scheduler_args(args: argparse.Namespace) -> None:
+    positive_names = (
         "vllm_max_num_seqs",
         "vllm_max_num_batched_tokens",
+        "vllm_max_num_scheduled_tokens",
+        "vllm_max_num_partial_prefills",
+        "vllm_max_long_partial_prefills",
+        "vllm_stream_interval",
         "eval_vllm_max_num_seqs",
         "eval_vllm_max_num_batched_tokens",
-    ):
-        if getattr(args, name) < 1:
+        "eval_vllm_max_num_scheduled_tokens",
+        "eval_vllm_max_num_partial_prefills",
+        "eval_vllm_max_long_partial_prefills",
+        "eval_vllm_stream_interval",
+    )
+    for name in positive_names:
+        value = getattr(args, name)
+        if value is not None and value < 1:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
+    for name in ("vllm_long_prefill_token_threshold", "eval_vllm_long_prefill_token_threshold"):
+        value = getattr(args, name)
+        if value is not None and value < 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be non-negative")
+    for prefix in ("", "eval_"):
+        partial = getattr(args, f"{prefix}vllm_max_num_partial_prefills")
+        long_partial = getattr(args, f"{prefix}vllm_max_long_partial_prefills")
+        effective_partial = partial if partial is not None else 1
+        effective_long_partial = long_partial if long_partial is not None else 1
+        if effective_long_partial > effective_partial:
+            flag = f"--{prefix}vllm-max-long-partial-prefills".replace("_", "-")
+            limit = f"--{prefix}vllm-max-num-partial-prefills".replace("_", "-")
+            raise ValueError(f"{flag} must be <= {limit}")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -3586,14 +3858,6 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("--eval-max-tokens must be positive")
     if args.eval_interrupt_answer_tokens < 1:
         raise ValueError("--eval-interrupt-answer-tokens must be positive")
-    for name in (
-        "vllm_max_num_seqs",
-        "vllm_max_num_batched_tokens",
-        "eval_vllm_max_num_seqs",
-        "eval_vllm_max_num_batched_tokens",
-    ):
-        if getattr(args, name) < 1:
-            raise ValueError(f"--{name.replace('_', '-')} must be positive")
     if args.adam_eps <= 0:
         raise ValueError("--adam-eps must be positive")
 
