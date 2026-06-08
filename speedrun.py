@@ -471,6 +471,11 @@ class RolloutExample:
     # False at injected interruption-marker positions (forced, not sampled => no policy gradient);
     # None means every generated token is trainable. Aligned 1:1 with behavior_logprobs.
     loss_mask: list[bool] | None = None
+    # ScaleRL prompt-level loss aggregation: total valid (trainable) token count of this sample's
+    # PROMPT GROUP (same value for every sample sharing puzzle_id). Set on rank 0 over the full
+    # batch so it survives length-sort/shard/scatter; 0 on pad examples. Ignored by token/sequence
+    # aggregation. See policy_gradient_loss_from_token_logprobs's prompt-level branch.
+    group_token_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -689,6 +694,7 @@ def strip_rollout_completion(example: "RolloutExample") -> "RolloutExample":
         puzzle_id=example.puzzle_id,
         completion="",
         loss_mask=example.loss_mask,
+        group_token_count=example.group_token_count,
     )
 
 
@@ -822,15 +828,18 @@ def _scatter_payload(
     padded_batch: list["RolloutExample"],
     adv_padded: list[float] | None,
     abort: bool = False,
+    num_prompts: int = 0,
 ) -> list:
     """The object rank 0 broadcasts to every trainer rank each step:
-    [control dict with abort flag, full padded step batch, full-batch advantages].
+    [control dict with abort flag + prompt count, full padded step batch, full-batch advantages].
 
     Each rank reads element 0 first, then either raises (abort) or slices its shard.
     Putting the abort flag first gives a poison sentinel and a real scatter the same
-    wire shape, so a rank-0 Phase-A failure unblocks workers in lockstep.
+    wire shape, so a rank-0 Phase-A failure unblocks workers in lockstep. num_prompts (the
+    global count of trained prompt groups P) rides in the control dict for the ScaleRL
+    prompt-level loss normalizer, which every rank needs but only rank 0 can compute.
     """
-    return [{"abort": bool(abort)}, padded_batch, adv_padded]
+    return [{"abort": bool(abort), "num_prompts": int(num_prompts)}, padded_batch, adv_padded]
 
 
 def _abort_payload() -> list:
@@ -1505,11 +1514,13 @@ def policy_gradient_loss_from_logits(
     behavior_logprobs: torch.Tensor | None = None,
     cispo_eps: float | None = None,
     stats: dict | None = None,
+    prompt_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
     token_logprobs = token_logprobs_from_logits(logits, labels)
     return policy_gradient_loss_from_token_logprobs(
         token_logprobs, labels, advantages, valid_token_normalizer, valid_sample_normalizer,
-        normalizer, sequence_normalize, behavior_logprobs, cispo_eps, stats)
+        normalizer, sequence_normalize, behavior_logprobs, cispo_eps, stats,
+        prompt_lengths=prompt_lengths)
 
 
 def policy_gradient_loss_from_token_logprobs(
@@ -1523,6 +1534,7 @@ def policy_gradient_loss_from_token_logprobs(
     behavior_logprobs: torch.Tensor | None = None,
     cispo_eps: float | None = None,
     stats: dict | None = None,
+    prompt_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
     advantage_weight = advantages.to(token_logprobs.dtype).unsqueeze(-1)  # (B, 1)
     if behavior_logprobs is not None:
@@ -1547,6 +1559,18 @@ def policy_gradient_loss_from_token_logprobs(
     else:
         token_weight = advantage_weight              # (B, 1) broadcasts
     weighted_logprobs = token_logprobs * token_weight
+    if prompt_lengths is not None:
+        # ScaleRL prompt-level aggregation (scaleRL.md §3.2 + the J_ScaleRL objective): each
+        # sample's token-summed loss is divided by its PROMPT GROUP's total valid-token count L_p
+        # (prompt_lengths — the same value for every sample of a group), then averaged over the
+        # prompts. prompt_lengths is computed over the FULL batch on rank 0 and carried per-sample,
+        # so the result is correct even when a group is split across ranks/microbatches; the global
+        # prompt count P arrives via valid_sample_normalizer. token_logprobs are already 0 at
+        # IGNORE positions (token_logprobs_from_logits), so the per-sample sum spans valid tokens.
+        denom = prompt_lengths.to(token_logprobs.dtype).clamp(min=1.0)
+        prompt_normalizer = labels.size(0) if valid_sample_normalizer is None else valid_sample_normalizer
+        pg_objective = (weighted_logprobs.sum(dim=-1) / denom).sum() / (prompt_normalizer * normalizer)
+        return -pg_objective
     if sequence_normalize:
         valid_mask = labels != IGNORE_INDEX
         sample_lengths = valid_mask.sum(dim=-1).clamp(min=1).to(token_logprobs.dtype)
@@ -1563,7 +1587,7 @@ def chunked_cispo_loss(model, input_ids, attention_mask, labels, advantages, *,
                        behavior_logprobs=None, cispo_eps=None, chunk_size=1024,
                        valid_token_normalizer=None, valid_sample_normalizer=None,
                        normalizer=1.0, sequence_normalize=False, stats=None,
-                       autocast_dtype=None):
+                       autocast_dtype=None, prompt_lengths=None):
     """Memory-efficient CISPO loss: run the base model to hidden states (small: B,T,H),
     then apply the LM head + cross-entropy in checkpointed sequence chunks to avoid
     materializing the full (T, vocab) fp32 logits. The head always runs in fp32; with
@@ -1584,7 +1608,8 @@ def chunked_cispo_loss(model, input_ids, attention_mask, labels, advantages, *,
         valid_token_normalizer=valid_token_normalizer,
         valid_sample_normalizer=valid_sample_normalizer,
         normalizer=normalizer, sequence_normalize=sequence_normalize,
-        behavior_logprobs=behavior_logprobs, cispo_eps=cispo_eps, stats=stats)
+        behavior_logprobs=behavior_logprobs, cispo_eps=cispo_eps, stats=stats,
+        prompt_lengths=prompt_lengths)
 
 
 def batch_normalize_advantages(advantages: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -2834,6 +2859,7 @@ def run_pipeline(
             adv_all = None
             shards: list[list[RolloutExample]] | None = None
             adv_shards: list[list[float]] | None = None
+            num_prompts_local = 0  # global trained-prompt count P (rank 0 fills it; broadcast in Phase C)
             if master_process:
                 # Blanket handler: any exception in rank 0's Phase A/B — explicit `_abort_step`
                 # rejects and implicit ones (puzzles.pop KeyError, torch.cat / task_reward / trim_*
@@ -2949,6 +2975,19 @@ def run_pipeline(
                         torch.tensor([e.advantage for e in step_examples], dtype=torch.float32, device=device))
                     adv_all_list = adv_all.detach().cpu().tolist()
                     training_step_examples = strip_rollout_completions(step_examples)
+                    # ScaleRL prompt-level loss aggregation: tag every sample with its prompt group's
+                    # total valid (trainable) token count L_p, summed over the FULL batch HERE — before
+                    # the length-sort can split a group across ranks/microbatches — and carried on the
+                    # example so it survives the scatter. P = number of trained prompt groups (puzzle
+                    # ids). Mirrors local_and_global_counts' valid-token definition (loss_mask sum, or
+                    # full generated length when interruption is off). No-op for token/sequence modes.
+                    group_token_totals: dict[int, int] = {}
+                    for e in training_step_examples:
+                        n_valid = sum(e.loss_mask) if e.loss_mask is not None else len(e.behavior_logprobs)
+                        group_token_totals[e.puzzle_id] = group_token_totals.get(e.puzzle_id, 0) + n_valid
+                    for e in training_step_examples:
+                        e.group_token_count = group_token_totals[e.puzzle_id]
+                    num_prompts_local = len(group_token_totals)
                     # Length-sort + snake-deal the (example, normalized-advantage) PAIRS across
                     # ranks before the scatter: adjacent microbatch slices get near-equal lengths
                     # (minimal padding) and every rank the same length profile (no straggler at the
@@ -2970,13 +3009,15 @@ def run_pipeline(
             if world_size > 1:
                 full_padded = [e for sh in shards for e in sh] if master_process else None
                 full_adv = [a for sh in adv_shards for a in sh] if master_process else None
-                payload = _scatter_payload(full_padded, full_adv, abort=False)
+                payload = _scatter_payload(full_padded, full_adv, abort=False,
+                                           num_prompts=num_prompts_local)
                 t_object_start = time.monotonic()
                 dist.broadcast_object_list(payload, src=0)
                 t_object_scatter_broadcast = time.monotonic() - t_object_start
                 control, full_padded, full_adv = payload
                 if control["abort"]:
                     raise RuntimeError("aborting after rank-0 poison sentinel (Phase A error on rank 0)")
+                global_num_prompts = int(control.get("num_prompts", 0))
                 per_rank = len(full_padded) // world_size
                 my_shard = full_padded[ddp_rank * per_rank:(ddp_rank + 1) * per_rank]
                 my_adv = torch.tensor(
@@ -2988,6 +3029,7 @@ def run_pipeline(
                 # silently train on mis-assigned advantages.
                 my_shard = shards[0]
                 my_adv = torch.tensor(adv_shards[0], dtype=torch.float32, device=device)
+                global_num_prompts = num_prompts_local
 
             # ---- CISPO training step ----
             t_train_start = time.monotonic()
@@ -3044,15 +3086,24 @@ def run_pipeline(
                 beh = beh_host.to(device, non_blocking=True)
                 t_batch_tensorize += time.monotonic() - t_tensorize_start
                 mb_stats: dict = {}
+                prompt_mode = args.loss_normalization == "prompt"
+                # ScaleRL prompt-level: per-sample group-total token count L_p (carried on each
+                # example), divided in-loss; the global prompt count P is the normalizer. Pads
+                # have group_token_count 0 -> clamp(min=1) in-loss with a 0 numerator => no effect.
+                prompt_lengths = (
+                    torch.tensor([e.group_token_count for e in mb], dtype=torch.float32, device=device)
+                    if prompt_mode else None
+                )
                 loss = chunked_cispo_loss(
                     model, input_ids, attention_mask, labels, my_adv[start:start + len(mb)],
                     behavior_logprobs=beh, cispo_eps=args.cispo_eps, chunk_size=args.logits_chunk_size,
                     valid_token_normalizer=global_token_count,
-                    valid_sample_normalizer=global_sample_count,
+                    valid_sample_normalizer=(global_num_prompts if prompt_mode else global_sample_count),
                     normalizer=1.0,
                     sequence_normalize=(args.loss_normalization == "sequence"),
                     stats=mb_stats,
                     autocast_dtype=train_autocast_dtype,
+                    prompt_lengths=prompt_lengths,
                 )
                 loss.backward()
                 loss_sum_t = loss_sum_t + loss.detach()
@@ -3512,9 +3563,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument(
         "--loss-normalization",
-        choices=["token", "sequence"],
-        default="sequence",
-        help="Normalize policy-gradient loss by rollout tokens or by each sequence before averaging.",
+        choices=["token", "sequence", "prompt"],
+        default="prompt",
+        help="Policy-gradient loss aggregation: 'token' (per-token over the whole batch, DAPO), "
+             "'sequence' (per-sequence mean then averaged over samples, GRPO sample-level), or "
+             "'prompt' (per-prompt-group token-average then averaged over prompts, ScaleRL §3.2 — "
+             "the default, matching the J_ScaleRL objective).",
     )
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True,
                         help="Trade compute for activation memory. On by default: the fp32 trainer GPU "
