@@ -17,6 +17,15 @@ VOLUME_MOUNT_PATH = "/vol"
 PERSISTENT_CACHE_DIR = f"{VOLUME_MOUNT_PATH}/.cache"
 PERSISTENT_HF_HOME = f"{PERSISTENT_CACHE_DIR}/huggingface"
 PERSISTENT_VLLM_CACHE = f"{PERSISTENT_CACHE_DIR}/vllm"
+# Container-LOCAL on purpose: inductor writes thousands of small artifact files during codegen,
+# and on the FUSE-mounted volume that made a 3-rank --compile cold start take >25 min (measured
+# 2026-06-08) vs the expected 2-5 min on local NVMe. Cold compile per run is the cheaper trade;
+# revisit cross-run warm starts with a tar-to-volume scheme if --compile sticks.
+LOCAL_INDUCTOR_CACHE = "/tmp/torchinductor"
+
+# rank-0 runs the decode/trim/score pipeline (thread pool) plus 6-7 vLLM engine processes share
+# the container; without an explicit reservation Modal's default CPU allocation can starve them.
+CPU_REQUEST = float(os.environ.get("CPU_REQUEST", "16"))
 
 # speedrun.py fills one node: it runs the trainer on GPU 0 and spawns vLLM generators on the
 # rest (vllm_dp = NODE_GPUS - world_size), so the allocation must match speedrun.NODE_GPUS (8).
@@ -44,15 +53,17 @@ RECIPE = [
     "--interrupt-answer-tokens", "512",
     "--learning-rate", "8e-7",       # fixed LR, close to ScaleRL 8B->4B adaptation (~7e-7)
     "--init-lr-frac", "0.05",        # warmup starts at 5% of peak
-    "--warmup-steps", "4",           # peak by step 3, then constant LR
+    "--warmup-steps", "5",           # linear warmup over 5 steps, then CONSTANT LR (ScaleRL & DAPO both use constant, no decay)
     "--lr-schedule", "constant",
     "--grad-clip", "0.5",            # tighter than default 1.0 (run1 showed 1.0 is no backstop); extra damper on the unguarded gnorm
     "--cispo-eps", "4.0",            # ScaleRL-faithful CISPO upper IS cap; tighten only if clip/gnorm rises
+    "--loss-normalization", "prompt",  # ScaleRL §3.2: prompt-average (per-group token-avg, then avg over prompts)
     "--max-staleness", "4",          # less off-policy than ScaleRL's 8 (run2-proven stability lever)
     # Measured sweet spot (non-monotonic): inflight 96 peaks generator throughput (~22k tok/s, collect ~33s).
     # 32 starves the backlog (collect ~96s); 160 over-saturates + balloons the weight-sync pause.
     "--inflight-requests", "96",
     "--vllm-gpu-mem-util", "0.9",
+    "--vllm-stream-interval", "8",   # buffer token streaming to cut host/IPC overhead; no sampling/budget change
     "--eval-top-p", "0.95",
     "--save-every", "0",
     "--save-final",
@@ -97,12 +108,6 @@ image = (
     .env({
         "OMP_NUM_THREADS": "1",
         "TOKENIZERS_PARALLELISM": "false",
-        "HF_HOME": PERSISTENT_HF_HOME,
-        "HF_HUB_CACHE": f"{PERSISTENT_HF_HOME}/hub",
-        "TRANSFORMERS_CACHE": f"{PERSISTENT_HF_HOME}/hub",
-        "HF_DATASETS_CACHE": f"{PERSISTENT_HF_HOME}/datasets",
-        "VLLM_CACHE_ROOT": PERSISTENT_VLLM_CACHE,
-        "XDG_CACHE_HOME": PERSISTENT_CACHE_DIR,
     })
     .add_local_python_source("speedrun")
 )
@@ -127,14 +132,59 @@ def _persistent_cache_env() -> dict[str, str]:
         "HF_HUB_CACHE": f"{PERSISTENT_HF_HOME}/hub",
         "TRANSFORMERS_CACHE": f"{PERSISTENT_HF_HOME}/hub",
         "HF_DATASETS_CACHE": f"{PERSISTENT_HF_HOME}/datasets",
+        "HF_XET_CACHE": f"{PERSISTENT_HF_HOME}/xet",
+        "TORCH_HOME": f"{PERSISTENT_CACHE_DIR}/torch",
         "VLLM_CACHE_ROOT": PERSISTENT_VLLM_CACHE,
+        # Local NVMe, NOT the volume — see LOCAL_INDUCTOR_CACHE for the measured FUSE pathology.
+        "TORCHINDUCTOR_CACHE_DIR": LOCAL_INDUCTOR_CACHE,
         "XDG_CACHE_HOME": PERSISTENT_CACHE_DIR,
     }
+
+
+def _ensure_persistent_cache_dirs() -> None:
+    """Create Modal-volume cache dirs before libraries try to populate them."""
+    for path in {
+        PERSISTENT_CACHE_DIR,
+        PERSISTENT_HF_HOME,
+        f"{PERSISTENT_HF_HOME}/hub",
+        f"{PERSISTENT_HF_HOME}/datasets",
+        f"{PERSISTENT_HF_HOME}/xet",
+        f"{PERSISTENT_CACHE_DIR}/torch",
+        PERSISTENT_VLLM_CACHE,
+        LOCAL_INDUCTOR_CACHE,
+    }:
+        os.makedirs(path, exist_ok=True)
+
+
+def _last_arg_value(args: list[str], flag: str, default: str | None = None) -> str | None:
+    value = default
+    for i, arg in enumerate(args[:-1]):
+        if arg == flag:
+            value = args[i + 1]
+    return value
+
+
+def _last_bool_flag(args: list[str], enabled_flag: str, disabled_flag: str, default: bool) -> bool:
+    value = default
+    for arg in args:
+        if arg == enabled_flag:
+            value = True
+        elif arg == disabled_flag:
+            value = False
+    return value
+
+
+def _needs_periodic_volume_commit(speedrun_args: list[str]) -> bool:
+    """Only commit every minute when the run is actually writing mid-run artifacts."""
+    save_every = int(_last_arg_value(speedrun_args, "--save-every", "60") or "60")
+    save_rollouts = _last_bool_flag(speedrun_args, "--save-rollouts", "--no-save-rollouts", True)
+    return save_every > 0 or save_rollouts
 
 
 @app.function(
     image=image,
     gpu=f"{GPU_TYPE}:{NUM_GPUS}",
+    cpu=CPU_REQUEST,
     timeout=24 * 60 * 60,
     volumes={VOLUME_MOUNT_PATH: volume},
     secrets=runtime_secrets,
@@ -156,7 +206,13 @@ def train(
     env = dict(os.environ)
     # speedrun maps each trainer rank to a physical GPU itself, so CUDA_VISIBLE_DEVICES must be unset.
     env.pop("CUDA_VISIBLE_DEVICES", None)
+    _ensure_persistent_cache_dirs()
     env.update(_persistent_cache_env())
+    print(
+        f"Persistent caches: HF_HOME={env['HF_HOME']} "
+        f"HF_HUB_CACHE={env['HF_HUB_CACHE']} VLLM_CACHE_ROOT={env['VLLM_CACHE_ROOT']}",
+        flush=True,
+    )
     env["LD_LIBRARY_PATH"] = _nvidia_ld_library_path()
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -168,8 +224,9 @@ def train(
         command = [sys.executable, "-m", "speedrun", *speedrun_args]
     print(f"Launching ({num_trainers} trainer(s)): {' '.join(command)} (cwd={VOLUME_MOUNT_PATH})", flush=True)
 
-    # Commit the volume every 60s (and once on exit) so checkpoints/rollouts are downloadable
-    # mid-run and survive a crash, not just at the end.
+    # Commit the volume every 60s only when checkpoints/rollouts are being written mid-run. The
+    # default benchmark recipe writes no mid-run artifacts and keeps the model cache on this volume,
+    # so repeatedly committing can contend with training without making anything useful downloadable.
     stop_commit = threading.Event()
 
     def _periodic_commit():
@@ -179,8 +236,12 @@ def train(
             except Exception:
                 pass
 
-    committer = threading.Thread(target=_periodic_commit, daemon=True)
-    committer.start()
+    committer = None
+    if _needs_periodic_volume_commit(speedrun_args):
+        committer = threading.Thread(target=_periodic_commit, daemon=True)
+        committer.start()
+    else:
+        print("Skipping periodic volume commits: no mid-run checkpoints/rollouts enabled", flush=True)
     try:
         subprocess.run(command, check=True, env=env, cwd=VOLUME_MOUNT_PATH)
         if final_eval_k > 0:
@@ -198,6 +259,8 @@ def train(
                 volume.commit()
     finally:
         stop_commit.set()
+        if committer is not None:
+            committer.join(timeout=5)
         volume.commit()
 
 
@@ -272,6 +335,7 @@ def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds
 @app.function(
     image=image,
     gpu=f"{GPU_TYPE}:{NUM_GPUS}",
+    cpu=CPU_REQUEST,
     timeout=6 * 60 * 60,
     volumes={VOLUME_MOUNT_PATH: volume},
     secrets=runtime_secrets,
@@ -288,7 +352,13 @@ def evaluate(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: str
     Writes outputs/<run>/eval_*.json with pass@1/pass@k + bootstrap CI per run."""
     env = dict(os.environ)
     env.pop("CUDA_VISIBLE_DEVICES", None)
+    _ensure_persistent_cache_dirs()
     env.update(_persistent_cache_env())
+    print(
+        f"Persistent caches: HF_HOME={env['HF_HOME']} "
+        f"HF_HUB_CACHE={env['HF_HUB_CACHE']} VLLM_CACHE_ROOT={env['VLLM_CACHE_ROOT']}",
+        flush=True,
+    )
     env["LD_LIBRARY_PATH"] = _nvidia_ld_library_path()
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     record_mode = "," in checkpoint
