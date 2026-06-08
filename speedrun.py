@@ -57,6 +57,46 @@ MSG_ENGINE_READY = "engine_ready"
 MSG_WEIGHTS_READY = "weights_ready"
 MSG_ERROR = "error"
 EVAL_PID_BASE = 1_000_000_000
+# ============================ RUN RECIPE (single source of truth) ============================
+# The benchmark sprint recipe lives here as a top-level constant. main() PREPENDS it to the CLI
+# args, so a bare `python -m speedrun --run X --max-steps N` (or the Modal launcher, which now only
+# passes --run/--max-steps/--extra) reproduces it exactly. Any flag passed on the CLI appears AFTER
+# the recipe and therefore OVERRIDES the recipe value (argparse last-wins). --run and --max-steps are
+# deliberately NOT here (they vary per launch). Eval-only invocations also get the recipe prepended,
+# which is harmless: eval reads the eval_* args and ignores the training-side flags.
+RECIPE = [
+    "--dtype", "float32",            # MANDATORY: bf16 untying lm_head desyncs vLLM on Qwen3's tied embeds
+    "--train-data", "datasets/sokoban_70_easy_train.jsonl",
+    "--eval-data", "datasets/sokoban_70_easy_eval.jsonl",
+    "--examples-per-step", "16",     # batch 128: faster feedback than batch 256; previous stable run's batch size
+    "--num-samples", "8",            # k=8: halves advantage noise vs run1's k=4; batch=128
+    "--temperature", "0.8",          # lower-entropy rollouts improved solve|answer EWMA in the baseline runs
+    "--top-p", "0.95",               # less aggressive than the old 0.7 truncation, but avoids fully open-tail samples
+    "--max-new-tokens", "5632",      # fixed think budget before answer forcing; 5632+512 matches the 6144 eval budget
+    "--max-model-len", "7168",       # covers max train prompt(~590)+5632+marker+512 answer continuation
+    "--device-batch-size", "2",      # fp32 trainer fits at batch 2 (OOM'd at 4); fp32 logits chunk is the batch-scaled cost
+    "--logits-chunk-size", "2048",
+    "--gradient-checkpointing",
+    "--interruption",                # ScaleRL A.10: force an answer instead of hard-truncating to 0 reward (keeps TRAIN trunc low)
+    "--interrupt-answer-tokens", "512",
+    "--learning-rate", "8e-7",       # constant LR (ScaleRL 5e-7 / DAPO 1e-6 are both constant; 8e-7 sits between)
+    "--init-lr-frac", "0.05",        # warmup starts at 5% of peak
+    "--warmup-steps", "5",           # linear warmup over 5 steps, then CONSTANT LR (ScaleRL & DAPO both use constant, no decay)
+    "--lr-schedule", "constant",
+    "--grad-clip", "0.5",            # tighter than default 1.0 (run1 showed 1.0 is no backstop)
+    "--cispo-eps", "4.0",            # ScaleRL-faithful CISPO upper IS cap; inert in practice (clip ~never fires)
+    "--loss-normalization", "prompt",  # ScaleRL §3.2: prompt-average (per-group token-avg, then avg over prompts)
+    "--max-staleness", "4",          # less off-policy than ScaleRL's 8 (run2-proven stability lever)
+    "--inflight-requests", "96",     # measured generator-throughput sweet spot (~22k tok/s); non-monotonic
+    "--vllm-gpu-mem-util", "0.9",
+    "--vllm-stream-interval", "8",   # buffer token streaming to cut host/IPC overhead; no sampling/budget change
+    "--eval-top-p", "0.95",
+    "--save-every", "0",
+    "--save-final",
+    "--no-save-rollouts",
+    "--wandb-rollout-samples", "0",
+]
+# ============================================================================================
 ANSWER_COMPLETE_RE = re.compile(r"####\s*[UDLRudlr]+(?=$|[^UDLRudlr])")
 ANSWER_TAG_RE = re.compile(r"<answer>.*?</answer>", re.IGNORECASE | re.DOTALL)
 _BOARD_PLACEHOLDER = "{board}"
@@ -3795,7 +3835,10 @@ def _validate_vllm_scheduler_args(args: argparse.Namespace) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    cli = sys.argv[1:] if argv is None else argv
+    # Prepend the hardcoded RECIPE (top of file) so the benchmark recipe is the baseline; any flag
+    # passed on the CLI comes AFTER and overrides its recipe value (argparse last-wins).
+    args = parser.parse_args([*RECIPE, *cli])
     _validate_sampling_args(args)
 
     if args.eval_only:

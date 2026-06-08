@@ -34,42 +34,9 @@ NUM_GPUS = int(os.environ.get("NUM_GPUS", "8"))
 
 # One-hour target recipe. Keep the ScaleRL-ish optimizer hparams, but use a benchmark-defined
 # non-trivial 1-box train/eval split and avoid debug/measurement I/O that slows the sprint.
-RECIPE = [
-    "--dtype", "float32",            # MANDATORY: speedrun guards bf16 (untying lm_head desyncs vLLM on Qwen3's tied embeds)
-    "--train-data", "datasets/sokoban_70_easy_train.jsonl",
-    "--eval-data", "datasets/sokoban_70_easy_eval.jsonl",
-    "--examples-per-step", "16",     # batch 128: faster feedback than batch 256; previous stable run's batch size.
-    "--num-samples", "8",            # k=8: halves advantage noise vs run1's k=4; batch=128
-    "--temperature", "0.8",          # lower-entropy rollouts improved solve|answer EWMA in the baseline runs
-    "--top-p", "0.95",               # less aggressive than the old 0.7 truncation, but avoids fully open-tail samples
-    "--max-new-tokens", "5632",      # fixed think budget before answer forcing; 5632+512 matches the 6144 eval budget
-    "--max-model-len", "7168",       # covers max train prompt(~590)+5632+marker+512 answer continuation
-    # fp32 head + params/AdamW/grad ~64GB is fixed; the fp32 logits chunk (chunk x vocab x batch) is the
-    # batch-scaled cost. device-batch-size 4 + logits-chunk 2048 OOM'd; batch 2 + chunk 2048 fits in probes.
-    "--device-batch-size", "2",      # fp32 trainer fits at batch 2 (OOM'd at 4)
-    "--logits-chunk-size", "2048",
-    "--gradient-checkpointing",
-    "--interruption",                # ScaleRL A.10: force an answer instead of hard-truncating to 0 reward (keeps TRAIN trunc low)
-    "--interrupt-answer-tokens", "512",
-    "--learning-rate", "8e-7",       # fixed LR, close to ScaleRL 8B->4B adaptation (~7e-7)
-    "--init-lr-frac", "0.05",        # warmup starts at 5% of peak
-    "--warmup-steps", "5",           # linear warmup over 5 steps, then CONSTANT LR (ScaleRL & DAPO both use constant, no decay)
-    "--lr-schedule", "constant",
-    "--grad-clip", "0.5",            # tighter than default 1.0 (run1 showed 1.0 is no backstop); extra damper on the unguarded gnorm
-    "--cispo-eps", "4.0",            # ScaleRL-faithful CISPO upper IS cap; tighten only if clip/gnorm rises
-    "--loss-normalization", "prompt",  # ScaleRL §3.2: prompt-average (per-group token-avg, then avg over prompts)
-    "--max-staleness", "4",          # less off-policy than ScaleRL's 8 (run2-proven stability lever)
-    # Measured sweet spot (non-monotonic): inflight 96 peaks generator throughput (~22k tok/s, collect ~33s).
-    # 32 starves the backlog (collect ~96s); 160 over-saturates + balloons the weight-sync pause.
-    "--inflight-requests", "96",
-    "--vllm-gpu-mem-util", "0.9",
-    "--vllm-stream-interval", "8",   # buffer token streaming to cut host/IPC overhead; no sampling/budget change
-    "--eval-top-p", "0.95",
-    "--save-every", "0",
-    "--save-final",
-    "--no-save-rollouts",
-    "--wandb-rollout-samples", "0",
-]
+# The run recipe now lives in speedrun.py as the top-level RECIPE constant, which speedrun.main()
+# prepends to the CLI args. The launcher below only passes the per-run args (--run / --max-steps /
+# EXTRA_ARGS), and the eval path relies on the same RECIPE defaults via speedrun --eval-only.
 
 
 app = modal.App(APP_NAME)
@@ -176,8 +143,11 @@ def _last_bool_flag(args: list[str], enabled_flag: str, disabled_flag: str, defa
 
 def _needs_periodic_volume_commit(speedrun_args: list[str]) -> bool:
     """Only commit every minute when the run is actually writing mid-run artifacts."""
-    save_every = int(_last_arg_value(speedrun_args, "--save-every", "60") or "60")
-    save_rollouts = _last_bool_flag(speedrun_args, "--save-rollouts", "--no-save-rollouts", True)
+    # The recipe baseline (now in speedrun.py) writes no mid-run artifacts (--save-every 0,
+    # --no-save-rollouts), so these defaults match it; we only commit periodically if EXTRA_ARGS
+    # overrides them. speedrun_args no longer carries the recipe, just --run/--max-steps/EXTRA_ARGS.
+    save_every = int(_last_arg_value(speedrun_args, "--save-every", "0") or "0")
+    save_rollouts = _last_bool_flag(speedrun_args, "--save-rollouts", "--no-save-rollouts", False)
     return save_every > 0 or save_rollouts
 
 
@@ -216,7 +186,7 @@ def train(
     env["LD_LIBRARY_PATH"] = _nvidia_ld_library_path()
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-    speedrun_args = ["--run", run_name, "--max-steps", str(max_steps), *RECIPE, *(extra_args or [])]
+    speedrun_args = ["--run", run_name, "--max-steps", str(max_steps), *(extra_args or [])]
     if num_trainers > 1:
         command = [sys.executable, "-m", "torch.distributed.run", "--standalone",
                    f"--nproc_per_node={num_trainers}", "-m", "speedrun", *speedrun_args]
@@ -280,13 +250,6 @@ def _parse_seeds(spec: str) -> list[int]:
     return seeds
 
 
-def _recipe_arg_value(flag: str, default: str | None = None) -> str | None:
-    try:
-        return RECIPE[RECIPE.index(flag) + 1]
-    except (ValueError, IndexError):
-        return default
-
-
 def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: list[int],
                   target: float = 0.70) -> list[list[str]]:
     """speedrun --eval-only command(s). `checkpoint` may be a comma-separated list of final
@@ -302,18 +265,14 @@ def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds
     checkpoints = [c for c in checkpoint.replace(" ", "").split(",") if c]
     if not checkpoints:
         raise ValueError(f"EVAL_CHECKPOINT must name at least one checkpoint, got {checkpoint!r}")
-    eval_data = _recipe_arg_value("--eval-data", "datasets/sokoban_eval.jsonl")
-    eval_max_tokens = _recipe_arg_value("--inloop-eval-max-tokens", "6144")
-    # Standalone eval has its own engine; keep enough room for prompt + the full 6144-token
-    # measurement budget. Eval deliberately does not use interruption-based answer forcing.
-    eval_max_model_len = "8192"
-    eval_top_p = _recipe_arg_value("--eval-top-p", _recipe_arg_value("--top-p", "0.95")) or "0.95"
+    # --eval-data and --eval-top-p come from speedrun's RECIPE (prepended by speedrun.main());
+    # --eval-only reads them and ignores the training-side flags. Only the standalone eval-engine
+    # specifics are set here: keep room for prompt + the full 6144-token measurement budget, and
+    # deliberately no interruption-based answer forcing.
     common = [sys.executable, "-m", "speedrun", "--eval-only",
               "--run", run_name,
-              "--eval-data", eval_data,
-              "--eval-k", str(k), "--eval-max-tokens", eval_max_tokens,
-              "--eval-max-model-len", eval_max_model_len, "--eval-vllm-dp", str(NUM_GPUS),
-              "--eval-top-p", eval_top_p]
+              "--eval-k", str(k), "--eval-max-tokens", "6144",
+              "--eval-max-model-len", "8192", "--eval-vllm-dp", str(NUM_GPUS)]
     if eval_limit > 0:
         common += ["--eval-limit", str(eval_limit)]
     if len(checkpoints) > 1:
