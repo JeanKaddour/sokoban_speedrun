@@ -71,40 +71,31 @@ EVAL_PID_BASE = 1_000_000_000
 # launch param, NOT a speedrun CLI arg, so it is pinned as the default in modal_app.py (NTRAINERS=3),
 # not in this list.
 RECIPE = [
-    "--dtype", "float32",            # MANDATORY: bf16 untying lm_head desyncs vLLM on Qwen3's tied embeds
+    "--dtype", "float32",            
     "--train-data", "datasets/sokoban_70_easy_train.jsonl",
     "--eval-data", "datasets/sokoban_70_easy_eval.jsonl",
-    "--examples-per-step", "16",     # batch 128: faster feedback than batch 256; previous stable run's batch size
-    "--num-samples", "8",            # k=8: halves advantage noise vs run1's k=4; batch=128
-    "--temperature", "0.8",          # lower-entropy rollouts improved solve|answer EWMA in the baseline runs
-    "--top-p", "0.95",               # less aggressive than the old 0.7 truncation, but avoids fully open-tail samples
-    "--max-new-tokens", "5632",      # fixed think budget before answer forcing; 5632+512 matches the 6144 eval budget
-    "--max-model-len", "7168",       # covers max train prompt(~590)+5632+marker+512 answer continuation
-    "--device-batch-size", "2",      # fp32 trainer fits at batch 2 (OOM'd at 4); fp32 logits chunk is the batch-scaled cost
+    "--examples-per-step", "16",     
+    "--num-samples", "8",            
+    "--temperature", "0.8",          
+    "--top-p", "0.95",               
+    "--max-new-tokens", "5632",      
+    "--max-model-len", "7168",       
+    "--device-batch-size", "2",      
     "--logits-chunk-size", "2048",
     "--gradient-checkpointing",
-    "--interruption",                # ScaleRL A.10: force an answer instead of hard-truncating to 0 reward (keeps TRAIN trunc low)
+    "--interruption",                
     "--interrupt-answer-tokens", "512",
-    "--learning-rate", "8e-7",       # constant LR (ScaleRL 5e-7 / DAPO 1e-6 are both constant; 8e-7 sits between)
-    "--init-lr-frac", "0.05",        # warmup starts at 5% of peak
-    "--warmup-steps", "5",           # linear warmup over 5 steps, then CONSTANT LR (ScaleRL & DAPO both use constant, no decay)
+    "--learning-rate", "8e-7",       
+    "--init-lr-frac", "0.05",       
+    "--warmup-steps", "5",           
     "--lr-schedule", "constant",
-    "--grad-clip", "1.0",            #
-    "--cispo-eps", "4.0",            # ScaleRL-faithful CISPO upper IS cap; inert in practice (clip ~never fires)
-    "--loss-normalization", "sequence",  # sample-level (GRPO). NOTE: prompt-level (ScaleRL §3.2) caused a length
-                                         # runaway in this sprint regime (run odxkh0nl: budget 5632/batch 128 has
-                                         # no headroom, so prompt-level's length-push blew truncation past ScaleRL
-                                         # §A.15's <5% stability line). prompt-level needs a low-truncation regime.
+    "--grad-clip", "1.0",            
+    "--cispo-eps", "4.0",            
+    "--loss-normalization", "sequence",  # sample-level (GRPO). 
     "--max-staleness", "4",          # less off-policy than ScaleRL's 8 (run2-proven stability lever)
     "--inflight-requests", "96",     # measured generator-throughput sweet spot (~22k tok/s); non-monotonic
     "--vllm-gpu-mem-util", "0.9",
     "--vllm-stream-interval", "8",   # buffer token streaming to cut host/IPC overhead; no sampling/budget change
-    # Lift the vLLM scheduler off the ENGINE_CONTEXT 2048/128 floor (verl + prime-rl both confirm the
-    # in-process AsyncLLM misses the H100 default tier). Rollout caps must move together (max_num_seqs
-    # clamps to min(seqs, batched_tokens)); KV-gated at gpu_mem_util 0.9 / max_model_len 7168, so
-    # re-measure vs the inflight=96 ~22k tok/s sweet spot and back off seqs if KV-bound. Eval caps +
-    # concurrency use the otherwise-free node; FREEZE them for the record protocol (they shift
-    # continuous-batching composition, so eval scores are not bit-comparable across cap values).
     "--vllm-max-num-batched-tokens", "8192",
     "--vllm-max-num-seqs", "512",
     "--eval-vllm-max-num-batched-tokens", "16384",
