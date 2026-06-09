@@ -85,7 +85,7 @@ RECIPE = [
     "--init-lr-frac", "0.05",        # warmup starts at 5% of peak
     "--warmup-steps", "5",           # linear warmup over 5 steps, then CONSTANT LR (ScaleRL & DAPO both use constant, no decay)
     "--lr-schedule", "constant",
-    "--grad-clip", "0.5",            # tighter than default 1.0 (run1 showed 1.0 is no backstop)
+    "--grad-clip", "1.0",            #
     "--cispo-eps", "4.0",            # ScaleRL-faithful CISPO upper IS cap; inert in practice (clip ~never fires)
     "--loss-normalization", "sequence",  # sample-level (GRPO). NOTE: prompt-level (ScaleRL §3.2) caused a length
                                          # runaway in this sprint regime (run odxkh0nl: budget 5632/batch 128 has
@@ -95,6 +95,17 @@ RECIPE = [
     "--inflight-requests", "96",     # measured generator-throughput sweet spot (~22k tok/s); non-monotonic
     "--vllm-gpu-mem-util", "0.9",
     "--vllm-stream-interval", "8",   # buffer token streaming to cut host/IPC overhead; no sampling/budget change
+    # Lift the vLLM scheduler off the ENGINE_CONTEXT 2048/128 floor (verl + prime-rl both confirm the
+    # in-process AsyncLLM misses the H100 default tier). Rollout caps must move together (max_num_seqs
+    # clamps to min(seqs, batched_tokens)); KV-gated at gpu_mem_util 0.9 / max_model_len 7168, so
+    # re-measure vs the inflight=96 ~22k tok/s sweet spot and back off seqs if KV-bound. Eval caps +
+    # concurrency use the otherwise-free node; FREEZE them for the record protocol (they shift
+    # continuous-batching composition, so eval scores are not bit-comparable across cap values).
+    "--vllm-max-num-batched-tokens", "8192",
+    "--vllm-max-num-seqs", "512",
+    "--eval-vllm-max-num-batched-tokens", "16384",
+    "--eval-vllm-max-num-seqs", "1024",
+    "--eval-concurrency", "1024",
     "--eval-top-p", "0.95",
     "--save-every", "0",
     "--save-final",
@@ -1560,12 +1571,13 @@ def policy_gradient_loss_from_logits(
     cispo_eps: float | None = None,
     stats: dict | None = None,
     prompt_lengths: torch.Tensor | None = None,
+    kl_tau: float = 0.0,
 ) -> torch.Tensor:
     token_logprobs = token_logprobs_from_logits(logits, labels)
     return policy_gradient_loss_from_token_logprobs(
         token_logprobs, labels, advantages, valid_token_normalizer, valid_sample_normalizer,
         normalizer, sequence_normalize, behavior_logprobs, cispo_eps, stats,
-        prompt_lengths=prompt_lengths)
+        prompt_lengths=prompt_lengths, kl_tau=kl_tau)
 
 
 def policy_gradient_loss_from_token_logprobs(
@@ -1580,8 +1592,10 @@ def policy_gradient_loss_from_token_logprobs(
     cispo_eps: float | None = None,
     stats: dict | None = None,
     prompt_lengths: torch.Tensor | None = None,
+    kl_tau: float = 0.0,
 ) -> torch.Tensor:
     advantage_weight = advantages.to(token_logprobs.dtype).unsqueeze(-1)  # (B, 1)
+    kl_per_token = None  # set below when the optional KL anchor is active (CISPO branch only)
     if behavior_logprobs is not None:
         if cispo_eps is None or cispo_eps <= 0:
             raise ValueError("cispo_eps must be a positive float when behavior_logprobs is provided")
@@ -1591,6 +1605,13 @@ def policy_gradient_loss_from_token_logprobs(
         log_ratio = token_logprobs - behavior_logprobs.to(token_logprobs.dtype)
         is_weight = torch.exp(torch.clamp(log_ratio, max=math.log(cispo_eps))).detach()
         token_weight = is_weight * advantage_weight  # (B, T)
+        # Optional prime-rl-style mismatch-KL anchor: penalize kl_tau * mean(log_ratio**2) over
+        # valid tokens, aggregated per-branch with the SAME denominator as weighted_logprobs (so
+        # kl_tau means the same thing across token/sequence/prompt modes). Grad flows through
+        # token_logprobs only (behavior_logprobs is detached). Mask to valid tokens because log_ratio
+        # is not necessarily 0 at IGNORE positions (token_logprobs is, but behavior may not be).
+        if kl_tau != 0.0:
+            kl_per_token = (log_ratio * log_ratio).masked_fill(labels == IGNORE_INDEX, 0.0)
         if stats is not None:
             # Off-policy drift diagnostics over valid (generated) tokens.
             with torch.no_grad():
@@ -1620,24 +1641,36 @@ def policy_gradient_loss_from_token_logprobs(
         denom = prompt_lengths.to(token_logprobs.dtype).clamp(min=1.0)
         prompt_normalizer = labels.size(0) if valid_sample_normalizer is None else valid_sample_normalizer
         pg_objective = (weighted_logprobs.sum(dim=-1) / denom).sum() / (prompt_normalizer * normalizer)
-        return -pg_objective
+        loss = -pg_objective
+        if kl_per_token is not None:
+            kl_objective = (kl_per_token.sum(dim=-1) / denom).sum() / (prompt_normalizer * normalizer)
+            loss = loss + kl_tau * kl_objective
+        return loss
     if sequence_normalize:
         valid_mask = labels != IGNORE_INDEX
         sample_lengths = valid_mask.sum(dim=-1).clamp(min=1).to(token_logprobs.dtype)
         sample_normalizer = labels.size(0) if valid_sample_normalizer is None else valid_sample_normalizer
         pg_objective = (weighted_logprobs.sum(dim=-1) / sample_lengths).sum() / (sample_normalizer * normalizer)
-        return -pg_objective
+        loss = -pg_objective
+        if kl_per_token is not None:
+            kl_objective = (kl_per_token.sum(dim=-1) / sample_lengths).sum() / (sample_normalizer * normalizer)
+            loss = loss + kl_tau * kl_objective
+        return loss
     valid_count = (labels != IGNORE_INDEX).sum().clamp(min=1)
     token_normalizer = valid_count if valid_token_normalizer is None else valid_token_normalizer
     pg_objective = weighted_logprobs.sum() / (token_normalizer * normalizer)
-    return -pg_objective
+    loss = -pg_objective
+    if kl_per_token is not None:
+        kl_objective = kl_per_token.sum() / (token_normalizer * normalizer)
+        loss = loss + kl_tau * kl_objective
+    return loss
 
 
 def chunked_cispo_loss(model, input_ids, attention_mask, labels, advantages, *,
                        behavior_logprobs=None, cispo_eps=None, chunk_size=1024,
                        valid_token_normalizer=None, valid_sample_normalizer=None,
                        normalizer=1.0, sequence_normalize=False, stats=None,
-                       autocast_dtype=None, prompt_lengths=None):
+                       autocast_dtype=None, prompt_lengths=None, kl_tau=0.0):
     """Memory-efficient CISPO loss: run the base model to hidden states (small: B,T,H),
     then apply the LM head + cross-entropy in checkpointed sequence chunks to avoid
     materializing the full (T, vocab) fp32 logits. The head always runs in fp32; with
@@ -1659,7 +1692,7 @@ def chunked_cispo_loss(model, input_ids, attention_mask, labels, advantages, *,
         valid_sample_normalizer=valid_sample_normalizer,
         normalizer=normalizer, sequence_normalize=sequence_normalize,
         behavior_logprobs=behavior_logprobs, cispo_eps=cispo_eps, stats=stats,
-        prompt_lengths=prompt_lengths)
+        prompt_lengths=prompt_lengths, kl_tau=kl_tau)
 
 
 def batch_normalize_advantages(advantages: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -2188,6 +2221,7 @@ def _eval_one_checkpoint(args: argparse.Namespace, model_path: str, multi: bool)
                 k=args.eval_k, sampling=sampling,
                 enable_thinking=args.enable_thinking,
                 indices=indices,
+                concurrency=args.eval_concurrency,
             )
         finally:
             try:
@@ -3161,6 +3195,7 @@ def run_pipeline(
                     stats=mb_stats,
                     autocast_dtype=train_autocast_dtype,
                     prompt_lengths=prompt_lengths,
+                    kl_tau=args.kl_tau,
                 )
                 loss.backward()
                 loss_sum_t = loss_sum_t + loss.detach()
@@ -3409,25 +3444,30 @@ def run_pipeline(
                         f"| t {t_step:.1f}s (gen {t_collect:.1f}/tr {t_train:.1f}/sync {t_sync:.1f}) "
                         f"| v{current_version} stale {metrics['staleness/mean']:.1f}"
                     )
+                    if wandb_rollouts_enabled and n_seqs > 0:
+                        import wandb
+                        # Sample a spread of this step's rollouts by reward (solved + middle + unsolved).
+                        order = sorted(range(n_seqs), key=lambda i: step_examples[i].reward)
+                        n = min(args.wandb_rollout_samples, n_seqs)
+                        picks = [order[round(j * (n_seqs - 1) / (n - 1))] for j in range(n)] if n > 1 else [order[0]]
+                        step_rows = [[step, step_examples[i].weight_version, staleness[i],
+                                      step_examples[i].puzzle_id, "trained", float(step_examples[i].reward),
+                                      float(step_examples[i].advantage), len(step_examples[i].behavior_logprobs),
+                                      finish_reasons[i], (step_examples[i].completion or "")] for i in picks]
+                        # LIVE per-step rollouts: fold an n-row table into the SAME metrics log (no extra log()
+                        # call => no wandb-step desync; survives an early kill, unlike the once-at-end dump).
+                        # FULL completions logged (already decoded; ~few hundred KB/step at N=10, async upload)
+                        # so the tail — where late repetition / non-termination shows — is visible.
+                        metrics["rollouts_live"] = wandb.Table(columns=wandb_rollout_columns, data=step_rows)
+                        wandb_rollout_rows.extend(step_rows)        # running record; full table dumped in finally
+                        wandb_rollout_rows = wandb_rollout_rows[-1500:]  # covers a full 120-step run at N=10
                     wandb_run.log(metrics)
                     run_logger.log_step(step, num_steps, metrics)
                     _maybe_finalize_inloop_eval_rounds(step)
                     if rollout_fh is not None:
                         rollout_fh.flush()
-                    if wandb_rollouts_enabled and n_seqs > 0:
-                        # Sample a spread of this step's rollouts by reward (so the table shows
-                        # solved + unsolved + middle), append to the running W&B table.
-                        order = sorted(range(n_seqs), key=lambda i: step_examples[i].reward)
-                        n = min(args.wandb_rollout_samples, n_seqs)
-                        picks = [order[round(j * (n_seqs - 1) / (n - 1))] for j in range(n)] if n > 1 else [order[0]]
-                        for i in picks:
-                            e = step_examples[i]
-                            wandb_rollout_rows.append([
-                                step, e.weight_version, staleness[i], e.puzzle_id, "trained",
-                                float(e.reward), float(e.advantage), len(e.behavior_logprobs),
-                                finish_reasons[i], e.completion[:4000],
-                            ])
-                        wandb_rollout_rows = wandb_rollout_rows[-400:]  # cap table size
+                    # (per-step rollout sampling now happens just before wandb_run.log(metrics) above,
+                    # folded into the metrics log as the live "rollouts_live" table)
                     if should_save_checkpoint_for_step(step, num_steps, args.save_every, args.save_final):
                         checkpoint_dir = save_hf_checkpoint(model, tokenizer, run_dir, step)
                         print0(f"Saved checkpoint to {checkpoint_dir}")
@@ -3537,6 +3577,42 @@ def save_hf_checkpoint(
     return checkpoint_dir
 
 
+def _resolve_flash_attention_2_or_raise() -> None:
+    """Fail fast (with an actionable message) if attn_implementation='flash_attention_2' cannot be
+    satisfied, instead of crashing mid-run on the first forward. transformers 5.8 can serve FA2 from
+    the HF `kernels` hub when the standalone flash-attn package is absent (the case here), but that
+    needs the `kernels` library + a one-time hub download of kernels-community/flash-attn2."""
+    try:
+        from transformers.utils import is_flash_attn_2_available
+        if is_flash_attn_2_available():
+            return  # native flash-attn build present
+    except Exception:
+        pass
+    try:
+        from transformers.modeling_flash_attention_utils import lazy_import_flash_attention
+    except Exception:
+        # Resolver API absent in this transformers version; let from_pretrained resolve at load time.
+        return
+    try:
+        from transformers.utils import is_kernels_available
+        kernels_ok = is_kernels_available()
+    except Exception:
+        kernels_ok = True  # let lazy_import_flash_attention be the judge
+    if not kernels_ok:
+        raise RuntimeError(
+            "--attn-implementation flash_attention_2 needs either the flash-attn package or the HF "
+            "`kernels` library (pip install kernels), or use --attn-implementation sdpa."
+        )
+    try:
+        lazy_import_flash_attention("kernels-community/flash-attn2")
+    except Exception as exc:
+        raise RuntimeError(
+            "--attn-implementation flash_attention_2: failed to load the kernels-hub flash-attn2 "
+            f"kernel (needs a one-time HF-hub download / network access): {exc!r}. Pre-download it "
+            "on the node or use --attn-implementation sdpa."
+        ) from exc
+
+
 def load_model_and_tokenizer(args: argparse.Namespace, device: torch.device):
     dtype = resolve_torch_dtype(args.dtype, device)
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=args.trust_remote_code)
@@ -3550,6 +3626,19 @@ def load_model_and_tokenizer(args: argparse.Namespace, device: torch.device):
             added_pad_token = True
 
     loader_kwargs = dict(trust_remote_code=args.trust_remote_code)
+    # FA2 is the default (validated ~5-13% faster trainer step, perfect train/vLLM logprob parity).
+    # fp32 head/tie is unaffected: FA2 only runs the bf16-autocast body matmul. Resolve the kernel
+    # up front; if it's unavailable (no `kernels` pkg / no network / non-Hopper), fall back to SDPA
+    # with a warning rather than crash the run — the fallback is visible in the log + as a higher train_s.
+    requested_attn = args.attn_implementation
+    if requested_attn == "flash_attention_2":
+        try:
+            _resolve_flash_attention_2_or_raise()
+        except Exception as exc:
+            print0(f"WARNING: --attn-implementation flash_attention_2 unavailable; falling back to sdpa: {exc}")
+            requested_attn = "sdpa"
+    if requested_attn != "sdpa":
+        loader_kwargs["attn_implementation"] = requested_attn
     try:
         model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype, **loader_kwargs)
     except TypeError:
@@ -3557,6 +3646,7 @@ def load_model_and_tokenizer(args: argparse.Namespace, device: torch.device):
     if added_pad_token:
         model.resize_token_embeddings(len(tokenizer))
     model.to(device)
+    print0(f"Attention implementation: {getattr(model.config, '_attn_implementation', 'unknown')}")
 
     if dtype != torch.float32 and hasattr(model, "lm_head") and isinstance(model.lm_head, torch.nn.Linear):
         model.lm_head = FP32LMHead(model.lm_head)
@@ -3666,6 +3756,15 @@ def build_parser() -> argparse.ArgumentParser:
                         help="torch.compile the transformer body (dynamic shapes) to cut the fp32 train "
                              "step. Off by default; verify grad_norm/loss match eager and watch for "
                              "recompile churn (variable sequence lengths) before trusting it.")
+    parser.add_argument("--attn-implementation", choices=["sdpa", "flash_attention_2", "eager"],
+                        default="flash_attention_2",
+                        help="HF attention implementation for the TRAINER body forward. Default "
+                             "'flash_attention_2' (validated ~5-13%% faster trainer step on H100 with "
+                             "perfect train/vLLM logprob parity). Works WITHOUT a from-source flash-attn "
+                             "build: transformers serves it from the HF `kernels` hub (needs the `kernels` "
+                             "pkg + a one-time download; cached on the Modal volume). If the kernel can't "
+                             "load it falls back to 'sdpa' with a warning. fp32 head/tie is unaffected "
+                             "(FA2 runs only the bf16 body). Use 'sdpa' to force the old path.")
     parser.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--save-every", type=int, default=60, help="Save every N steps; 0 disables periodic saves")
     parser.add_argument("--save-final", action=argparse.BooleanOptionalAction, default=True)
@@ -3681,11 +3780,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Pass enforce_eager=True to the rollout vLLM engine. This can reduce cold-start "
                              "CUDA graph capture time but may lower steady-state generation throughput; off by default.")
     parser.add_argument("--vllm-max-num-seqs", type=int, default=None,
-                        help="Optional vLLM scheduler max_num_seqs for rollout generation. "
-                             "Unset preserves vLLM's auto default.")
+                        help="vLLM scheduler max_num_seqs for rollout generation. NOTE: when unset, the "
+                             "in-process AsyncLLM (ENGINE_CONTEXT) falls back to 128, NOT the H100 1024 "
+                             "tier, so the RECIPE sets it explicitly. Re-clamped to "
+                             "min(max_num_seqs, max_num_batched_tokens) — raise both together.")
     parser.add_argument("--vllm-max-num-batched-tokens", type=int, default=None,
-                        help="Optional vLLM scheduler max_num_batched_tokens for rollout generation. "
-                             "Unset preserves vLLM's auto default.")
+                        help="vLLM scheduler max_num_batched_tokens for rollout generation. NOTE: when "
+                             "unset, the in-process AsyncLLM (ENGINE_CONTEXT) falls back to 2048, NOT the "
+                             "H100 8192 tier, so the RECIPE sets it explicitly.")
     parser.add_argument("--vllm-max-num-scheduled-tokens", type=int, default=None,
                         help="Optional vLLM scheduler max_num_scheduled_tokens for rollout generation. "
                              "Unset defaults to max_num_batched_tokens.")
@@ -3724,6 +3826,12 @@ def build_parser() -> argparse.ArgumentParser:
                              "Debug guard; small overhead. No-op at world_size==1.")
     parser.add_argument("--cispo-eps", type=float, default=4.0,
                         help="CISPO upper clip epsilon_max for the importance weight")
+    parser.add_argument("--kl-tau", type=float, default=0.0,
+                        help="Optional prime-rl-style mismatch-KL anchor: adds kl_tau * mean(log_ratio**2) "
+                             "over valid tokens, aggregated with the SAME per-prompt/per-sample/per-token "
+                             "denominator as the policy loss. Back-props through the policy logprobs only "
+                             "(behavior detached). 0.0 (default) disables it (byte-identical). Active only "
+                             "when behavior logprobs are present (the CISPO branch). prime-rl's default is 1e-3.")
     parser.add_argument("--max-model-len", type=int, default=8192,
                         help="vLLM max_model_len (prompt + generation) for the generators; must cover "
                              "prompt (~700) + --max-new-tokens (6144).")
@@ -3801,11 +3909,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-vllm-enforce-eager", action=argparse.BooleanOptionalAction, default=False,
                         help="Pass enforce_eager=True to the standalone eval vLLM engine.")
     parser.add_argument("--eval-vllm-max-num-seqs", type=int, default=None,
-                        help="Optional vLLM scheduler max_num_seqs for the standalone eval engine. "
-                             "Unset preserves vLLM's auto default.")
+                        help="vLLM scheduler max_num_seqs for the standalone eval engine. When unset, "
+                             "the AsyncLLM (ENGINE_CONTEXT) falls back to 128, NOT the H100 1024 tier. "
+                             "To realize a higher value you must also raise --eval-concurrency in lockstep.")
     parser.add_argument("--eval-vllm-max-num-batched-tokens", type=int, default=None,
-                        help="Optional vLLM scheduler max_num_batched_tokens for the standalone eval engine. "
-                             "Unset preserves vLLM's auto default.")
+                        help="vLLM scheduler max_num_batched_tokens for the standalone eval engine. When "
+                             "unset, the AsyncLLM (ENGINE_CONTEXT) falls back to 2048, NOT the H100 8192 tier.")
     parser.add_argument("--eval-vllm-max-num-scheduled-tokens", type=int, default=None,
                         help="Optional vLLM scheduler max_num_scheduled_tokens for the standalone eval engine. "
                              "Unset defaults to max_num_batched_tokens.")
@@ -3829,6 +3938,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "Unset preserves vLLM's default.")
     parser.add_argument("--eval-limit", type=int, default=None,
                         help="Evaluate only the first N puzzles (smoke tests); default = full eval set.")
+    parser.add_argument("--eval-concurrency", type=int, default=128,
+                        help="Max concurrent in-flight eval requests (asyncio semaphore) for the "
+                             "standalone --eval-only path. Raise in lockstep with --eval-vllm-max-num-seqs "
+                             "so the engine is actually fed beyond 128 sequences.")
     return parser
 
 
