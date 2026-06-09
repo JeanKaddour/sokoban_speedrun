@@ -26,6 +26,7 @@ import uuid
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterator
@@ -50,6 +51,14 @@ ALLPASS_WARN_FRAC = 0.5      # all-pass zero-variance drops >= this share of fre
                              # being mastered (curriculum starvation / wasted generation); warn at/above it
 WEIGHT_SYNC_TIMEOUT_S = 300.0  # bound the rank-0 weight broadcast so a dead vLLM child can't hang the trainer
 ROLLOUT_GET_TIMEOUT_S = 300.0  # bound result-queue waits so a silent vLLM child crash can't stall the trainer
+# Trainer-group NCCL timeout. Workers sit in the Phase-C broadcast recv for ALL of rank 0's
+# Phase A, which is legitimately unbounded (a reject storm needs >reject_limit consecutive groups,
+# ~15-35 min of generation, before the diagnostic abort; the rank-0 setup workers wait on can also
+# exceed 10 min on a cold node). torch's default 10-minute watchdog would kill healthy workers
+# mid-recv with an opaque NCCL error before those paths resolve, so raise it well above any healthy
+# stall; real failures are covered by the poison/init-status protocol and the explicit
+# WEIGHT_SYNC/ROLLOUT_GET timeouts above.
+TRAINER_PG_TIMEOUT_S = 7200.0
 MSG_GENERATE = "generate"
 MSG_ROLLOUT = "rollout"
 MSG_INIT_WEIGHTS = "init_weights"
@@ -108,8 +117,6 @@ RECIPE = [
     "--wandb-rollout-samples", "20",  # log N=10 rollouts/step to the wandb "rollouts_live" + final "rollouts" tables
 ]
 # ============================================================================================
-ANSWER_COMPLETE_RE = re.compile(r"####\s*[UDLRudlr]+(?=$|[^UDLRudlr])")
-ANSWER_TAG_RE = re.compile(r"<answer>.*?</answer>", re.IGNORECASE | re.DOTALL)
 _BOARD_PLACEHOLDER = "{board}"
 SOKOBAN_RG_PROMPT_TEMPLATE = """You are solving a Sokoban puzzle. You are the player (*); push every box (@) onto a goal (X).
 
@@ -1124,19 +1131,14 @@ def normalize_sokoban_moves(candidate: str) -> str | None:
 
 
 def extract_sokoban_answer(completion: str) -> str | None:
-    """Extract normalized Sokoban moves from answer tags or after the first #### marker."""
-    tag = SOKOBAN_ANSWER_TAG_RE.search(completion)
-    if tag is not None:
-        return normalize_sokoban_moves(tag.group(1))
+    """Extract normalized Sokoban moves from answer tags or after the first #### marker.
 
-    marker = SOKOBAN_MARKER_RE.search(completion)
-    if marker is None:
-        return None
-    for line in completion[marker.end() :].splitlines():
-        if not line.strip():
-            continue
-        return normalize_sokoban_moves(line)
-    return None
+    Thin wrapper over find_sokoban_answer_end_and_moves — the single source of truth for
+    answer extraction — so the training trim/score path and every eval path score identically
+    by construction (they used to disagree on tag-vs-marker precedence and on spaced/word-form
+    '####' answers, making the trained reward diverge from the eval reward)."""
+    _, moves = find_sokoban_answer_end_and_moves(completion)
+    return moves
 
 
 @lru_cache(maxsize=1)
@@ -1303,13 +1305,28 @@ def decode_completion(tokenizer, sequence: torch.Tensor, prefix_length: int) -> 
 
 
 def find_sokoban_answer_end_and_moves(text: str) -> tuple[int | None, str | None]:
-    marker_match = ANSWER_COMPLETE_RE.search(text)
-    tag_match = ANSWER_TAG_RE.search(text)
-    matches = [match for match in (marker_match, tag_match) if match is not None]
-    for match in sorted(matches, key=lambda candidate: candidate.start()):
-        moves = extract_sokoban_answer(text[: match.end()])
-        if moves is not None:
-            return match.end(), moves
+    """Locate the answer that scoring uses, as (answer_end, moves).
+
+    SINGLE SOURCE OF TRUTH for answer extraction. Precedence is the pinned eval semantics:
+    the FIRST <answer> tag wins; only when no tag exists anywhere does the first '####'
+    marker's first non-blank line count. `moves` is what gets scored; `answer_end` is the
+    char offset just past the scored answer, for --trim-after-answer. answer_end is non-None
+    only when the answer parsed (an unparseable answer leaves the sequence untrimmed)."""
+    tag = SOKOBAN_ANSWER_TAG_RE.search(text)
+    if tag is not None:
+        moves = normalize_sokoban_moves(tag.group(1))
+        return (tag.end() if moves is not None else None), moves
+    marker = SOKOBAN_MARKER_RE.search(text)
+    if marker is None:
+        return None, None
+    pos = marker.end()
+    for line in text[pos:].splitlines(keepends=True):
+        content = line.rstrip("\r\n")
+        if not content.strip():
+            pos += len(line)
+            continue
+        moves = normalize_sokoban_moves(content)
+        return (pos + len(content) if moves is not None else None), moves
     return None, None
 
 
@@ -1879,8 +1896,16 @@ async def run_held_out_eval(
     total_length_trunc = sum(r["length_trunc"] for r in results)
     pass_at_1 = sum(per_puzzle) / max(1, n_puzzles)  # puzzle-weighted (== solved/total when n_i==k)
 
+    # vLLM can drop occasional None/empty completions (see _vllm_generate), so a puzzle may carry
+    # n < k samples. Clamp the estimator's k to the per-puzzle n: pass@min(j, n) <= pass@j, so a
+    # shortfall can only deflate the score (never inflate a record), and the eval cannot crash at
+    # aggregation (the estimator requires k <= n) after all the generation work is done.
+    n_short = sum(1 for r in results if r["n"] < k)
+    if n_short:
+        print(f"WARNING: {n_short}/{n_puzzles} puzzles returned fewer than k={k} samples; "
+              f"pass@k clamps k to each puzzle's sample count", flush=True)
     pass_at_k = {
-        j: sum(_pass_at_k_unbiased(r["n"], r["c"], j) for r in results) / max(1, n_puzzles)
+        j: sum(_pass_at_k_unbiased(r["n"], r["c"], min(j, r["n"])) for r in results) / max(1, n_puzzles)
         for j in pass_at_ks if j <= k
     }
 
@@ -2416,10 +2441,11 @@ def run_pipeline(
     # barrier and only wait at the (5) broadcast, which rank 0 sources after finishing (4). The
     # whole block is skipped for T==1.
     if world_size > 1:
+        pg_timeout = timedelta(seconds=TRAINER_PG_TIMEOUT_S)
         try:
-            dist.init_process_group(backend="nccl", device_id=device)
+            dist.init_process_group(backend="nccl", device_id=device, timeout=pg_timeout)
         except TypeError:
-            dist.init_process_group(backend="nccl")
+            dist.init_process_group(backend="nccl", timeout=pg_timeout)
         dist.barrier()  # (1) the ONLY init barrier; symmetric all-rank; see invariant above.
     print0(f"Pipeline trainer world size: {world_size}")
 
@@ -2988,6 +3014,19 @@ def run_pipeline(
                             msg["samples"],
                         ))
                         t_decode_trim_score += time.monotonic() - t_process_start
+                        if not processed_samples:
+                            # vLLM dropped every completion in this group (see _vllm_generate's
+                            # None/empty filter): nothing to score, and the zero-variance branch
+                            # below would crash on max([]). Treat it as a rejected group so the
+                            # reject-limit safety net still catches a persistently broken generator.
+                            print0(f"[collect] step {step}: group pid={pid} returned 0 usable samples; skipping")
+                            consecutive_rejected += 1
+                            consecutive_rejected_max = max(consecutive_rejected_max, consecutive_rejected)
+                            if consecutive_rejected > reject_limit:
+                                raise _abort_step(
+                                    f"step {step}: rejected {consecutive_rejected} consecutive rollout groups "
+                                    f"(staleness bound too tight or rewards degenerate); aborting")
+                            continue
                         rewards = [sample.reward for sample in processed_samples]
                         fins = [sample.finish_reason for sample in processed_samples]
                         rewards_t = torch.tensor(rewards, dtype=torch.float32)
@@ -3214,14 +3253,18 @@ def run_pipeline(
                 # Reduce the diagnostic accumulators to GLOBAL sums in the all-ranks region (one
                 # extra small all-reduce). Without this they were rank-0-local, so is_ratio/* only
                 # reflected rank 0's shard; the new ESS/drift metrics need the full-batch view too.
+                # loss_sum_t rides along: each rank computes its shard loss with normalizer=1.0
+                # over GLOBAL counts, so the true step loss is the SUM over ranks — without this
+                # the logged `loss` (wandb + record log) was rank 0's shard-partial value (~1/T).
                 diag_t = torch.stack([
                     is_ratio_acc_t, is_clip_acc_t, is_tok_acc_t.to(torch.float32),
-                    log_ratio_acc_t, is_ratio_sq_acc_t,
+                    log_ratio_acc_t, is_ratio_sq_acc_t, loss_sum_t,
                 ])
                 dist.all_reduce(diag_t, op=dist.ReduceOp.SUM)
                 is_ratio_acc_t, is_clip_acc_t = diag_t[0], diag_t[1]
                 is_tok_acc_t = diag_t[2].to(torch.long)
                 log_ratio_acc_t, is_ratio_sq_acc_t = diag_t[3], diag_t[4]
+                loss_sum_t = diag_t[5]
             # ---- Phase F (ALL RANKS): clip + step on the global gradient; identical grads +
             # identical AdamW state keep every rank's params byte-identical afterward. ----
             t_optimizer_start = time.monotonic()
