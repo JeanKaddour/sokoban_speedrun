@@ -251,7 +251,8 @@ def _parse_seeds(spec: str) -> list[int]:
 
 
 def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: list[int],
-                  target: float = 0.70) -> list[list[str]]:
+                  target: float = 0.70, eval_max_tokens: int = 6144, eval_max_model_len: int = 8192,
+                  interruption: bool = False, interrupt_answer_tokens: int = 512) -> list[list[str]]:
     """speedrun --eval-only command(s). `checkpoint` may be a comma-separated list of final
     checkpoints (one per training seed): that emits ONE record-eval command that evaluates all
     of them under the pinned protocol at a single eval seed and ends with the built-in
@@ -267,12 +268,15 @@ def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds
         raise ValueError(f"EVAL_CHECKPOINT must name at least one checkpoint, got {checkpoint!r}")
     # --eval-data and --eval-top-p come from speedrun's RECIPE (prepended by speedrun.main());
     # --eval-only reads them and ignores the training-side flags. Only the standalone eval-engine
-    # specifics are set here: keep room for prompt + the full 6144-token measurement budget, and
-    # deliberately no interruption-based answer forcing.
+    # specifics are set here. Defaults are the record protocol: 6144-token budget, no interruption.
+    # EVAL_MAX_TOKENS / EVAL_MAX_MODEL_LEN / EVAL_INTERRUPTION override (e.g. a generous training-like
+    # eval); --eval-max-model-len must cover prompt + max_tokens + the forced-answer continuation.
     common = [sys.executable, "-m", "speedrun", "--eval-only",
               "--run", run_name,
-              "--eval-k", str(k), "--eval-max-tokens", "6144",
-              "--eval-max-model-len", "8192", "--eval-vllm-dp", str(NUM_GPUS)]
+              "--eval-k", str(k), "--eval-max-tokens", str(eval_max_tokens),
+              "--eval-max-model-len", str(eval_max_model_len), "--eval-vllm-dp", str(NUM_GPUS)]
+    if interruption:
+        common += ["--eval-interruption", "--eval-interrupt-answer-tokens", str(interrupt_answer_tokens)]
     if eval_limit > 0:
         common += ["--eval-limit", str(eval_limit)]
     if len(checkpoints) > 1:
@@ -300,7 +304,8 @@ def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds
     secrets=runtime_secrets,
 )
 def evaluate(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: str = "12345",
-             target: float = 0.70) -> None:
+             target: float = 0.70, eval_max_tokens: int = 6144, eval_max_model_len: int = 8192,
+             interruption: bool = False) -> None:
     """Authoritative held-out eval (speedrun.py --eval-only): own vLLM engine over all GPUs at the
     full 6144-token leaderboard budget. `checkpoint` is a /vol path or an HF id (e.g. Qwen/Qwen3-4B
     for the base) — or a COMMA-SEPARATED list of final checkpoints (one per training seed), which
@@ -321,7 +326,8 @@ def evaluate(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: str
     env["LD_LIBRARY_PATH"] = _nvidia_ld_library_path()
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     record_mode = "," in checkpoint
-    for command in eval_commands(checkpoint, run_name, k, eval_limit, _parse_seeds(seeds), target):
+    for command in eval_commands(checkpoint, run_name, k, eval_limit, _parse_seeds(seeds), target,
+                                 eval_max_tokens, eval_max_model_len, interruption):
         print(f"Eval: {' '.join(command)} (cwd={VOLUME_MOUNT_PATH})", flush=True)
         try:
             if record_mode:
@@ -335,8 +341,81 @@ def evaluate(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: str
             volume.commit()  # commit per eval so partial results survive a crash
 
 
+@app.function(
+    image=image,
+    gpu=f"{GPU_TYPE}:{NUM_GPUS}",
+    cpu=CPU_REQUEST,
+    timeout=6 * 60 * 60,
+    volumes={VOLUME_MOUNT_PATH: volume},
+    secrets=runtime_secrets,
+)
+def probe_datasets(eval_datasets: list[str], run_name: str, k: int, eval_limit: int,
+                   max_tokens: int, max_model_len: int, interruption: bool,
+                   model: str = "Qwen/Qwen3-4B") -> None:
+    """Base-model pass@k probe (P0) across a difficulty ladder. Runs speedrun --eval-only against
+    the BASE model on each eval dataset (relative /vol path) and writes one JSON per set to
+    outputs/<run>/probe_<stem>.json. Used to locate the productive (0,1) reward-variance band from
+    the per_puzzle_solved_count distribution BEFORE committing a training run to a dataset. Mirrors
+    the TRAINING rollout regime (5632 think budget + interruption answer-forcing, temp 0.8) so the
+    saturation/all-fail readout predicts the live group_pass@k, not the leaderboard budget."""
+    import os.path as osp
+    env = dict(os.environ)
+    env.pop("CUDA_VISIBLE_DEVICES", None)
+    _ensure_persistent_cache_dirs()
+    env.update(_persistent_cache_env())
+    print(
+        f"Persistent caches: HF_HOME={env['HF_HOME']} HF_HUB_CACHE={env['HF_HUB_CACHE']} "
+        f"VLLM_CACHE_ROOT={env['VLLM_CACHE_ROOT']}",
+        flush=True,
+    )
+    env["LD_LIBRARY_PATH"] = _nvidia_ld_library_path()
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    for ds in eval_datasets:
+        stem = osp.splitext(osp.basename(ds))[0]
+        out = f"outputs/{run_name}/probe_{stem}.json"
+        command = [sys.executable, "-m", "speedrun", "--eval-only",
+                   "--run", run_name,
+                   "--eval-checkpoint", model,
+                   "--eval-data", ds,
+                   "--eval-k", str(k),
+                   "--eval-temperature", "0.8", "--eval-top-p", "0.95", "--eval-seed", "12345",
+                   "--eval-max-tokens", str(max_tokens),
+                   "--eval-max-model-len", str(max_model_len),
+                   "--eval-vllm-dp", str(NUM_GPUS),
+                   "--eval-output", out]
+        if eval_limit > 0:
+            command += ["--eval-limit", str(eval_limit)]
+        if interruption:
+            command += ["--eval-interruption", "--eval-interrupt-answer-tokens", "512"]
+        print(f"Probe: {' '.join(command)} (cwd={VOLUME_MOUNT_PATH})", flush=True)
+        try:
+            subprocess.run(command, check=True, env=env, cwd=VOLUME_MOUNT_PATH)
+        finally:
+            volume.commit()  # commit per dataset so partial results survive a crash
+
+
 @app.local_entrypoint()
 def main() -> None:
+    # Probe mode: PROBE_DATASETS="datasets/a_eval.jsonl,datasets/b_eval.jsonl" modal run modal_app.py
+    #   (blocking .remote(); no --detach needed). Locates the (0,1) reward-variance band on the base
+    #   model. RUN_NAME pins the output dir; pull with `modal volume get nanochat-rl-hf /outputs/<run>`.
+    probe_spec = os.environ.get("PROBE_DATASETS")
+    if probe_spec:
+        eval_datasets = [d.strip() for d in probe_spec.split(",") if d.strip()]
+        k = int(os.environ.get("EVAL_K", "8"))
+        eval_limit = int(os.environ.get("EVAL_LIMIT", "100"))
+        max_tokens = int(os.environ.get("PROBE_MAX_TOKENS", "5632"))
+        max_model_len = int(os.environ.get("PROBE_MAX_MODEL_LEN", "7168"))
+        interruption = os.environ.get("PROBE_INTERRUPTION", "1") not in ("0", "false", "False", "")
+        model = os.environ.get("PROBE_MODEL", "Qwen/Qwen3-4B")
+        run_name = os.environ.get("RUN_NAME") or f"sokoban-probe-{datetime.now():%Y%m%d-%H%M%S}"
+        print(f"Running base-model probe: sets={eval_datasets} run={run_name} k={k} "
+              f"limit={eval_limit} max_tokens={max_tokens} interruption={interruption}", flush=True)
+        probe_datasets.remote(eval_datasets, run_name, k, eval_limit, max_tokens, max_model_len,
+                              interruption, model)
+        print(f"Probe complete. Pull results: "
+              f"modal volume get nanochat-rl-hf /outputs/{run_name} ./reports/probe_modal --force", flush=True)
+        return
     # Eval mode: EVAL_CHECKPOINT=<vol path or HF id> modal run --detach modal_app.py
     # Record mode: EVAL_CHECKPOINT="ckptA,ckptB,..." (one final checkpoint per training seed) runs
     # the whole record eval + significance verdict in one call; EVAL_TARGET sets the bar (0.70).
@@ -346,15 +425,24 @@ def main() -> None:
         eval_limit = int(os.environ.get("EVAL_LIMIT", "0"))  # 0 = full eval set; >0 = first N (cheap dev)
         seeds = ",".join(str(s) for s in _parse_seeds(os.environ.get("EVAL_SEEDS", "12345")))
         target = float(os.environ.get("EVAL_TARGET", "0.70"))
+        eval_max_tokens = int(os.environ.get("EVAL_MAX_TOKENS", "6144"))
+        eval_max_model_len = int(os.environ.get("EVAL_MAX_MODEL_LEN", "8192"))
+        eval_interruption = os.environ.get("EVAL_INTERRUPTION", "0") not in ("0", "false", "False", "")
         run_name = os.environ.get("RUN_NAME") or f"sokoban-eval-{datetime.now():%Y%m%d-%H%M%S}"
-        print(f"Running eval: ckpt={eval_ckpt}, run={run_name}, k={k}, "
-              f"limit={eval_limit}, seeds=[{seeds}], target={target}", flush=True)
-        evaluate.remote(eval_ckpt, run_name, k, eval_limit, seeds, target)
+        print(f"Running eval: ckpt={eval_ckpt}, run={run_name}, k={k}, limit={eval_limit}, "
+              f"seeds=[{seeds}], target={target}, max_tokens={eval_max_tokens}, "
+              f"max_model_len={eval_max_model_len}, interruption={eval_interruption}", flush=True)
+        evaluate.remote(eval_ckpt, run_name, k, eval_limit, seeds, target,
+                        eval_max_tokens, eval_max_model_len, eval_interruption)
         return
     # NTRAINERS=1 => single trainer + 7 vLLM; NTRAINERS=2 => 2 trainers + 6 vLLM (torchrun), etc.
-    # Default = short throughput probe. Full sprint e.g.: MAX_STEPS=22 modal run --detach modal_app.py
+    # Default NTRAINERS=3 is the CANONICAL sprint trainer count: the node is trainer-bound at inflight 96
+    # so 3 trainers (6 microbatches fewer per rank than nt2) is the sweet spot (~30% faster per step than
+    # nt2; rvvtdz8w's setting). PINNED here so we never accidentally launch nt2. Trainer count is a torchrun
+    # launch param (not a speedrun CLI arg), so it lives here; the rest of the recipe is speedrun.py RECIPE.
+    # Full sprint e.g.: MAX_STEPS=150 modal run --detach modal_app.py
     max_steps = int(os.environ.get("MAX_STEPS", "4"))
-    num_trainers = int(os.environ.get("NTRAINERS", "1"))
+    num_trainers = int(os.environ.get("NTRAINERS", "3"))
     extra_args = shlex.split(os.environ.get("EXTRA_ARGS", ""))
     final_eval_k = int(os.environ.get("FINAL_EVAL_K", "0"))
     final_eval_limit = int(os.environ.get("FINAL_EVAL_LIMIT", "0"))
