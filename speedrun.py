@@ -113,8 +113,8 @@ RECIPE = [
     "--eval-top-p", "0.95",
     "--save-every", "0",
     "--save-final",
-    "--no-save-rollouts",
-    "--wandb-rollout-samples", "0",
+    "--no-save-rollouts",             # no rollout jsonl on disk (avoids volume-commit churn)
+    "--wandb-rollout-samples", "20",  # log N=10 rollouts/step to the wandb "rollouts_live" + final "rollouts" tables
 ]
 # ============================================================================================
 ANSWER_COMPLETE_RE = re.compile(r"####\s*[UDLRudlr]+(?=$|[^UDLRudlr])")
