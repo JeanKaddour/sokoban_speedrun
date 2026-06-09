@@ -12,8 +12,8 @@ Motivation: A lot of LLM RL papers don't reproduce and there are many high-varia
 
 Two roles share the node:
 
-- **Generator** — one vLLM process samples completions for each puzzle.
-- **Trainers** — data-parallel ranks score the rollouts (Sokoban solutions verified by ReasoningGym), update the policy, and broadcast fresh weights to the generator over NCCL.
+- **Generator**: one vLLM process samples completions for each puzzle.
+- **Trainers**: data-parallel ranks score the rollouts (solutions verified by ReasoningGym), update the policy, and broadcast fresh weights to the generator over NCCL.
 
 The two run concurrently, so the generator never idles waiting for a step.
 
@@ -68,7 +68,9 @@ The function runs `python -m speedrun` from the `nanochat-rl-hf` volume (mounted
 ## Why Sokoban?
 
 * Small contamination risk: We generate fresh puzzles, so unlike Go or GSM8k there is little risk the base model has memorized them.
-* Diverse reasoning paths are encouraged, as Puzzles typically permit multiple solutions. Ideal for measuring the model's diversity. 
+* Simple enough to yield RL gains in `O(10)` GPU hours
+* Hard enough for gains to be meaningful: Sokoban is PSPACE-complete and can't be brute-forced; it requires genuine reasoning capabilities.
+* Diverse reasoning paths are encouraged. Puzzles naturally permit multiple solutions.
 
 ## Why handroll your own asnyc RL stack?
 * Using an existing framework might help in the short term, but it comes with a lot of machinery and overhead that isn't needed here. General-purpose frameworks are built to support every RL scenario and layers of abstraction between you and the training loop. 
