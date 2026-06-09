@@ -6,6 +6,17 @@ Sokoban: If you don't know it, the best way to familiarize yourself with it is [
 
 Motivation: A lot of LLM RL papers don't reproduce and there are many high-variance moving parts in their pipelines. This is an attempt to standardize things.
 
+## How it works
+
+`speedrun.py` is a self-contained async RL pipeline in one file. It is designed to run on one 8×H100 node, using `torch` and `vllm`. 
+
+Two roles share the node:
+
+- **Generator** — one vLLM process samples completions for each puzzle.
+- **Trainers** — data-parallel ranks score the rollouts (Sokoban solutions verified by ReasoningGym), update the policy, and broadcast fresh weights to the generator over NCCL.
+
+The two run concurrently, so the generator never idles waiting for a step.
+
 ## Rules
 
 The primary metric is the pass@1 solve-rate, averaged over `5` seeds, but contributors are encouraged to also report pass@k for {4,8,16}. 
@@ -56,13 +67,10 @@ The function runs `python -m speedrun` from the `nanochat-rl-hf` volume (mounted
 
 ## Why Sokoban?
 
-* Sokoban is PSPACE-complete; it can't be brute-forced and genuinely requires strong reasoning capabilities.
 * Small contamination risk: We generate fresh puzzles, so unlike Go or GSM8k there is little risk the base model has memorized them.
 * Diverse reasoning paths are encouraged, as Puzzles typically permit multiple solutions. Ideal for measuring the model's diversity. 
-* Simple enough to yield meaningful RL gains in `O(10)` GPU hours
 
 ## Why handroll your own asnyc RL stack?
-
 * Using an existing framework might help in the short term, but it comes with a lot of machinery and overhead that isn't needed here. General-purpose frameworks are built to support every RL scenario and layers of abstraction between you and the training loop. 
 * Our (initial) setup is minimal: torchrun launches a handful of data-parallel trainer ranks alongside one vLLM generator on its own GPUs of the same 8×H100 node, and the trainer broadcasts fresh weights to vLLM over NCCL. This makes it small enough to read end to end. 
 
