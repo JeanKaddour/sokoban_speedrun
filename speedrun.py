@@ -66,6 +66,10 @@ EVAL_PID_BASE = 1_000_000_000
 # the recipe and therefore OVERRIDES the recipe value (argparse last-wins). --run and --max-steps are
 # deliberately NOT here (they vary per launch). Eval-only invocations also get the recipe prepended,
 # which is harmless: eval reads the eval_* args and ignores the training-side flags.
+# TRAINER COUNT: the canonical sprint runs NTRAINERS=3 (3 trainer ranks + 5 vLLM) — the trainer-bound
+# sweet spot at inflight 96, ~30% faster per step than nt2 (rvvtdz8w's setting). That is a torchrun
+# launch param, NOT a speedrun CLI arg, so it is pinned as the default in modal_app.py (NTRAINERS=3),
+# not in this list.
 RECIPE = [
     "--dtype", "float32",            # MANDATORY: bf16 untying lm_head desyncs vLLM on Qwen3's tied embeds
     "--train-data", "datasets/sokoban_70_easy_train.jsonl",
@@ -2889,7 +2893,9 @@ def run_pipeline(
                 # The record clock starts at the first training step; startup is untimed (see README rules).
                 run_logger.start_clock(t_step_start)
             lr = args.learning_rate * get_lr_multiplier(step, num_steps, args.init_lr_frac,
-                                                        args.warmup_steps, args.lr_schedule)
+                                                        args.warmup_steps, args.lr_schedule,
+                                                        args.min_lr_frac, args.lr_decay_steps,
+                                                        args.lr_decay_start)
             for g in optimizer.param_groups:
                 g["lr"] = lr
 
@@ -3525,6 +3531,9 @@ def get_lr_multiplier(
     init_lr_frac: float = 1.0,
     warmup_steps: int = 0,
     schedule: str = "linear",
+    min_lr_frac: float = 0.0,
+    lr_decay_steps: int | None = None,
+    lr_decay_start: int | None = None,
 ) -> float:
     if warmup_steps > 0 and step < warmup_steps:
         if warmup_steps == 1:
@@ -3535,15 +3544,25 @@ def get_lr_multiplier(
         return 1.0
     if schedule != "linear":
         raise ValueError(f"Unsupported LR schedule: {schedule}")
+    # Linear decay from peak (1.0, at the end of warmup) down to the floor `min_lr_frac`, reached at
+    # absolute step `lr_decay_steps` (defaults to num_steps), then HELD at the floor for the rest of
+    # the run. With min_lr_frac=0.0 and lr_decay_steps=None this is the legacy decay-to-zero schedule.
+    decay_end = lr_decay_steps if lr_decay_steps is not None else num_steps
     if warmup_steps == 0:
         if num_steps <= 1:
             return 1.0
         if step == 0:
             return init_lr_frac
-        return max(0.0, 1.0 - (step - 1) / num_steps)
-    decay_steps = max(1, num_steps - warmup_steps)
-    decay_progress = (step - warmup_steps) / decay_steps
-    return max(0.0, 1.0 - decay_progress)
+        decay_span = max(1, decay_end)
+        decay_progress = min(1.0, max(0.0, (step - 1) / decay_span))
+        return min_lr_frac + (1.0 - min_lr_frac) * (1.0 - decay_progress)
+    # Optional HOLD at peak until `lr_decay_start` (defaults to the end of warmup), then linear decay.
+    decay_start = lr_decay_start if lr_decay_start is not None else warmup_steps
+    if step < decay_start:
+        return 1.0
+    decay_span = max(1, decay_end - decay_start)
+    decay_progress = min(1.0, max(0.0, (step - decay_start) / decay_span))
+    return min_lr_frac + (1.0 - min_lr_frac) * (1.0 - decay_progress)
 
 
 def strip_compiled_state_dict_keys(state_dict: Mapping[str, Any]) -> dict[str, Any]:
@@ -3626,10 +3645,11 @@ def load_model_and_tokenizer(args: argparse.Namespace, device: torch.device):
             added_pad_token = True
 
     loader_kwargs = dict(trust_remote_code=args.trust_remote_code)
-    # FA2 is the default (validated ~5-13% faster trainer step, perfect train/vLLM logprob parity).
-    # fp32 head/tie is unaffected: FA2 only runs the bf16-autocast body matmul. Resolve the kernel
+    # sdpa is the default proven path for the trainer body forward. FA2 is opt-in via
+    # --attn-implementation flash_attention_2 (re-testing at nt3). When requested, resolve the kernel
     # up front; if it's unavailable (no `kernels` pkg / no network / non-Hopper), fall back to SDPA
     # with a warning rather than crash the run — the fallback is visible in the log + as a higher train_s.
+    # fp32 head/tie is unaffected: the attention impl only runs the bf16-autocast body matmul.
     requested_attn = args.attn_implementation
     if requested_attn == "flash_attention_2":
         try:
@@ -3739,6 +3759,27 @@ def build_parser() -> argparse.ArgumentParser:
         default="constant",
         help="LR schedule after warmup.",
     )
+    parser.add_argument(
+        "--min-lr-frac",
+        type=float,
+        default=0.0,
+        help="Floor for the linear schedule, as a fraction of peak LR. Decay stops here and HOLDS "
+             "(0.0 = decay to zero, the legacy behavior).",
+    )
+    parser.add_argument(
+        "--lr-decay-steps",
+        type=int,
+        default=None,
+        help="Absolute step at which the linear decay reaches --min-lr-frac, after which LR holds at "
+             "the floor. Defaults to num_steps (decay spans the whole run).",
+    )
+    parser.add_argument(
+        "--lr-decay-start",
+        type=int,
+        default=None,
+        help="Absolute step at which the linear decay BEGINS; LR holds at peak from the end of warmup "
+             "until here (trapezoid). Defaults to the end of warmup (decay starts immediately).",
+    )
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument(
         "--loss-normalization",
@@ -3759,12 +3800,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--attn-implementation", choices=["sdpa", "flash_attention_2", "eager"],
                         default="flash_attention_2",
                         help="HF attention implementation for the TRAINER body forward. Default "
-                             "'flash_attention_2' (validated ~5-13%% faster trainer step on H100 with "
-                             "perfect train/vLLM logprob parity). Works WITHOUT a from-source flash-attn "
-                             "build: transformers serves it from the HF `kernels` hub (needs the `kernels` "
-                             "pkg + a one-time download; cached on the Modal volume). If the kernel can't "
+                             "'flash_attention_2': in the nt3 A/B it ran ~60 us/tok vs sdpa's ~75-95 "
+                             "(~15-30%% faster, consistent with the original probe). Served from the HF "
+                             "`kernels` hub without a from-source flash-attn build (needs the `kernels` "
+                             "pkg + a one-time download, cached on the Modal volume). If the kernel can't "
                              "load it falls back to 'sdpa' with a warning. fp32 head/tie is unaffected "
-                             "(FA2 runs only the bf16 body). Use 'sdpa' to force the old path.")
+                             "(FA2 runs only the bf16 body). Pass 'sdpa' to force the old path.")
     parser.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--save-every", type=int, default=60, help="Save every N steps; 0 disables periodic saves")
     parser.add_argument("--save-final", action=argparse.BooleanOptionalAction, default=True)
