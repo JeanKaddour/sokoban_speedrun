@@ -19,7 +19,7 @@ Each record links its full training log (script source, environment attestation,
 - **TARGET**: pass@1 > **0.55** on the held-out eval set [`datasets/sokoban_eval.jsonl`](datasets/sokoban_eval.jsonl) (256 puzzles). The submission must clear it via lower 95% bootstrap CI.
 - **Eval protocol**: sample k=16 completions per puzzle to estimate per-sample pass@1 (pass@16 is reported separately), with a 32,768-token budget, interruption answer-forcing, temperature 0.8 / top-p 0.95, and eval seed 12345.
 - **Record time** = the run log's record clock: it starts at training step 1 and ends when the final checkpoint finishes writing. Startup (model load, engine build) is untimed.
-- **Fixed**: the base model (Qwen3-4B), the training set [`datasets/sokoban_train.jsonl`](datasets/sokoban_train.jsonl) (10,000 puzzles, **consumed in file order** — the published ordering is the curriculum and may not be changed), the eval set and protocol above. Both datasets regenerate byte-identically via `python datasets/generate_sokoban_datasets.py --official`.
+- **Fixed**: the base model (Qwen3-4B), the training set [`datasets/sokoban_train.jsonl`](datasets/sokoban_train.jsonl) (10,000 puzzles, consumed in file order), the eval set.
 - **Changeable**: RL algorithm, loss function, schedules, training/inference engine, parallelism, dataset-agnostic auxiliary rewards (e.g. entropy or uncertainty proxies), and the prompt, as long as the changes do not add Sokoban-specific solving knowledge (see FAQ).
 - **Hardware**: one 8xH100 node.
 
@@ -43,7 +43,7 @@ The two run concurrently, so the generator never idles waiting for a step. The b
 
 ## How to run
 
-On an 8-GPU node (3 trainer ranks + 5 vLLM generators):
+On an 8xH100-GPU node (3 trainer ranks + 5 vLLM generators):
 
 ```bash
 torchrun --standalone --nproc_per_node=3 -m speedrun --run myrun --max-steps 100
