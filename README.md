@@ -16,11 +16,8 @@ Each record links its full training log (script source, environment attestation,
 
 # Rules
 
-- **TARGET**: pass@1 > **0.55** on the held-out eval set [`datasets/sokoban_eval.jsonl`](datasets/sokoban_eval.jsonl) (256 puzzles). Your eval's **lower 95% bootstrap CI** (printed by the eval command) must clear the TARGET.
-- **Eval protocol (fixed)**: k=16 samples/puzzle, 12,288-token budget with interruption answer-forcing, temperature 0.8 / top-p 0.95, eval seed 12345. One command (its defaults are the protocol):
-  ```bash
-  EVAL_CHECKPOINT=/vol/outputs/<run>/step_NNNNNN modal run modal_app.py
-  ```
+- **TARGET**: pass@1 > **0.55** on the held-out eval set [`datasets/sokoban_eval.jsonl`](datasets/sokoban_eval.jsonl) (256 puzzles). The submission must clear it via lower 95% bootstrap CI.
+- **Eval protocol**: sample k=16 completions per puzzle to estimate per-sample pass@1 (pass@16 is reported separately), with a 32,768-token budget, interruption answer-forcing, temperature 0.8 / top-p 0.95, and eval seed 12345.
 - **Record time** = the run log's record clock: it starts at training step 1 and ends when the final checkpoint finishes writing. Startup (model load, engine build) is untimed.
 - **Fixed**: the base model (Qwen3-4B), the training set [`datasets/sokoban_train.jsonl`](datasets/sokoban_train.jsonl) (10,000 puzzles, **consumed in file order** — the published ordering is the curriculum and may not be changed), the eval set and protocol above. Both datasets regenerate byte-identically via `python datasets/generate_sokoban_datasets.py --official`.
 - **Changeable**: RL algorithm, loss function, schedules, training/inference engine, parallelism, dataset-agnostic auxiliary rewards (e.g. entropy or uncertainty proxies), and the prompt, as long as the changes do not add Sokoban-specific solving knowledge (see FAQ).
@@ -44,7 +41,7 @@ Two roles share the node:
 
 The two run concurrently, so the generator never idles waiting for a step. The benchmark recipe lives at the top of `speedrun.py` as the `RECIPE` constant — any CLI flag overrides it.
 
-# How to run
+## How to run
 
 On an 8-GPU node (3 trainer ranks + 5 vLLM generators):
 
@@ -70,6 +67,12 @@ EVAL_CHECKPOINT=/vol/outputs/myrun/step_000099 modal run modal_app.py
 
 The function runs `python -m speedrun` from the `nanochat-rl-hf` volume (mounted at `/vol`), so its relative paths resolve there: datasets at `/vol/datasets/`, with checkpoints and logs written to `/vol/outputs/`.
 
+## Evals
+
+```bash
+EVAL_CHECKPOINT=/vol/outputs/<run>/step_NNNNNN modal run modal_app.py
+```
+
 # FAQ
 
 ## Why Sokoban?
@@ -79,9 +82,7 @@ The function runs `python -m speedrun` from the `nanochat-rl-hf` volume (mounted
 * Hard enough for gains to be meaningful: Sokoban is PSPACE-complete and can't be brute-forced; it requires genuine reasoning capabilities.
 * Diverse reasoning paths are encouraged. Puzzles naturally permit multiple solutions.
 
-## Why is the eval non-trivial?
-
-All eval puzzles have 2 boxes and 5–14-move solutions. Under the leaderboard protocol the base model answers 95% of the time but is right on only 23% of attempts: base pass@1 is **0.218**, so the 0.55 TARGET sits far above any luck path. Our reference runs reach pass@16 ≈ 0.97, so there is large headroom both in time-to-target and for raising the TARGET in future seasons.
+All eval puzzles have 2 boxes and 5–14-move solutions. Under the leaderboard protocol the base model answers 95% of the time but is right on only 23% of attempts: base pass@1 is **0.218**, so the 0.55 TARGET sits far above any luck path.
 
 ## Why is the training set ordered?
 
