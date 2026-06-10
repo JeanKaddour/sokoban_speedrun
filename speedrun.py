@@ -25,7 +25,8 @@ import time
 import uuid
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import asdict, dataclass, field, replace
 from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
@@ -81,29 +82,29 @@ EVAL_PID_BASE = 1_000_000_000
 # launch param, NOT a speedrun CLI arg, so it is pinned as the default in modal_app.py (NTRAINERS=3),
 # not in this list.
 RECIPE = [
-    "--dtype", "float32",            
+    "--dtype", "float32",       # load trainer params/head fp32; train autocast runs body bf16, head/logits fp32
     "--train-data", "datasets/sokoban_train.jsonl",
     "--eval-data", "datasets/sokoban_eval.jsonl",
-    "--examples-per-step", "16",     
-    "--num-samples", "8",            
-    "--temperature", "0.8",          
-    "--top-p", "0.95",               
-    "--max-new-tokens", "5632",      
-    "--max-model-len", "7168",       
-    "--device-batch-size", "2",      
+    "--examples-per-step", "16",
+    "--num-samples", "8",
+    "--temperature", "0.8",
+    "--top-p", "0.95",
+    "--max-new-tokens", "5632",
+    "--max-model-len", "7168",
+    "--device-batch-size", "2",
     "--logits-chunk-size", "2048",
     "--gradient-checkpointing",
-    "--interruption",                
+    "--interruption",
     "--interrupt-answer-tokens", "512",
-    "--learning-rate", "8e-7",       
-    "--init-lr-frac", "0.05",       
-    "--warmup-steps", "5",           
+    "--learning-rate", "8e-7",
+    "--init-lr-frac", "0.05",
+    "--warmup-steps", "5",
     "--lr-schedule", "linear",
     "--min-lr-frac", "0.15",
     "--lr-decay-steps", "90",
-    "--grad-clip", "1.0",            
-    "--cispo-eps", "4.0",            
-    "--loss-normalization", "sequence",  # sample-level (GRPO). 
+    "--grad-clip", "1.0",
+    "--cispo-eps", "4.0",
+    "--loss-normalization", "sequence",  # sample-level (GRPO).
     "--max-staleness", "4",          # less off-policy than ScaleRL's 8 (run2-proven stability lever)
     "--inflight-requests", "96",     # measured generator-throughput sweet spot (~22k tok/s); non-monotonic
     "--vllm-gpu-mem-util", "0.9",
@@ -164,6 +165,29 @@ Here is your puzzle:
 """
 
 
+# vLLM scheduler/engine knobs plumbed verbatim from the CLI (`--vllm-*` for rollout generation,
+# `--eval-vllm-*` for the standalone eval engine) into AsyncEngineArgs. None means "preserve
+# vLLM's default" everywhere along the way. Adding a knob = one entry here + one add_argument in
+# _add_vllm_tuning_args (both flag families pick it up automatically).
+VLLM_TUNE_KEYS = (
+    "max_num_seqs",
+    "max_num_batched_tokens",
+    "max_num_scheduled_tokens",
+    "max_num_partial_prefills",
+    "max_long_partial_prefills",
+    "long_prefill_token_threshold",
+    "enable_chunked_prefill",
+    "scheduler_reserve_full_isl",
+    "stream_interval",
+    "performance_mode",
+)
+
+
+def vllm_tuning_from_args(args: argparse.Namespace, prefix: str = "") -> dict[str, Any]:
+    """Collect one --[eval-]vllm-* flag family into build_async_engine tuning kwargs."""
+    return {key: getattr(args, f"{prefix}vllm_{key}") for key in VLLM_TUNE_KEYS}
+
+
 def build_async_engine(
     model: str,
     num_dp: int,
@@ -173,18 +197,15 @@ def build_async_engine(
     gpu_memory_utilization: float = 0.85,
     seed: int = 0,
     enforce_eager: bool = False,
-    max_num_seqs: int | None = None,
-    max_num_batched_tokens: int | None = None,
-    max_num_scheduled_tokens: int | None = None,
-    max_num_partial_prefills: int | None = None,
-    max_long_partial_prefills: int | None = None,
-    long_prefill_token_threshold: int | None = None,
-    enable_chunked_prefill: bool | None = None,
-    scheduler_reserve_full_isl: bool | None = None,
-    stream_interval: int | None = None,
-    performance_mode: str | None = None,
+    **tuning,
 ):
-    """Construct the in-process vLLM AsyncLLM with native NCCL weight transfer enabled."""
+    """Construct the in-process vLLM AsyncLLM with native NCCL weight transfer enabled.
+
+    `tuning` accepts exactly the VLLM_TUNE_KEYS knobs; None values are dropped so vLLM's own
+    defaults apply."""
+    unknown = set(tuning) - set(VLLM_TUNE_KEYS)
+    if unknown:
+        raise TypeError(f"unknown vLLM tuning kwargs: {sorted(unknown)}")
     os.environ.setdefault("VLLM_USE_DEEP_GEMM", "0")
     from vllm.config import WeightTransferConfig
     from vllm.engine.arg_utils import AsyncEngineArgs
@@ -203,26 +224,7 @@ def build_async_engine(
         "seed": seed,
         "weight_transfer_config": WeightTransferConfig(backend="nccl"),
     }
-    if max_num_seqs is not None:
-        engine_kwargs["max_num_seqs"] = max_num_seqs
-    if max_num_batched_tokens is not None:
-        engine_kwargs["max_num_batched_tokens"] = max_num_batched_tokens
-    if max_num_scheduled_tokens is not None:
-        engine_kwargs["max_num_scheduled_tokens"] = max_num_scheduled_tokens
-    if max_num_partial_prefills is not None:
-        engine_kwargs["max_num_partial_prefills"] = max_num_partial_prefills
-    if max_long_partial_prefills is not None:
-        engine_kwargs["max_long_partial_prefills"] = max_long_partial_prefills
-    if long_prefill_token_threshold is not None:
-        engine_kwargs["long_prefill_token_threshold"] = long_prefill_token_threshold
-    if enable_chunked_prefill is not None:
-        engine_kwargs["enable_chunked_prefill"] = enable_chunked_prefill
-    if scheduler_reserve_full_isl is not None:
-        engine_kwargs["scheduler_reserve_full_isl"] = scheduler_reserve_full_isl
-    if stream_interval is not None:
-        engine_kwargs["stream_interval"] = stream_interval
-    if performance_mode is not None:
-        engine_kwargs["performance_mode"] = performance_mode
+    engine_kwargs.update({key: value for key, value in tuning.items() if value is not None})
     engine_args = AsyncEngineArgs(**engine_kwargs)
     return AsyncLLM.from_engine_args(engine_args)
 
@@ -255,6 +257,36 @@ async def _vllm_generate(engine, prompt_token_ids, n, *, temperature, top_p, top
     if dropped:
         print(f"[generate_group] dropped {dropped}/{len(final.outputs)} None/empty vLLM completion(s)", flush=True)
     return outputs
+
+
+def make_interrupt_config(
+    marker_ids: list[int],
+    answer_max_tokens: int,
+    max_model_len: int,
+    *,
+    base_temperature: float,
+    base_top_p: float,
+    base_top_k: int,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    top_k: int | None = None,
+    phase1_min_tokens: int | None = None,
+    phase1_max_tokens: int | None = None,
+) -> dict[str, Any]:
+    """Build the sampling['interrupt'] payload consumed by generate_group. The forced-answer
+    continuation inherits the base sampling params unless an explicit override is given; the
+    training / in-loop-eval / standalone-eval paths all build their config through here so the
+    inherit-unless-overridden semantics cannot drift apart."""
+    return {
+        "marker_ids": list(marker_ids),
+        "answer_max_tokens": answer_max_tokens,
+        "max_model_len": max_model_len,
+        "phase1_min_tokens": phase1_min_tokens,
+        "phase1_max_tokens": phase1_max_tokens,
+        "temperature": base_temperature if temperature is None else temperature,
+        "top_p": base_top_p if top_p is None else top_p,
+        "top_k": base_top_k if top_k is None else top_k,
+    }
 
 
 async def generate_group(engine, prompt_token_ids: list[int], num_samples: int, sampling: dict) -> list[dict]:
@@ -346,12 +378,23 @@ async def generate_group(engine, prompt_token_ids: list[int], num_samples: int, 
 
 def _safe_get(q):
     """Non-throwing queue get with a short timeout; returns None on empty."""
-    import queue
-
     try:
         return q.get(timeout=0.1)
     except queue.Empty:
         return None
+
+
+def _safe_qsize(q) -> float:
+    """qsize() is unimplemented on some platforms; report -1 instead of crashing."""
+    try:
+        return float(q.qsize())
+    except (NotImplementedError, OSError):
+        return -1.0
+
+
+def ewma_update(prev: float, value: float, alpha: float, *, seed: bool) -> float:
+    """One EWMA step; `seed` (e.g. during warmup) resets the average to the raw value."""
+    return value if seed else (1.0 - alpha) * prev + alpha * value
 
 
 async def _drain_prompts(engine, prompt_q, result_q, state, inflight: int):
@@ -397,8 +440,6 @@ async def _drain_prompts(engine, prompt_q, result_q, state, inflight: int):
 
 
 async def _handle_control(engine, control_q, status_q, state):
-    from dataclasses import asdict
-
     from vllm.distributed.weight_transfer.base import WeightTransferInitRequest, WeightTransferUpdateRequest
     from vllm.distributed.weight_transfer.nccl_engine import (
         NCCLWeightTransferInitInfo,
@@ -458,16 +499,7 @@ async def _child_main_async(cfg, prompt_q, result_q, control_q, status_q):
         gpu_memory_utilization=cfg["gpu_memory_utilization"],
         seed=cfg["seed"],
         enforce_eager=cfg.get("enforce_eager", False),
-        max_num_seqs=cfg.get("max_num_seqs"),
-        max_num_batched_tokens=cfg.get("max_num_batched_tokens"),
-        max_num_scheduled_tokens=cfg.get("max_num_scheduled_tokens"),
-        max_num_partial_prefills=cfg.get("max_num_partial_prefills"),
-        max_long_partial_prefills=cfg.get("max_long_partial_prefills"),
-        long_prefill_token_threshold=cfg.get("long_prefill_token_threshold"),
-        enable_chunked_prefill=cfg.get("enable_chunked_prefill"),
-        scheduler_reserve_full_isl=cfg.get("scheduler_reserve_full_isl"),
-        stream_interval=cfg.get("stream_interval"),
-        performance_mode=cfg.get("performance_mode"),
+        **{key: cfg.get(key) for key in VLLM_TUNE_KEYS},
     )
     state = {"weight_version": 0, "paused": False, "stop": False}
     status_q.put({"type": MSG_ENGINE_READY})
@@ -706,10 +738,6 @@ def should_save_checkpoint_for_step(step: int, num_steps: int, save_every: int, 
     return periodic_save or (final_step and save_final)
 
 
-def _pipeline_has_next_step(step: int, num_steps: int) -> bool:
-    return step < num_steps - 1
-
-
 def build_optimizer(parameters: Iterator[torch.nn.Parameter], args: argparse.Namespace) -> torch.optim.Optimizer:
     if args.optimizer != "adamw":
         raise ValueError(f"Unsupported optimizer {args.optimizer!r}; only 'adamw' is implemented")
@@ -727,13 +755,53 @@ def build_optimizer(parameters: Iterator[torch.nn.Parameter], args: argparse.Nam
     )
 
 
+def get_lr_multiplier(
+    step: int,
+    num_steps: int,
+    init_lr_frac: float = 1.0,
+    warmup_steps: int = 0,
+    schedule: str = "linear",
+    min_lr_frac: float = 0.0,
+    lr_decay_steps: int | None = None,
+    lr_decay_start: int | None = None,
+) -> float:
+    if warmup_steps > 0 and step < warmup_steps:
+        if warmup_steps == 1:
+            return 1.0
+        progress = step / (warmup_steps - 1)
+        return init_lr_frac + (1.0 - init_lr_frac) * progress
+    if schedule == "constant":
+        return 1.0
+    if schedule != "linear":
+        raise ValueError(f"Unsupported LR schedule: {schedule}")
+    # Linear decay from peak (1.0, at the end of warmup) down to the floor `min_lr_frac`, reached at
+    # absolute step `lr_decay_steps` (defaults to num_steps), then HELD at the floor for the rest of
+    # the run. With min_lr_frac=0.0 and lr_decay_steps=None this is the legacy decay-to-zero schedule.
+    decay_end = lr_decay_steps if lr_decay_steps is not None else num_steps
+    if warmup_steps == 0:
+        if num_steps <= 1:
+            return 1.0
+        if step == 0:
+            return init_lr_frac
+        decay_span = max(1, decay_end)
+        decay_progress = min(1.0, max(0.0, (step - 1) / decay_span))
+        return min_lr_frac + (1.0 - min_lr_frac) * (1.0 - decay_progress)
+    # Optional HOLD at peak until `lr_decay_start` (defaults to the end of warmup), then linear decay.
+    decay_start = lr_decay_start if lr_decay_start is not None else warmup_steps
+    if step < decay_start:
+        return 1.0
+    decay_span = max(1, decay_end - decay_start)
+    decay_progress = min(1.0, max(0.0, (step - decay_start) / decay_span))
+    return min_lr_frac + (1.0 - min_lr_frac) * (1.0 - decay_progress)
+
+
 def make_pad_example(pad_token_id: int) -> "RolloutExample":
     """A RolloutExample that pads a step batch to a multiple of the trainer world size, so
     every rank gets equal microbatches and none stalls in the all-reduce. It contributes zero
     to both loss numerator and token-count denominator: advantage 0.0 zeroes the gradient,
     prefix_length == length means no generated tokens, and empty behavior_logprobs keeps it out
     of both counts (see local_and_global_counts). The 2-token sequence satisfies
-    make_rl_batch_varprefix's max_length >= 2 guard.
+    build_rl_batch_varprefix_cpu's max_length >= 2 guard.
     """
     return RolloutExample(
         sequence=torch.tensor([pad_token_id, pad_token_id], dtype=torch.long),
@@ -749,53 +817,12 @@ def make_pad_example(pad_token_id: int) -> "RolloutExample":
 
 def strip_rollout_completion(example: "RolloutExample") -> "RolloutExample":
     """Return a training-only copy of a rollout without the decoded completion payload."""
-    if example.completion == "":
-        return example
-    return RolloutExample(
-        sequence=example.sequence,
-        prefix_length=example.prefix_length,
-        reward=example.reward,
-        advantage=example.advantage,
-        behavior_logprobs=example.behavior_logprobs,
-        weight_version=example.weight_version,
-        puzzle_id=example.puzzle_id,
-        completion="",
-        loss_mask=example.loss_mask,
-        group_token_count=example.group_token_count,
-    )
+    return example if example.completion == "" else replace(example, completion="")
 
 
 def strip_rollout_completions(examples: list["RolloutExample"]) -> list["RolloutExample"]:
     """Drop decoded strings from examples that are only needed for training/scatter payloads."""
     return [strip_rollout_completion(example) for example in examples]
-
-
-def pad_shards_to_equal(
-    step_examples: list["RolloutExample"],
-    world_size: int,
-    pad_example: "RolloutExample",
-) -> list[list["RolloutExample"]]:
-    """Split the full step batch into `world_size` EQUAL-length shards, appending
-    copies of `pad_example` to reach the next multiple of world_size. Equal microbatch
-    counts per rank avoid stalls in the cross-rank grad all-reduce; pads contribute
-    zero gradient (see make_pad_example). world_size == 1 returns [step_examples] as-is.
-    """
-    if world_size < 1:
-        raise ValueError("world_size must be at least 1")
-    if pad_example.advantage != 0.0:
-        raise ValueError("pad_example must have advantage == 0.0 (zero gradient)")
-    if world_size == 1:
-        return [step_examples]
-
-    total = len(step_examples)
-    remainder = total % world_size
-    pad_count = 0 if remainder == 0 else world_size - remainder
-    # Padding is at most world_size - 1; it never approaches the per-rank shard size.
-    assert pad_count < world_size, f"pad_count {pad_count} must be < world_size {world_size}"
-
-    padded = list(step_examples) + [pad_example] * pad_count
-    per_rank = len(padded) // world_size
-    return [padded[r * per_rank:(r + 1) * per_rank] for r in range(world_size)]
 
 
 def sort_and_shard_for_microbatching(
@@ -862,33 +889,6 @@ def local_and_global_counts(local_examples: list["RolloutExample"]) -> tuple[int
         for e in local_examples
     )
     return local_sample_count, local_token_count
-
-
-def build_parameter_buckets(
-    parameters: Iterator[torch.nn.Parameter] | list[torch.nn.Parameter],
-    bucket_bytes: int,
-) -> list[list[torch.nn.Parameter]]:
-    """Group parameters into order-preserving byte buckets for future bucketed all-reduce."""
-    if bucket_bytes < 1:
-        raise ValueError("bucket_bytes must be at least 1")
-    buckets: list[list[torch.nn.Parameter]] = []
-    current: list[torch.nn.Parameter] = []
-    current_bytes = 0
-    for param in parameters:
-        param_bytes = param.numel() * param.element_size()
-        if current and current_bytes + param_bytes > bucket_bytes:
-            buckets.append(current)
-            current = []
-            current_bytes = 0
-        current.append(param)
-        current_bytes += param_bytes
-        if current_bytes >= bucket_bytes:
-            buckets.append(current)
-            current = []
-            current_bytes = 0
-    if current:
-        buckets.append(current)
-    return buckets
 
 
 def _scatter_payload(
@@ -1038,18 +1038,17 @@ def set_seed(seed: int, device: torch.device | str | None = None) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+_TORCH_DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
+
+
 def resolve_torch_dtype(dtype_name: str, device: torch.device) -> torch.dtype:
     if dtype_name == "auto":
-        if device.type == "cuda" and torch.cuda.is_bf16_supported():
-            return torch.bfloat16
-        return torch.float32
-    if dtype_name == "float32":
-        return torch.float32
-    if dtype_name == "bfloat16":
-        return torch.bfloat16
-    if dtype_name == "float16":
-        return torch.float16
-    raise ValueError(f"Unsupported dtype: {dtype_name}")
+        bf16_ok = device.type == "cuda" and torch.cuda.is_bf16_supported()
+        return torch.bfloat16 if bf16_ok else torch.float32
+    try:
+        return _TORCH_DTYPES[dtype_name]
+    except KeyError:
+        raise ValueError(f"Unsupported dtype: {dtype_name}") from None
 
 
 def as_1d_token_tensor(encoded) -> torch.Tensor:
@@ -1339,23 +1338,6 @@ def find_sokoban_answer_end_and_moves(text: str) -> tuple[int | None, str | None
     return None, None
 
 
-def find_sokoban_answer_end(text: str) -> int | None:
-    answer_end, _ = find_sokoban_answer_end_and_moves(text)
-    return answer_end
-
-
-def trim_sequence_after_answer(tokenizer, sequence: torch.Tensor, prefix_length: int) -> torch.Tensor:
-    generated_len = int(sequence.numel()) - prefix_length
-    trimmed, _, _, _, _ = trim_generated_with_logprobs_and_text(
-        tokenizer,
-        sequence,
-        prefix_length,
-        [0.0] * max(0, generated_len),
-        None,
-    )
-    return trimmed
-
-
 def trim_generated_with_logprobs_and_text(
     tokenizer,
     sequence: torch.Tensor,
@@ -1399,21 +1381,6 @@ def trim_generated_with_logprobs_and_text(
     return trimmed, behavior_logprobs[:kept_gen], trimmed_mask, final_text, moves
 
 
-def trim_generated_with_logprobs(tokenizer, sequence: torch.Tensor, prefix_length: int,
-                                 behavior_logprobs: list[float], loss_mask: list[bool] | None = None
-                                 ) -> tuple[torch.Tensor, list[float], list[bool] | None]:
-    """Trim a full sequence after its first parseable answer and truncate the behavior logprobs
-    (and the optional per-token loss mask) to match the kept generated tokens."""
-    trimmed, trimmed_logprobs, trimmed_mask, _, _ = trim_generated_with_logprobs_and_text(
-        tokenizer,
-        sequence,
-        prefix_length,
-        behavior_logprobs,
-        loss_mask,
-    )
-    return trimmed, trimmed_logprobs, trimmed_mask
-
-
 def process_rollout_sample(
     tokenizer,
     prompt_ids: torch.Tensor,
@@ -1453,8 +1420,8 @@ def process_rollout_sample(
 
 
 def build_rl_batch_varprefix_cpu(sequences, prefixes, pad_token_id, masks=None, pin_memory=False):
-    """CPU half of make_rl_batch_varprefix: pad/concat + mask construction with NO CUDA calls
-    beyond optional pinned allocation, so a prefetch thread can build the NEXT microbatch while
+    """Pad/concat + mask construction for one RL microbatch, with NO CUDA calls beyond
+    optional pinned allocation, so a prefetch thread can build the NEXT microbatch while
     the current one's fwd/bwd runs; the train loop then issues one non_blocking H2D copy per
     tensor instead of the old per-row pageable copies. Values are identical to the old path."""
     if not sequences:
@@ -1494,15 +1461,9 @@ def build_rl_batch_varprefix_cpu(sequences, prefixes, pad_token_id, masks=None, 
     return input_ids, real[:, :-1], labels
 
 
-def make_rl_batch_varprefix(sequences, prefixes, pad_token_id, device, masks=None):
-    input_ids, attention_mask, labels = build_rl_batch_varprefix_cpu(
-        sequences, prefixes, pad_token_id, masks=masks)
-    return input_ids.to(device), attention_mask.to(device), labels.to(device)
-
-
 def build_behavior_logprob_tensor_varprefix_cpu(sequences, behavior_logprobs, prefixes,
                                                 pin_memory=False):
-    """CPU half of build_behavior_logprob_tensor_varprefix (see build_rl_batch_varprefix_cpu)."""
+    """Behavior-logprob tensor for one RL microbatch (see build_rl_batch_varprefix_cpu)."""
     if not (len(sequences) == len(behavior_logprobs) == len(prefixes)):
         raise ValueError("sequences, behavior_logprobs, and prefixes must align")
     max_length = max(int(seq.numel()) for seq in sequences)
@@ -1516,11 +1477,6 @@ def build_behavior_logprob_tensor_varprefix_cpu(sequences, behavior_logprobs, pr
         start = pfx - 1
         out[row, start:start + gen_len] = torch.tensor(blp, dtype=torch.float32)
     return out
-
-
-def build_behavior_logprob_tensor_varprefix(sequences, behavior_logprobs, prefixes, device):
-    return build_behavior_logprob_tensor_varprefix_cpu(
-        sequences, behavior_logprobs, prefixes).to(device)
 
 
 def tensorize_microbatch_cpu(microbatch, pad_token_id, pin_memory=False):
@@ -1578,27 +1534,6 @@ def chunked_token_logprobs(lm_head, hidden_states, labels, chunk_size=1024):
         else:
             parts.append(_f(h, lab))
     return torch.cat(parts, dim=1)
-
-
-def policy_gradient_loss_from_logits(
-    logits: torch.Tensor,
-    labels: torch.Tensor,
-    advantages: torch.Tensor,
-    valid_token_normalizer: torch.Tensor | float | None = None,
-    valid_sample_normalizer: torch.Tensor | float | None = None,
-    normalizer: float = 1.0,
-    sequence_normalize: bool = False,
-    behavior_logprobs: torch.Tensor | None = None,
-    cispo_eps: float | None = None,
-    stats: dict | None = None,
-    prompt_lengths: torch.Tensor | None = None,
-    kl_tau: float = 0.0,
-) -> torch.Tensor:
-    token_logprobs = token_logprobs_from_logits(logits, labels)
-    return policy_gradient_loss_from_token_logprobs(
-        token_logprobs, labels, advantages, valid_token_normalizer, valid_sample_normalizer,
-        normalizer, sequence_normalize, behavior_logprobs, cispo_eps, stats,
-        prompt_lengths=prompt_lengths, kl_tau=kl_tau)
 
 
 def policy_gradient_loss_from_token_logprobs(
@@ -1696,8 +1631,8 @@ def chunked_cispo_loss(model, input_ids, attention_mask, labels, advantages, *,
     then apply the LM head + cross-entropy in checkpointed sequence chunks to avoid
     materializing the full (T, vocab) fp32 logits. The head always runs in fp32; with
     autocast_dtype set, only the body forward is bf16 (halving activation memory). In the
-    fp32 path (autocast_dtype=None) this equals
-    policy_gradient_loss_from_logits(model(input_ids,...).logits, ...)."""
+    fp32 path (autocast_dtype=None) this equals computing the full logits in one shot and
+    feeding them through policy_gradient_loss_from_token_logprobs."""
     base = getattr(model, "model", None)
     lm_head = getattr(model, "lm_head", None)
     if base is None or lm_head is None:
@@ -1788,10 +1723,6 @@ class PipelineWeightSync:
             iterator=self._named_parameters(),
             trainer_args=NCCLTrainerSendWeightsArgs(group=self._group, packed=True),
         )
-
-
-def task_reward(task, conversation, completion) -> float:
-    return float(task.reward(conversation, completion))
 
 
 # ---------------------------------------------------------------------------
@@ -2202,18 +2133,13 @@ def _eval_one_checkpoint(args: argparse.Namespace, model_path: str, multi: bool)
     )
     if args.eval_interruption:
         marker_ids = tokenizer(INTERRUPTION_TEXT, add_special_tokens=False)["input_ids"]
-        sampling["interrupt"] = {
-            "marker_ids": list(marker_ids),
-            "answer_max_tokens": args.eval_interrupt_answer_tokens,
-            "max_model_len": args.eval_max_model_len,
-            "temperature": (
-                args.eval_interrupt_temperature
-                if args.eval_interrupt_temperature is not None
-                else args.eval_temperature
-            ),
-            "top_p": args.eval_interrupt_top_p if args.eval_interrupt_top_p is not None else args.eval_top_p,
-            "top_k": args.eval_interrupt_top_k if args.eval_interrupt_top_k is not None else args.eval_top_k,
-        }
+        sampling["interrupt"] = make_interrupt_config(
+            marker_ids, args.eval_interrupt_answer_tokens, args.eval_max_model_len,
+            base_temperature=args.eval_temperature, base_top_p=args.eval_top_p,
+            base_top_k=args.eval_top_k,
+            temperature=args.eval_interrupt_temperature,
+            top_p=args.eval_interrupt_top_p, top_k=args.eval_interrupt_top_k,
+        )
 
     print(
         f"[eval] model={model_path} eval_data={args.eval_data} "
@@ -2233,16 +2159,7 @@ def _eval_one_checkpoint(args: argparse.Namespace, model_path: str, multi: bool)
             gpu_memory_utilization=args.eval_gpu_mem_util,
             seed=args.eval_seed,
             enforce_eager=args.eval_vllm_enforce_eager,
-            max_num_seqs=args.eval_vllm_max_num_seqs,
-            max_num_batched_tokens=args.eval_vllm_max_num_batched_tokens,
-            max_num_scheduled_tokens=args.eval_vllm_max_num_scheduled_tokens,
-            max_num_partial_prefills=args.eval_vllm_max_num_partial_prefills,
-            max_long_partial_prefills=args.eval_vllm_max_long_partial_prefills,
-            long_prefill_token_threshold=args.eval_vllm_long_prefill_token_threshold,
-            enable_chunked_prefill=args.eval_vllm_enable_chunked_prefill,
-            scheduler_reserve_full_isl=args.eval_vllm_scheduler_reserve_full_isl,
-            stream_interval=args.eval_vllm_stream_interval,
-            performance_mode=args.eval_vllm_performance_mode,
+            **vllm_tuning_from_args(args, prefix="eval_"),
         )
         try:
             return await run_held_out_eval(
@@ -2286,11 +2203,11 @@ def _eval_one_checkpoint(args: argparse.Namespace, model_path: str, multi: bool)
         out_path = Path(args.eval_output)
     else:
         run_name = args.run if (args.run and args.run != "dummy") else "eval"
-        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", run_name)
+        safe = sanitize_run_name(run_name)
         suffix = f"step{step:06d}" if step is not None else "latest"
         if multi:
             # Disambiguate per-checkpoint JSONs by the checkpoint's run dir (outputs/<run>/step_NNNNNN).
-            ckpt_tag = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(model_path).parent.name or model_path)
+            ckpt_tag = sanitize_run_name(Path(model_path).parent.name or model_path)
             out_path = args.output_dir / safe / f"eval_{ckpt_tag}_{suffix}.json"
         else:
             out_path = args.output_dir / safe / f"eval_{suffix}.json"
@@ -2356,9 +2273,8 @@ def run_standalone_eval(args: argparse.Namespace) -> None:
 
 
 def _await_status(status_q, expected_type, timeout: float = 600.0):
-    import time as _time
-    deadline = _time.time() + timeout
-    while _time.time() < deadline:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
         try:
             msg = status_q.get(timeout=1.0)
         except Exception:
@@ -2383,13 +2299,266 @@ def _start_process_with_cuda_visible_devices(process, visible_gpus: str) -> None
             os.environ["CUDA_VISIBLE_DEVICES"] = old_cvd
 
 
+@dataclass
+class CollectStats:
+    """Rank-0 Phase-A bookkeeping for one step's collect loop (run_pipeline's
+    _collect_step_batch). The *_total/_unfiltered counters are the unbiased online proxies,
+    counted over ALL fresh generated groups BEFORE the zero-variance filter; the lists are
+    aligned per accepted (trained) sample."""
+
+    step_examples: list[RolloutExample] = field(default_factory=list)
+    finish_reasons: list[str | None] = field(default_factory=list)
+    staleness: list[int] = field(default_factory=list)
+    group_solved: list[float] = field(default_factory=list)  # 1.0 if any sample in the group solved
+    groups_seen_total: int = 0
+    samples_seen_total: int = 0
+    samples_answered_total: int = 0
+    samples_solved_total: int = 0
+    samples_length_trunc_unfiltered: int = 0
+    groups_any_solved_total: int = 0
+    gen_tokens_total: int = 0
+    prefill_tokens_total: int = 0
+    puzzles_used: int = 0
+    groups_zero_variance: int = 0
+    groups_zv_allfail: int = 0
+    groups_zv_allpass: int = 0
+    groups_stale: int = 0
+    consecutive_rejected: int = 0
+    consecutive_rejected_max: int = 0
+
+    def register_reject(self, step: int, reject_limit: int) -> None:
+        """One rejected group (stale / zero-variance / unusable): bump the consecutive-reject
+        counter and hard-abort past reject_limit (degenerate-generation safety net)."""
+        self.consecutive_rejected += 1
+        self.consecutive_rejected_max = max(self.consecutive_rejected_max, self.consecutive_rejected)
+        if self.consecutive_rejected > reject_limit:
+            raise RuntimeError(
+                f"step {step}: rejected {self.consecutive_rejected} consecutive rollout groups "
+                f"(staleness bound too tight or rewards degenerate); aborting")
+
+
+class InloopEval:
+    """Rank-0 in-loop held-out eval, run through the SHARED training vLLM engine.
+
+    Eval prompts are enqueued with puzzle ids >= EVAL_PID_BASE so the Phase-A collect loop can
+    route their results here instead of training on them. Per-round per-puzzle counts accumulate
+    as results stream back (interleaved with training rollouts, possibly across several train
+    steps); a round is logged ONLY once every puzzle returned — a partial round is never logged
+    as eval/pass_at_1, only warned about past --inloop-eval-deadline-steps."""
+
+    def __init__(self, args: argparse.Namespace, tokenizer, eval_task: FixedSokobanDataset,
+                 interrupt_marker_ids: list[int] | None, prompt_q, wandb_run, run_logger) -> None:
+        self.args = args
+        self.tokenizer = tokenizer
+        self.eval_task = eval_task
+        self.interrupt_marker_ids = interrupt_marker_ids
+        self.prompt_q = prompt_q
+        self.wandb_run = wandb_run
+        self.run_logger = run_logger
+        self.prompts: list[dict[str, Any]] = []
+        self.rounds: dict[int, dict[str, Any]] = {}
+        self.pid_to_round: dict[int, tuple[int, int]] = {}
+        self.next_eval_pid = EVAL_PID_BASE
+
+    def prepare_prompts(self) -> None:
+        """Pre-tokenize the eval set once (rank-0 setup) and validate it fits max_model_len."""
+        args = self.args
+        max_prompt_len = 0
+        for idx in range(len(self.eval_task)):
+            conv = self.eval_task[idx]
+            prompt_ids = encode_prompt(self.tokenizer, conv["question"], args.enable_thinking)
+            max_prompt_len = max(max_prompt_len, int(prompt_ids.numel()))
+            self.prompts.append({
+                "index": idx,
+                "conversation": conv,
+                "prompt_ids": prompt_ids.tolist(),
+            })
+        if max_prompt_len + args.inloop_eval_max_tokens > args.max_model_len:
+            raise ValueError(
+                f"--max-model-len {args.max_model_len} too small for in-loop eval: "
+                f"max eval prompt ({max_prompt_len}) + --inloop-eval-max-tokens "
+                f"({args.inloop_eval_max_tokens}) exceeds it"
+            )
+        if not isinstance(self.wandb_run, DummyWandb):
+            self.wandb_run.define_metric("eval/*", step_metric="eval/round_step")
+        print0(
+            f"In-loop held-out eval ON: every={args.inloop_eval_every} steps, "
+            f"n={len(self.prompts)}, k={args.inloop_eval_k}, "
+            f"max_tokens={args.inloop_eval_max_tokens}, "
+            f"interruption={args.inloop_eval_interruption}"
+        )
+
+    def _sampling(self) -> dict[str, Any]:
+        args = self.args
+        sampling_eval = {
+            "temperature": args.eval_temperature,
+            "top_p": args.eval_top_p,
+            "top_k": args.eval_top_k,
+            "max_tokens": args.inloop_eval_max_tokens,
+            "seed": args.inloop_eval_seed,
+            "logprobs": 0,
+        }
+        if args.inloop_eval_interruption:
+            if self.interrupt_marker_ids is None:
+                raise RuntimeError("--inloop-eval-interruption requested but interruption marker was not initialized")
+            sampling_eval["interrupt"] = make_interrupt_config(
+                self.interrupt_marker_ids, args.inloop_eval_interrupt_answer_tokens, args.max_model_len,
+                base_temperature=args.eval_temperature, base_top_p=args.eval_top_p,
+                base_top_k=args.eval_top_k,
+                temperature=args.eval_interrupt_temperature,
+                top_p=args.eval_interrupt_top_p, top_k=args.eval_interrupt_top_k,
+            )
+        return sampling_eval
+
+    def launch_round(self, round_step: int, weight_version: int) -> None:
+        args = self.args
+        if args.inloop_eval_every <= 0 or not self.prompts:
+            return
+        if round_step in self.rounds:
+            return
+        state = {
+            "round_step": round_step,
+            "launched_at_step": round_step,
+            "weight_version": weight_version,
+            "expected": len(self.prompts),
+            "received": 0,
+            "n_samples": 0,
+            "n_answered": 0,
+            "n_solved": 0,
+            "n_length_trunc": 0,
+            "pids": [],
+            "per_puzzle_n": [0] * len(self.prompts),
+            "per_puzzle_solved_count": [0] * len(self.prompts),
+            "per_puzzle_answered_count": [0] * len(self.prompts),
+            "per_puzzle_length_trunc_count": [0] * len(self.prompts),
+        }
+        self.rounds[round_step] = state
+        sampling_eval = self._sampling()
+        for idx, item in enumerate(self.prompts):
+            pid = self.next_eval_pid
+            self.next_eval_pid += 1
+            state["pids"].append(pid)
+            self.pid_to_round[pid] = (round_step, idx)
+            self.prompt_q.put({
+                "type": MSG_GENERATE,
+                "puzzle_id": pid,
+                "prompt_token_ids": item["prompt_ids"],
+                "num_samples": args.inloop_eval_k,
+                "sampling": sampling_eval,
+            })
+        print0(
+            f"launched in-loop eval for step {round_step}: "
+            f"{len(self.prompts)} puzzles x k={args.inloop_eval_k}"
+        )
+
+    def process_result(self, msg: dict[str, Any], current_step: int) -> None:
+        pid = int(msg["puzzle_id"])
+        route = self.pid_to_round.pop(pid, None)
+        if route is None:
+            return
+        round_step, eval_idx = route
+        state = self.rounds.get(round_step)
+        if state is None:
+            return
+
+        conv = self.prompts[eval_idx]["conversation"]
+        n = solved = answered = length_trunc = 0
+        for sample in msg["samples"]:
+            n += 1
+            completion = self.tokenizer.decode(sample["token_ids"], skip_special_tokens=True)
+            if extract_sokoban_answer(completion) is not None:
+                answered += 1
+            if sample.get("finish_reason") == "length":
+                length_trunc += 1
+            solved += self.eval_task.evaluate(conv, completion)
+
+        state["received"] += 1
+        state["n_samples"] += n
+        state["n_answered"] += answered
+        state["n_solved"] += solved
+        state["n_length_trunc"] += length_trunc
+        state["per_puzzle_n"][eval_idx] = n
+        state["per_puzzle_solved_count"][eval_idx] = solved
+        state["per_puzzle_answered_count"][eval_idx] = answered
+        state["per_puzzle_length_trunc_count"][eval_idx] = length_trunc
+
+        if state["received"] >= state["expected"]:
+            self._finalize_round(round_step, current_step)
+
+    def warn_overdue(self, current_step: int) -> None:
+        """Flag (once per round) rounds still incomplete past the deadline; never logs them."""
+        for round_step, state in self.rounds.items():
+            if current_step - int(state["launched_at_step"]) < self.args.inloop_eval_deadline_steps:
+                continue
+            if state.get("deadline_warned"):
+                continue
+            state["deadline_warned"] = True
+            print0(
+                f"in-loop eval step {round_step:3d} still pending after "
+                f"{self.args.inloop_eval_deadline_steps} train steps "
+                f"({int(state['received'])}/{int(state['expected'])} puzzles); "
+                "not logging eval/pass_at_1 until the full eval set completes"
+            )
+
+    def _finalize_round(self, round_step: int, current_step: int) -> None:
+        state = self.rounds.pop(round_step, None)
+        if state is None:
+            return
+        for pid in state["pids"]:
+            self.pid_to_round.pop(pid, None)
+
+        received = int(state["received"])
+        expected = int(state["expected"])
+        if received != expected:
+            raise RuntimeError(
+                f"refusing to finalize incomplete in-loop eval round {round_step}: "
+                f"received {received}/{expected} puzzles"
+            )
+        per_puzzle = [
+            c / n
+            for c, n in zip(state["per_puzzle_solved_count"], state["per_puzzle_n"])
+            if n > 0
+        ]
+        total_samples = int(state["n_samples"])
+        total_answered = int(state["n_answered"])
+        total_solved = int(state["n_solved"])
+        total_trunc = int(state["n_length_trunc"])
+        pass_at_1 = sum(per_puzzle) / max(1, len(per_puzzle))
+        answer_rate = total_answered / max(1, total_samples)
+        solve_given_answer = total_solved / max(1, total_answered)
+        trunc_frac = total_trunc / max(1, total_samples)
+        metrics = {
+            "eval/round_step": round_step,
+            "eval/logged_step": current_step,
+            "eval/round_weight_version": state["weight_version"],
+            "eval/round_complete_frac": received / max(1, expected),
+            "eval/received_puzzles": received,
+            "eval/expected_puzzles": expected,
+            "eval/pass_at_1": pass_at_1,
+            "eval/answer_rate": answer_rate,
+            "eval/solve_given_answer": solve_given_answer,
+            "eval/trunc_frac": trunc_frac,
+            "eval/n_samples": total_samples,
+            "eval/n_answered": total_answered,
+            "eval/n_solved": total_solved,
+            "eval/n_length_trunc": total_trunc,
+            "eval/finalize_reason_complete": 1.0,
+        }
+        self.wandb_run.log(metrics)
+        self.run_logger.log_eval(round_step, metrics)
+        print0(
+            f"in-loop eval step {round_step:3d} (complete, {received}/{expected} puzzles) | "
+            f"pass@1 {pass_at_1:.3f} answer {answer_rate:.3f} "
+            f"solve|answer {solve_given_answer:.3f} trunc {trunc_frac:.3f}"
+        )
+
+
 def run_pipeline(
     args: argparse.Namespace,
     train_task: FixedSokobanDataset | None = None,
     eval_task: FixedSokobanDataset | None = None,
 ) -> None:
     import multiprocessing as mp
-    import queue
 
     if train_task is None:
         train_task = load_sokoban_jsonl_dataset(args.train_data, split_name="train")
@@ -2506,20 +2675,14 @@ def run_pipeline(
                     max_tokens=args.max_new_tokens)
     if args.interruption:
         assert interrupt_marker_ids is not None
-        sampling["interrupt"] = {
-            "marker_ids": list(interrupt_marker_ids),
-            "answer_max_tokens": args.interrupt_answer_tokens,
-            "max_model_len": args.max_model_len,
-            "phase1_min_tokens": args.interrupt_min_tokens,
-            "phase1_max_tokens": args.interrupt_max_tokens,
-            "temperature": (
-                args.interrupt_temperature
-                if args.interrupt_temperature is not None
-                else args.temperature
-            ),
-            "top_p": args.interrupt_top_p if args.interrupt_top_p is not None else args.top_p,
-            "top_k": args.interrupt_top_k if args.interrupt_top_k is not None else args.top_k,
-        }
+        sampling["interrupt"] = make_interrupt_config(
+            interrupt_marker_ids, args.interrupt_answer_tokens, args.max_model_len,
+            base_temperature=args.temperature, base_top_p=args.top_p, base_top_k=args.top_k,
+            temperature=args.interrupt_temperature,
+            top_p=args.interrupt_top_p, top_k=args.interrupt_top_k,
+            phase1_min_tokens=args.interrupt_min_tokens,
+            phase1_max_tokens=args.interrupt_max_tokens,
+        )
         # Guard: the phase-2 prompt is prompt + phase-1 cap + marker + answer; leave headroom for the
         # prompt so it fits max_model_len (the per-request clamp in generate_group is the runtime backstop).
         phase1_max_tokens = (
@@ -2554,10 +2717,7 @@ def run_pipeline(
     model_perf_info = None
     rollout_fh = None
     run_logger = RunLogger(run_dir=run_dir, args=args, enabled=master_process)
-    inloop_eval_prompts: list[dict[str, Any]] = []
-    inloop_eval_rounds: dict[int, dict[str, Any]] = {}
-    inloop_eval_pid_to_round: dict[int, tuple[int, int]] = {}
-    next_eval_pid = EVAL_PID_BASE
+    inloop_eval: InloopEval | None = None  # rank 0 only; built in _rank0_setup (needs queues + wandb)
 
     def enqueue_puzzle(pid):
         if not train_prompt_cache:
@@ -2572,11 +2732,15 @@ def run_pipeline(
                       "prompt_token_ids": cached.prompt_token_ids, "num_samples": args.num_samples,
                       "sampling": sampling})
 
+    def _enqueue_next_puzzle() -> None:
+        nonlocal next_puzzle_id
+        enqueue_puzzle(next_puzzle_id)
+        next_puzzle_id += 1
+
     def _rank0_setup() -> None:
         nonlocal train_prompt_cache
         nonlocal child, wsync, prompt_q, result_q, control_q, status_q
-        nonlocal next_puzzle_id, wandb_run, model_perf_info, rollout_fh
-        nonlocal inloop_eval_prompts
+        nonlocal wandb_run, model_perf_info, rollout_fh, inloop_eval
         # Rendezvous steps (2)-(4); see the two-NCCL-group invariant above. All of this runs on
         # rank 0 only, with NO dist.* collective between (2) and (4): the workers are parked at the
         # (5) init-status broadcast, so a stray trainer-group collective here would have no peer
@@ -2599,16 +2763,7 @@ def run_pipeline(
             max_model_len=args.max_model_len, gpu_memory_utilization=args.vllm_gpu_mem_util,
             seed=args.seed, inflight=args.inflight_requests, visible_gpus=visible,
             enforce_eager=args.vllm_enforce_eager,
-            max_num_seqs=args.vllm_max_num_seqs,
-            max_num_batched_tokens=args.vllm_max_num_batched_tokens,
-            max_num_scheduled_tokens=args.vllm_max_num_scheduled_tokens,
-            max_num_partial_prefills=args.vllm_max_num_partial_prefills,
-            max_long_partial_prefills=args.vllm_max_long_partial_prefills,
-            long_prefill_token_threshold=args.vllm_long_prefill_token_threshold,
-            enable_chunked_prefill=args.vllm_enable_chunked_prefill,
-            scheduler_reserve_full_isl=args.vllm_scheduler_reserve_full_isl,
-            stream_interval=args.vllm_stream_interval,
-            performance_mode=args.vllm_performance_mode,
+            **vllm_tuning_from_args(args),
         )
         child = ctx.Process(target=engine_child_main, args=(cfg, prompt_q, result_q, control_q, status_q))
         _start_process_with_cuda_visible_devices(child, visible)
@@ -2623,7 +2778,7 @@ def run_pipeline(
         _await_status(status_q, MSG_ENGINE_READY)        # (4) weight-transfer engine ready
 
         for _ in range(args.inflight_requests):
-            enqueue_puzzle(next_puzzle_id); next_puzzle_id += 1
+            _enqueue_next_puzzle()
 
         # wandb / rollout files / model-perf are RANK-0-ONLY (only rank 0 logs metrics and
         # owns the collect loop). This is part of the guarded rank-0 init path so workers learn
@@ -2636,211 +2791,14 @@ def run_pipeline(
             run_dir.mkdir(parents=True, exist_ok=True)
             rollout_fh = open(run_dir / "rollouts.jsonl", "a", encoding="utf-8")
             print0(f"Saving rollouts to {run_dir / 'rollouts.jsonl'}")
+        inloop_eval = InloopEval(args, tokenizer, eval_task, interrupt_marker_ids,
+                                 prompt_q, wandb_run, run_logger)
         if args.inloop_eval_every > 0:
-            inloop_eval_prompts = []
-            max_prompt_len = 0
-            for idx in range(len(eval_task)):
-                conv = eval_task[idx]
-                prompt_ids = encode_prompt(tokenizer, conv["question"], args.enable_thinking)
-                max_prompt_len = max(max_prompt_len, int(prompt_ids.numel()))
-                inloop_eval_prompts.append({
-                    "index": idx,
-                    "conversation": conv,
-                    "prompt_ids": prompt_ids.tolist(),
-                })
-            if max_prompt_len + args.inloop_eval_max_tokens > args.max_model_len:
-                raise ValueError(
-                    f"--max-model-len {args.max_model_len} too small for in-loop eval: "
-                    f"max eval prompt ({max_prompt_len}) + --inloop-eval-max-tokens "
-                    f"({args.inloop_eval_max_tokens}) exceeds it"
-                )
-            if not isinstance(wandb_run, DummyWandb):
-                wandb_run.define_metric("eval/*", step_metric="eval/round_step")
-            print0(
-                f"In-loop held-out eval ON: every={args.inloop_eval_every} steps, "
-                f"n={len(inloop_eval_prompts)}, k={args.inloop_eval_k}, "
-                f"max_tokens={args.inloop_eval_max_tokens}, "
-                f"interruption={args.inloop_eval_interruption}"
-            )
+            inloop_eval.prepare_prompts()
     wandb_rollouts_enabled = False
     wandb_rollout_rows: list[list] = []
     wandb_rollout_columns = ["step", "weight_version", "staleness", "puzzle_id", "status",
                              "reward", "advantage", "gen_tokens", "finish_reason", "completion"]
-
-    def _safe_qsize(q) -> float:
-        try:
-            return float(q.qsize())
-        except (NotImplementedError, OSError):
-            return -1.0
-
-    def _inloop_eval_sampling() -> dict[str, Any]:
-        sampling_eval = {
-            "temperature": args.eval_temperature,
-            "top_p": args.eval_top_p,
-            "top_k": args.eval_top_k,
-            "max_tokens": args.inloop_eval_max_tokens,
-            "seed": args.inloop_eval_seed,
-            "logprobs": 0,
-        }
-        if args.inloop_eval_interruption:
-            if interrupt_marker_ids is None:
-                raise RuntimeError("--inloop-eval-interruption requested but interruption marker was not initialized")
-            sampling_eval["interrupt"] = {
-                "marker_ids": list(interrupt_marker_ids),
-                "answer_max_tokens": args.inloop_eval_interrupt_answer_tokens,
-                "max_model_len": args.max_model_len,
-                "temperature": (
-                    args.eval_interrupt_temperature
-                    if args.eval_interrupt_temperature is not None
-                    else args.eval_temperature
-                ),
-                "top_p": args.eval_interrupt_top_p if args.eval_interrupt_top_p is not None else args.eval_top_p,
-                "top_k": args.eval_interrupt_top_k if args.eval_interrupt_top_k is not None else args.eval_top_k,
-            }
-        return sampling_eval
-
-    def _finalize_inloop_eval_round(round_step: int, current_step: int) -> None:
-        state = inloop_eval_rounds.pop(round_step, None)
-        if state is None:
-            return
-        for pid in state["pids"]:
-            inloop_eval_pid_to_round.pop(pid, None)
-
-        received = int(state["received"])
-        expected = int(state["expected"])
-        if received != expected:
-            raise RuntimeError(
-                f"refusing to finalize incomplete in-loop eval round {round_step}: "
-                f"received {received}/{expected} puzzles"
-            )
-        per_puzzle = [
-            c / n
-            for c, n in zip(state["per_puzzle_solved_count"], state["per_puzzle_n"])
-            if n > 0
-        ]
-        total_samples = int(state["n_samples"])
-        total_answered = int(state["n_answered"])
-        total_solved = int(state["n_solved"])
-        total_trunc = int(state["n_length_trunc"])
-        pass_at_1 = sum(per_puzzle) / max(1, len(per_puzzle))
-        answer_rate = total_answered / max(1, total_samples)
-        solve_given_answer = total_solved / max(1, total_answered)
-        trunc_frac = total_trunc / max(1, total_samples)
-        metrics = {
-            "eval/round_step": round_step,
-            "eval/logged_step": current_step,
-            "eval/round_weight_version": state["weight_version"],
-            "eval/round_complete_frac": received / max(1, expected),
-            "eval/received_puzzles": received,
-            "eval/expected_puzzles": expected,
-            "eval/pass_at_1": pass_at_1,
-            "eval/answer_rate": answer_rate,
-            "eval/solve_given_answer": solve_given_answer,
-            "eval/trunc_frac": trunc_frac,
-            "eval/n_samples": total_samples,
-            "eval/n_answered": total_answered,
-            "eval/n_solved": total_solved,
-            "eval/n_length_trunc": total_trunc,
-            "eval/finalize_reason_complete": 1.0,
-        }
-        wandb_run.log(metrics)
-        run_logger.log_eval(round_step, metrics)
-        print0(
-            f"in-loop eval step {round_step:3d} (complete, {received}/{expected} puzzles) | "
-            f"pass@1 {pass_at_1:.3f} answer {answer_rate:.3f} "
-            f"solve|answer {solve_given_answer:.3f} trunc {trunc_frac:.3f}"
-        )
-
-    def _maybe_finalize_inloop_eval_rounds(current_step: int) -> None:
-        if args.inloop_eval_every <= 0:
-            return
-        for round_step, state in inloop_eval_rounds.items():
-            if current_step - int(state["launched_at_step"]) < args.inloop_eval_deadline_steps:
-                continue
-            if state.get("deadline_warned"):
-                continue
-            state["deadline_warned"] = True
-            print0(
-                f"in-loop eval step {round_step:3d} still pending after "
-                f"{args.inloop_eval_deadline_steps} train steps "
-                f"({int(state['received'])}/{int(state['expected'])} puzzles); "
-                "not logging eval/pass_at_1 until the full eval set completes"
-            )
-
-    def _launch_inloop_eval_round(round_step: int) -> None:
-        nonlocal next_eval_pid
-        if args.inloop_eval_every <= 0 or not inloop_eval_prompts:
-            return
-        if round_step in inloop_eval_rounds:
-            return
-        state = {
-            "round_step": round_step,
-            "launched_at_step": round_step,
-            "weight_version": current_version,
-            "expected": len(inloop_eval_prompts),
-            "received": 0,
-            "n_samples": 0,
-            "n_answered": 0,
-            "n_solved": 0,
-            "n_length_trunc": 0,
-            "pids": [],
-            "per_puzzle_n": [0] * len(inloop_eval_prompts),
-            "per_puzzle_solved_count": [0] * len(inloop_eval_prompts),
-            "per_puzzle_answered_count": [0] * len(inloop_eval_prompts),
-            "per_puzzle_length_trunc_count": [0] * len(inloop_eval_prompts),
-        }
-        inloop_eval_rounds[round_step] = state
-        sampling_eval = _inloop_eval_sampling()
-        for idx, item in enumerate(inloop_eval_prompts):
-            pid = next_eval_pid
-            next_eval_pid += 1
-            state["pids"].append(pid)
-            inloop_eval_pid_to_round[pid] = (round_step, idx)
-            prompt_q.put({
-                "type": MSG_GENERATE,
-                "puzzle_id": pid,
-                "prompt_token_ids": item["prompt_ids"],
-                "num_samples": args.inloop_eval_k,
-                "sampling": sampling_eval,
-            })
-        print0(
-            f"launched in-loop eval for step {round_step}: "
-            f"{len(inloop_eval_prompts)} puzzles x k={args.inloop_eval_k}"
-        )
-
-    def _process_inloop_eval_result(msg: dict[str, Any], current_step: int) -> None:
-        pid = int(msg["puzzle_id"])
-        route = inloop_eval_pid_to_round.pop(pid, None)
-        if route is None:
-            return
-        round_step, eval_idx = route
-        state = inloop_eval_rounds.get(round_step)
-        if state is None:
-            return
-
-        conv = inloop_eval_prompts[eval_idx]["conversation"]
-        n = solved = answered = length_trunc = 0
-        for sample in msg["samples"]:
-            n += 1
-            completion = tokenizer.decode(sample["token_ids"], skip_special_tokens=True)
-            if extract_sokoban_answer(completion) is not None:
-                answered += 1
-            if sample.get("finish_reason") == "length":
-                length_trunc += 1
-            solved += eval_task.evaluate(conv, completion)
-
-        state["received"] += 1
-        state["n_samples"] += n
-        state["n_answered"] += answered
-        state["n_solved"] += solved
-        state["n_length_trunc"] += length_trunc
-        state["per_puzzle_n"][eval_idx] = n
-        state["per_puzzle_solved_count"][eval_idx] = solved
-        state["per_puzzle_answered_count"][eval_idx] = answered
-        state["per_puzzle_length_trunc_count"][eval_idx] = length_trunc
-
-        if state["received"] >= state["expected"]:
-            _finalize_inloop_eval_round(round_step, current_step)
 
     # Abort protocol. `_abort_step` turns a controlled rank-0 reject into a RuntimeError without
     # broadcasting; the single poison broadcast on the failure path comes from `_broadcast_poison`,
@@ -2887,6 +2845,317 @@ def run_pipeline(
         if master_process else None
     )
 
+    def _collect_step_batch(step: int, t_step_start: float, times: dict[str, float]) -> CollectStats:
+        """Phase A (RANK 0 ONLY): drain result_q until examples_per_step fresh, signal-bearing
+        rollout groups are banked. In-loop-eval results (pid >= EVAL_PID_BASE) are routed out of
+        band; stale / zero-variance / unusable groups are rejected (with the reject-limit safety
+        abort in CollectStats.register_reject). Raises on engine errors — the caller's blanket
+        handler broadcasts the poison sentinel."""
+        cs = CollectStats()
+        reject_limit = max(256, args.examples_per_step * 64)
+        while cs.puzzles_used < args.examples_per_step:
+            t_wait_start = time.monotonic()
+            try:
+                msg = result_q.get(timeout=ROLLOUT_GET_TIMEOUT_S)
+            except queue.Empty:
+                if not child.is_alive():
+                    raise _abort_step("vLLM child died during generation (no rollouts received)")
+                continue
+            finally:
+                times["result_queue_wait"] += time.monotonic() - t_wait_start
+            if msg["type"] == MSG_ERROR:
+                raise _abort_step(f"engine child error: {msg['msg']}")
+            pid, version = msg["puzzle_id"], msg["weight_version"]
+            if pid >= EVAL_PID_BASE:
+                inloop_eval.process_result(msg, step)
+                continue
+            meta = puzzles.pop(pid)
+            _enqueue_next_puzzle()
+            if not is_fresh_enough(version, current_version, args.max_staleness):
+                cs.groups_stale += 1
+                cs.register_reject(step, reject_limit)
+                continue
+            t_process_start = time.monotonic()
+            processed_samples = list(decode_pool.map(
+                lambda sample: process_rollout_sample(
+                    tokenizer,
+                    meta["prompt_ids"],
+                    meta["prefix_length"],
+                    sample,
+                    meta["conversation"],
+                    trim_after_answer=args.trim_after_answer,
+                ),
+                msg["samples"],
+            ))
+            times["decode_trim_score"] += time.monotonic() - t_process_start
+            if not processed_samples:
+                # vLLM dropped every completion in this group (see _vllm_generate's
+                # None/empty filter): nothing to score, and the zero-variance branch
+                # below would crash on max([]). Treat it as a rejected group so the
+                # reject-limit safety net still catches a persistently broken generator.
+                print0(f"[collect] step {step}: group pid={pid} returned 0 usable samples; skipping")
+                cs.register_reject(step, reject_limit)
+                continue
+            rewards = [sample.reward for sample in processed_samples]
+            fins = [sample.finish_reason for sample in processed_samples]
+            rewards_t = torch.tensor(rewards, dtype=torch.float32)
+            adv = rewards_t - rewards_t.mean()
+            adv_values = adv.tolist()
+            # Unbiased online proxy (before any filter): solved == reward 1.0, matching evaluate().
+            cs.groups_seen_total += 1
+            cs.samples_seen_total += len(rewards)
+            cs.samples_answered_total += sum(
+                1 for sample in processed_samples if sample.moves is not None
+            )
+            cs.samples_solved_total += sum(1 for r in rewards if r == 1.0)
+            cs.samples_length_trunc_unfiltered += sum(1 for fin in fins if fin == "length")
+            cs.groups_any_solved_total += 1 if any(r == 1.0 for r in rewards) else 0
+            is_zero_var = args.zero_variance_filter and not group_has_signal(rewards)
+            t_log_start = time.monotonic()
+            if rollout_fh is not None:
+                status = "zero_variance" if is_zero_var else "trained"
+                for sample, a in zip(processed_samples, adv_values):
+                    rollout_fh.write(json.dumps({
+                        "step": step, "weight_version": version,
+                        "staleness": current_version - version,
+                        "puzzle_id": pid, "status": status,
+                        "reward": float(sample.reward), "advantage": float(a),
+                        "gen_tokens": len(sample.behavior_logprobs),
+                        "finish_reason": sample.finish_reason,
+                        "question": meta["conversation"]["question"],
+                        "completion": sample.completion,
+                    }, ensure_ascii=False) + "\n")
+            times["rollout_logging"] += time.monotonic() - t_log_start
+            if is_zero_var:
+                cs.groups_zero_variance += 1
+                if max(rewards) > 0.5:
+                    cs.groups_zv_allpass += 1
+                else:
+                    cs.groups_zv_allfail += 1
+                cs.register_reject(step, reject_limit)
+                continue
+            cs.consecutive_rejected = 0
+            cs.group_solved.append(1.0 if max(rewards) > 0.5 else 0.0)
+            cs.prefill_tokens_total += meta["prefix_length"]
+            for sample, a in zip(processed_samples, adv_values):
+                cs.step_examples.append(RolloutExample(
+                    sequence=sample.sequence, prefix_length=meta["prefix_length"],
+                    reward=sample.reward, advantage=a,
+                    behavior_logprobs=sample.behavior_logprobs,
+                    weight_version=version, puzzle_id=pid,
+                    completion=sample.completion,
+                    loss_mask=sample.loss_mask))
+                cs.finish_reasons.append(sample.finish_reason)
+                cs.staleness.append(current_version - version)
+                cs.gen_tokens_total += len(sample.behavior_logprobs)
+            cs.puzzles_used += 1
+        times["collect"] = time.monotonic() - t_step_start
+        return cs
+
+    def _sync_weights_to_generators(times: dict[str, float]) -> None:
+        """RANK 0: push fresh weights to the vLLM generators (MSG_SYNC_WEIGHTS -> threaded
+        wsync.send() -> MSG_WEIGHTS_READY) and bump current_version."""
+        nonlocal current_version
+        t_sync_start = time.monotonic()
+        names, dtype_names, shapes = wsync.metadata()
+        current_version += 1
+        control_q.put({"type": MSG_SYNC_WEIGHTS, "names": names, "dtype_names": dtype_names,
+                       "shapes": shapes, "version": current_version})
+        send_result: dict = {}
+
+        def _do_send():
+            # Daemon-thread constraint: drive ONLY the PyNccl weight-transfer group
+            # (wsync.send). Never call dist.* here — the trainer NCCL group is single-
+            # threaded on rank 0's main thread and a dist.* call would deadlock it.
+            try:
+                wsync.send()
+            except BaseException as exc:  # surface NCCL/other errors to the parent
+                send_result["error"] = exc
+
+        send_thread = threading.Thread(target=_do_send, daemon=True)
+        send_thread.start()
+        t_send_wait_start = time.monotonic()
+        send_thread.join(timeout=WEIGHT_SYNC_TIMEOUT_S)
+        times["weight_sync_send"] = time.monotonic() - t_send_wait_start
+        if send_thread.is_alive() or not child.is_alive():
+            raise RuntimeError(
+                "weight broadcast stalled or the vLLM child died during weight sync "
+                f"(child_alive={child.is_alive()})"
+            )
+        if "error" in send_result:
+            raise send_result["error"]
+        t_status_wait_start = time.monotonic()
+        _await_status(status_q, MSG_WEIGHTS_READY)
+        times["weight_sync_wait"] = time.monotonic() - t_status_wait_start
+        times["sync"] = time.monotonic() - t_sync_start
+
+    def _finish_step_rank0(step: int, lr: float, cs: CollectStats, times: dict[str, float],
+                           adv_all: torch.Tensor, loss_sum: float, grad_norm: float,
+                           is_ratio_acc: float, is_clip_acc: float, is_tok_acc: int,
+                           log_ratio_acc: float, is_ratio_sq_acc: float,
+                           global_token_count: int, num_microbatches: int) -> None:
+        """RANK 0 end-of-step bookkeeping: metric assembly, wandb/console/record-log lines, the
+        EWMA canaries, the live rollout table, checkpoint saving, and the warn/abort guards.
+        Raises (e.g. the non-finite grad_norm abort) propagate to the caller's poison handler."""
+        nonlocal trunc_ewma, gnorm_ewma, solve_given_answer_ewma, wandb_rollout_rows
+        rewards_all = torch.tensor([e.reward for e in cs.step_examples], dtype=torch.float32)
+        adv_raw = torch.tensor([e.advantage for e in cs.step_examples], dtype=torch.float32)
+        gen_lens = torch.tensor([float(len(e.behavior_logprobs)) for e in cs.step_examples])
+        n_length_trunc = sum(1 for f in cs.finish_reasons if f == "length")
+        n_eos = sum(1 for f in cs.finish_reasons if f == "stop")
+        n_seqs = len(cs.step_examples)
+        answer_rate = cs.samples_answered_total / max(1, cs.samples_seen_total)
+        solve_given_answer = cs.samples_solved_total / max(1, cs.samples_answered_total)
+        if cs.samples_answered_total > 0:
+            solve_given_answer_ewma = ewma_update(
+                solve_given_answer_ewma if solve_given_answer_ewma is not None else 0.0,
+                solve_given_answer, 0.1, seed=solve_given_answer_ewma is None)
+        metrics = {
+            "step": step, "lr": lr, "weight_version": current_version,
+            "groups/used": cs.puzzles_used,
+            "groups/zero_variance_dropped": cs.groups_zero_variance,
+            "groups/zero_variance_allfail": cs.groups_zv_allfail,
+            "groups/zero_variance_allpass": cs.groups_zv_allpass,
+            "groups/zero_variance_allfail_frac": cs.groups_zv_allfail / max(1, cs.groups_seen_total),
+            "groups/zero_variance_allpass_frac": cs.groups_zv_allpass / max(1, cs.groups_seen_total),
+            "groups/stale_dropped": cs.groups_stale,
+            # Signal yield this step: accepted groups / all fresh groups seen. Falls as the
+            # train set is mastered (all-pass drops climb) or staleness tightens; the
+            # high-water mark foreshadows the reject_limit hard abort.
+            "groups/acceptance_ratio": cs.puzzles_used / max(1, cs.groups_seen_total),
+            "groups/consecutive_rejected_max": cs.consecutive_rejected_max,
+            "seqs": n_seqs,
+            "reward/mean": float(rewards_all.mean()),
+            "reward/std": float(rewards_all.std(unbiased=False)),
+            "reward/solved_frac": float((rewards_all > 0.5).float().mean()),
+            "reward/group_pass_at_k": float(sum(cs.group_solved) / max(1, len(cs.group_solved))),
+            # Unbiased proxies over all fresh generated groups (pre-filter). Use these,
+            # not solved_frac/group_pass_at_k, to gauge live progress; see run_held_out_eval.
+            "reward/online_solved_frac_unfiltered": cs.samples_solved_total / max(1, cs.samples_seen_total),
+            "reward/online_group_any_solved_unfiltered": cs.groups_any_solved_total / max(1, cs.groups_seen_total),
+            "reward/answer_rate": answer_rate,
+            "reward/solve_given_answer": solve_given_answer,
+            "reward/solve_given_answer_ewma": (
+                solve_given_answer_ewma if solve_given_answer_ewma is not None else 0.0
+            ),
+            "adv/raw_std": float(adv_raw.std(unbiased=False)),
+            "adv/norm_std": float(adv_all.std(unbiased=False)),
+            "loss": loss_sum,
+            "grad_norm": grad_norm,
+            "train/logits_chunk_size": args.logits_chunk_size,
+            "train/device_batch_size": args.device_batch_size,
+            "is_ratio/mean": (is_ratio_acc / is_tok_acc) if is_tok_acc else 0.0,
+            "is_ratio/clipped_frac": (is_clip_acc / is_tok_acc) if is_tok_acc else 0.0,
+            # Effective sample size fraction (Σw)²/(N·Σw²) over valid tokens: 1.0 == on
+            # policy, →0 as the bf16-behavior/fp32-trainer mismatch + staleness widen.
+            "is_ratio/ess_frac": (
+                (is_ratio_acc * is_ratio_acc) / (is_tok_acc * is_ratio_sq_acc)
+                if is_tok_acc and is_ratio_sq_acc > 0.0 else 0.0
+            ),
+            # Mean log(pi_theta / pi_behavior) over valid tokens (signed drift; ~0 = matched).
+            "mismatch/mean_log_ratio": (log_ratio_acc / is_tok_acc) if is_tok_acc else 0.0,
+            "gen/mean_tokens": float(gen_lens.mean()),
+            "gen/max_tokens": float(gen_lens.max()),
+            "gen/total_tokens": int(cs.gen_tokens_total),
+            "gen/length_trunc_frac": n_length_trunc / max(1, n_seqs),
+            "gen/length_trunc_frac_unfiltered": (
+                cs.samples_length_trunc_unfiltered / max(1, cs.samples_seen_total)
+            ),
+            "gen/eos_frac": n_eos / max(1, n_seqs),
+            "staleness/mean": sum(cs.staleness) / max(1, len(cs.staleness)),
+            "staleness/max": (max(cs.staleness) if cs.staleness else 0),
+            **{f"time/{name}_s": value for name, value in times.items()},
+            "throughput/gen_tokens_per_s": cs.gen_tokens_total / max(1e-6, times["collect"]),
+            "throughput/train_tokens_per_s": global_token_count / max(1e-6, times["train"]),
+            "throughput/seqs_per_s": n_seqs / max(1e-6, times["step"]),
+            "throughput/result_q_backlog": _safe_qsize(result_q),
+        }
+        metrics.update(estimate_step_perf_metrics(
+            model_info=model_perf_info,
+            train_padded_tokens=float(global_token_count),
+            train_forward_backward_passes=float(num_microbatches),
+            rollout_prefill_tokens=float(cs.prefill_tokens_total),
+            rollout_decode_tokens=float(cs.gen_tokens_total),
+            rollout_forward_passes=float(cs.gen_tokens_total),
+            train_seconds=times["train"],
+            rollout_seconds=times["collect"],
+        ))
+
+        # Truncation EWMA (ScaleRL A.15 leading-spiral indicator): logged to W&B and
+        # WARN-only (no hard-abort). During warmup the EWMA just tracks the raw (high,
+        # expected) cold-start truncation and is re-seeded at the first post-warmup step,
+        # so that history doesn't skew the steady-state value.
+        trunc_ewma = ewma_update(trunc_ewma, metrics["gen/length_trunc_frac"],
+                                 TRUNC_EWMA_ALPHA, seed=step <= args.warmup_steps)
+        metrics["gen/length_trunc_ewma"] = trunc_ewma
+
+        # Grad-norm EWMA (run1's collapse mode was gnorm 0.4->4.9): logged + WARN-only.
+        # Mirror the truncation EWMA: seed on warmup, smooth after. A non-finite grad_norm
+        # is immediate divergence and still hard-aborts (NaN poisons the weights).
+        gnorm_val = float(grad_norm)
+        gnorm_finite = math.isfinite(gnorm_val)
+        if not gnorm_finite:
+            gnorm_ewma = float("inf")
+        else:
+            gnorm_ewma = ewma_update(gnorm_ewma, gnorm_val, GNORM_EWMA_ALPHA,
+                                     seed=step <= args.warmup_steps)
+        metrics["grad_norm_ewma"] = gnorm_ewma
+
+        print0(
+            f"step {step:3d} | rew {metrics['reward/mean']:.3f} pass@k {metrics['reward/group_pass_at_k']:.2f} "
+            f"solved {metrics['reward/solved_frac']:.2f} ans {metrics['reward/answer_rate']:.2f} "
+            f"s|a {metrics['reward/solve_given_answer']:.2f} | loss {loss_sum:.4f} gnorm {grad_norm:.2f} "
+            f"| IS {metrics['is_ratio/mean']:.2f} clip {metrics['is_ratio/clipped_frac']:.2f} "
+            f"| genlen {metrics['gen/mean_tokens']:.0f} trunc {metrics['gen/length_trunc_frac']:.2f} "
+            f"| gen {metrics['throughput/gen_tokens_per_s']:.0f} tok/s tr {metrics['throughput/train_tokens_per_s']:.0f} tok/s "
+            f"| t {times['step']:.1f}s (gen {times['collect']:.1f}/tr {times['train']:.1f}/sync {times['sync']:.1f}) "
+            f"| v{current_version} stale {metrics['staleness/mean']:.1f}"
+        )
+        if wandb_rollouts_enabled and n_seqs > 0:
+            import wandb
+            # Sample a spread of this step's rollouts by reward (solved + middle + unsolved).
+            examples = cs.step_examples
+            order = sorted(range(n_seqs), key=lambda i: examples[i].reward)
+            n = min(args.wandb_rollout_samples, n_seqs)
+            picks = [order[round(j * (n_seqs - 1) / (n - 1))] for j in range(n)] if n > 1 else [order[0]]
+            step_rows = [[step, examples[i].weight_version, cs.staleness[i],
+                          examples[i].puzzle_id, "trained", float(examples[i].reward),
+                          float(examples[i].advantage), len(examples[i].behavior_logprobs),
+                          cs.finish_reasons[i], (examples[i].completion or "")] for i in picks]
+            # LIVE per-step rollouts: fold an n-row table into the SAME metrics log (no extra log()
+            # call => no wandb-step desync; survives an early kill, unlike the once-at-end dump).
+            # FULL completions logged (already decoded; ~few hundred KB/step at N=10, async upload)
+            # so the tail — where late repetition / non-termination shows — is visible.
+            metrics["rollouts_live"] = wandb.Table(columns=wandb_rollout_columns, data=step_rows)
+            wandb_rollout_rows.extend(step_rows)        # running record; full table dumped in finally
+            wandb_rollout_rows = wandb_rollout_rows[-1500:]  # covers a full 120-step run at N=10
+        wandb_run.log(metrics)
+        run_logger.log_step(step, num_steps, metrics)
+        inloop_eval.warn_overdue(step)
+        if rollout_fh is not None:
+            rollout_fh.flush()
+        if should_save_checkpoint_for_step(step, num_steps, args.save_every, args.save_final):
+            checkpoint_dir = save_hf_checkpoint(model, tokenizer, run_dir, step)
+            print0(f"Saved checkpoint to {checkpoint_dir}")
+            if step == num_steps - 1 and args.save_final:
+                # Official record clock stops here: the final checkpoint has finished writing.
+                run_logger.log_final_checkpoint(checkpoint_dir)
+        if trunc_ewma >= TRUNC_WARN_EWMA:
+            print0(f"WARNING step {step}: gen/length_trunc_ewma={trunc_ewma:.3f} "
+                   f">= {TRUNC_WARN_EWMA:.2f} (truncation climbing; ScaleRL A.15 spiral risk)")
+        if not gnorm_finite:
+            raise _abort_step(
+                f"non-finite grad_norm ({grad_norm}) at step {step} — divergence; "
+                f"aborting; resume from the last saved checkpoint"
+            )
+        if gnorm_ewma >= GNORM_WARN_EWMA:
+            print0(f"WARNING step {step}: grad_norm_ewma={gnorm_ewma:.2f} "
+                   f">= {GNORM_WARN_EWMA:.1f} (gradient climbing; run1-style explosion risk)")
+        if metrics["groups/zero_variance_allpass_frac"] >= ALLPASS_WARN_FRAC:
+            print0(f"WARNING step {step}: groups/zero_variance_allpass_frac="
+                   f"{metrics['groups/zero_variance_allpass_frac']:.2f} >= {ALLPASS_WARN_FRAC:.2f} "
+                   f"(train set being mastered; curriculum starvation / wasted generation)")
+
     try:
         # RANK-0 INIT STATUS (all ranks, world_size>1 only): workers must not enter the
         # loop's first Phase-C scatter until rank 0 has finished the slow rank-0-only setup.
@@ -2913,7 +3182,7 @@ def run_pipeline(
         solve_given_answer_ewma: float | None = None
 
         for step in range(num_steps):
-            has_next_step = _pipeline_has_next_step(step, num_steps)
+            has_next_step = step < num_steps - 1
             t_step_start = time.monotonic()
             if step == 0:
                 # The record clock starts at the first training step; startup is untimed (see README rules).
@@ -2940,183 +3209,50 @@ def run_pipeline(
             # double-broadcasting the sentinel within a step.
             poison_sent = [False]
 
-            # ---- Phase A (RANK 0 ONLY): collect one step's worth of fresh, signal-bearing rollouts ----
-            step_examples: list[RolloutExample] = []
-            finish_reasons: list[str | None] = []
-            staleness: list[int] = []
-            group_solved: list[float] = []      # 1.0 if any sample in the group solved
-            # Unbiased online proxy: counted over ALL fresh (non-stale) generated groups,
-            # BEFORE the zero-variance filter that biases reward/solved_frac & group_pass_at_k.
-            groups_seen_total = 0
-            samples_seen_total = 0
-            samples_answered_total = 0
-            samples_solved_total = 0
-            samples_length_trunc_unfiltered = 0
-            groups_any_solved_total = 0
-            gen_tokens_total = 0
-            prefill_tokens_total = 0
-            puzzles_used = 0
-            groups_zero_variance = 0
-            groups_zv_allfail = 0
-            groups_zv_allpass = 0
-            groups_stale = 0
-            consecutive_rejected = 0
-            consecutive_rejected_max = 0
-            reject_limit = max(256, args.examples_per_step * 64)
-            t_collect = 0.0
-            t_result_queue_wait = 0.0
-            t_decode_trim_score = 0.0
-            t_rollout_logging = 0.0
-            t_object_scatter_broadcast = 0.0
-            t_batch_tensorize = 0.0
-            t_grad_allreduce = 0.0
-            t_optimizer_clip = 0.0
-            t_weight_sync_send = 0.0
-            t_weight_sync_wait = 0.0
+            # Per-step wall-clock breakdown, logged as time/<name>_s (initialized in metric
+            # order; the collect-side entries are filled inside _collect_step_batch).
+            times = {name: 0.0 for name in (
+                "collect", "result_queue_wait", "decode_trim_score", "rollout_logging",
+                "object_scatter_broadcast", "batch_tensorize", "grad_allreduce",
+                "optimizer_clip", "weight_sync_send", "weight_sync_wait",
+                "train", "sync", "step",
+            )}
+            cs: CollectStats | None = None  # rank-0 Phase-A result
             adv_all = None
             shards: list[list[RolloutExample]] | None = None
             adv_shards: list[list[float]] | None = None
             num_prompts_local = 0  # global trained-prompt count P (rank 0 fills it; broadcast in Phase C)
             if master_process:
                 # Blanket handler: any exception in rank 0's Phase A/B — explicit `_abort_step`
-                # rejects and implicit ones (puzzles.pop KeyError, torch.cat / task_reward / trim_*
+                # rejects and implicit ones (puzzles.pop KeyError, torch.cat / scoring / trim_*
                 # errors, the empty-batch assert) — broadcasts one poison sentinel before
                 # propagating, so workers unblock at Phase C and raise in lockstep.
                 try:
-                    while puzzles_used < args.examples_per_step:
-                        t_wait_start = time.monotonic()
-                        try:
-                            msg = result_q.get(timeout=ROLLOUT_GET_TIMEOUT_S)
-                        except queue.Empty:
-                            if not child.is_alive():
-                                raise _abort_step("vLLM child died during generation (no rollouts received)")
-                            continue
-                        finally:
-                            t_result_queue_wait += time.monotonic() - t_wait_start
-                        if msg["type"] == MSG_ERROR:
-                            raise _abort_step(f"engine child error: {msg['msg']}")
-                        pid, version = msg["puzzle_id"], msg["weight_version"]
-                        if pid >= EVAL_PID_BASE:
-                            _process_inloop_eval_result(msg, step)
-                            continue
-                        meta = puzzles.pop(pid)
-                        enqueue_puzzle(next_puzzle_id); next_puzzle_id += 1
-                        if not is_fresh_enough(version, current_version, args.max_staleness):
-                            groups_stale += 1
-                            consecutive_rejected += 1
-                            consecutive_rejected_max = max(consecutive_rejected_max, consecutive_rejected)
-                            if consecutive_rejected > reject_limit:
-                                raise _abort_step(
-                                    f"step {step}: rejected {consecutive_rejected} consecutive rollout groups "
-                                    f"(staleness bound too tight or rewards degenerate); aborting")
-                            continue
-                        t_process_start = time.monotonic()
-                        processed_samples = list(decode_pool.map(
-                            lambda sample: process_rollout_sample(
-                                tokenizer,
-                                meta["prompt_ids"],
-                                meta["prefix_length"],
-                                sample,
-                                meta["conversation"],
-                                trim_after_answer=args.trim_after_answer,
-                            ),
-                            msg["samples"],
-                        ))
-                        t_decode_trim_score += time.monotonic() - t_process_start
-                        if not processed_samples:
-                            # vLLM dropped every completion in this group (see _vllm_generate's
-                            # None/empty filter): nothing to score, and the zero-variance branch
-                            # below would crash on max([]). Treat it as a rejected group so the
-                            # reject-limit safety net still catches a persistently broken generator.
-                            print0(f"[collect] step {step}: group pid={pid} returned 0 usable samples; skipping")
-                            consecutive_rejected += 1
-                            consecutive_rejected_max = max(consecutive_rejected_max, consecutive_rejected)
-                            if consecutive_rejected > reject_limit:
-                                raise _abort_step(
-                                    f"step {step}: rejected {consecutive_rejected} consecutive rollout groups "
-                                    f"(staleness bound too tight or rewards degenerate); aborting")
-                            continue
-                        rewards = [sample.reward for sample in processed_samples]
-                        fins = [sample.finish_reason for sample in processed_samples]
-                        rewards_t = torch.tensor(rewards, dtype=torch.float32)
-                        adv = rewards_t - rewards_t.mean()
-                        adv_values = adv.tolist()
-                        # Unbiased online proxy (before any filter): solved == reward 1.0, matching evaluate().
-                        groups_seen_total += 1
-                        samples_seen_total += len(rewards)
-                        samples_answered_total += sum(
-                            1 for sample in processed_samples if sample.moves is not None
-                        )
-                        samples_solved_total += sum(1 for r in rewards if r == 1.0)
-                        samples_length_trunc_unfiltered += sum(1 for fin in fins if fin == "length")
-                        groups_any_solved_total += 1 if any(r == 1.0 for r in rewards) else 0
-                        is_zero_var = args.zero_variance_filter and not group_has_signal(rewards)
-                        t_log_start = time.monotonic()
-                        if rollout_fh is not None:
-                            status = "zero_variance" if is_zero_var else "trained"
-                            for sample, a in zip(processed_samples, adv_values):
-                                rollout_fh.write(json.dumps({
-                                    "step": step, "weight_version": version,
-                                    "staleness": current_version - version,
-                                    "puzzle_id": pid, "status": status,
-                                    "reward": float(sample.reward), "advantage": float(a),
-                                    "gen_tokens": len(sample.behavior_logprobs),
-                                    "finish_reason": sample.finish_reason,
-                                    "question": meta["conversation"]["question"],
-                                    "completion": sample.completion,
-                                }, ensure_ascii=False) + "\n")
-                        t_rollout_logging += time.monotonic() - t_log_start
-                        if is_zero_var:
-                            groups_zero_variance += 1
-                            if max(rewards) > 0.5:
-                                groups_zv_allpass += 1
-                            else:
-                                groups_zv_allfail += 1
-                            consecutive_rejected += 1
-                            consecutive_rejected_max = max(consecutive_rejected_max, consecutive_rejected)
-                            if consecutive_rejected > reject_limit:
-                                raise _abort_step(
-                                    f"step {step}: rejected {consecutive_rejected} consecutive rollout groups "
-                                    f"(staleness bound too tight or rewards degenerate); aborting")
-                            continue
-                        consecutive_rejected = 0
-                        group_solved.append(1.0 if max(rewards) > 0.5 else 0.0)
-                        prefill_tokens_total += meta["prefix_length"]
-                        for sample, a in zip(processed_samples, adv_values):
-                            step_examples.append(RolloutExample(
-                                sequence=sample.sequence, prefix_length=meta["prefix_length"],
-                                reward=sample.reward, advantage=a,
-                                behavior_logprobs=sample.behavior_logprobs,
-                                weight_version=version, puzzle_id=pid,
-                                completion=sample.completion,
-                                loss_mask=sample.loss_mask))
-                            finish_reasons.append(sample.finish_reason)
-                            staleness.append(current_version - version)
-                            gen_tokens_total += len(sample.behavior_logprobs)
-                        puzzles_used += 1
-                    t_collect = time.monotonic() - t_step_start
+                    # ---- Phase A (RANK 0 ONLY): collect one step's worth of fresh, signal-
+                    # bearing rollouts (see _collect_step_batch above). ----
+                    cs = _collect_step_batch(step, t_step_start, times)
 
                     # The collect loop only exits once `examples_per_step` signal groups landed, so
                     # step_examples is non-empty by construction; guard it before scatter so an
-                    # empty batch never reaches pad_shards_to_equal -> make_rl_batch_varprefix.
-                    assert step_examples, "Phase A produced an empty step batch (would break scatter)"
+                    # empty batch never reaches sort_and_shard_for_microbatching -> build_rl_batch_varprefix_cpu.
+                    assert cs.step_examples, "Phase A produced an empty step batch (would break scatter)"
 
                     # ---- Phase B (RANK 0 ONLY): batch-normalize advantages over the FULL step batch,
                     # BEFORE scattering. Per-shard std would be wrong, so this must precede the split.
                     adv_all = batch_normalize_advantages(
-                        torch.tensor([e.advantage for e in step_examples], dtype=torch.float32, device=device))
+                        torch.tensor([e.advantage for e in cs.step_examples], dtype=torch.float32, device=device))
                     adv_all_list = adv_all.detach().cpu().tolist()
-                    training_step_examples = strip_rollout_completions(step_examples)
+                    training_step_examples = strip_rollout_completions(cs.step_examples)
                     # ScaleRL prompt-level loss aggregation: tag every sample with its prompt group's
                     # total valid (trainable) token count L_p, summed over the FULL batch HERE — before
                     # the length-sort can split a group across ranks/microbatches — and carried on the
                     # example so it survives the scatter. P = number of trained prompt groups (puzzle
                     # ids). Mirrors local_and_global_counts' valid-token definition (loss_mask sum, or
                     # full generated length when interruption is off). No-op for token/sequence modes.
-                    group_token_totals: dict[int, int] = {}
+                    group_token_totals: Counter[int] = Counter()
                     for e in training_step_examples:
                         n_valid = sum(e.loss_mask) if e.loss_mask is not None else len(e.behavior_logprobs)
-                        group_token_totals[e.puzzle_id] = group_token_totals.get(e.puzzle_id, 0) + n_valid
+                        group_token_totals[e.puzzle_id] += n_valid
                     for e in training_step_examples:
                         e.group_token_count = group_token_totals[e.puzzle_id]
                     num_prompts_local = len(group_token_totals)
@@ -3145,7 +3281,7 @@ def run_pipeline(
                                            num_prompts=num_prompts_local)
                 t_object_start = time.monotonic()
                 dist.broadcast_object_list(payload, src=0)
-                t_object_scatter_broadcast = time.monotonic() - t_object_start
+                times["object_scatter_broadcast"] = time.monotonic() - t_object_start
                 control, full_padded, full_adv = payload
                 if control["abort"]:
                     raise RuntimeError("aborting after rank-0 poison sentinel (Phase A error on rank 0)")
@@ -3220,7 +3356,7 @@ def run_pipeline(
                 attention_mask = attn_host.to(device, non_blocking=True)
                 labels = labels_host.to(device, non_blocking=True)
                 beh = beh_host.to(device, non_blocking=True)
-                t_batch_tensorize += time.monotonic() - t_tensorize_start
+                times["batch_tensorize"] += time.monotonic() - t_tensorize_start
                 mb_stats: dict = {}
                 prompt_mode = args.loss_normalization == "prompt"
                 # ScaleRL prompt-level: per-sample group-total token count L_p (carried on each
@@ -3258,7 +3394,7 @@ def run_pipeline(
             if world_size > 1:
                 t_allreduce_start = time.monotonic()
                 all_reduce_grads_sum(model)
-                t_grad_allreduce = time.monotonic() - t_allreduce_start
+                times["grad_allreduce"] = time.monotonic() - t_allreduce_start
                 # Reduce the diagnostic accumulators to GLOBAL sums in the all-ranks region (one
                 # extra small all-reduce). Without this they were rank-0-local, so is_ratio/* only
                 # reflected rank 0's shard; the new ESS/drift metrics need the full-batch view too.
@@ -3280,7 +3416,7 @@ def run_pipeline(
             grad_norm_t = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
             torch.cuda.synchronize()
-            t_optimizer_clip = time.monotonic() - t_optimizer_start
+            times["optimizer_clip"] = time.monotonic() - t_optimizer_start
             loss_sum = float(loss_sum_t.detach())
             is_ratio_acc = float(is_ratio_acc_t.detach())
             is_clip_acc = float(is_clip_acc_t.detach())
@@ -3288,7 +3424,7 @@ def run_pipeline(
             log_ratio_acc = float(log_ratio_acc_t.detach())
             is_ratio_sq_acc = float(is_ratio_sq_acc_t.detach())
             grad_norm = float(grad_norm_t.detach())
-            t_train = time.monotonic() - t_train_start
+            times["train"] = time.monotonic() - t_train_start
 
             # ---- Phase F (debug guard, ALL RANKS): confirm the replicas stayed bit-identical.
             # Gated by `world_size > 1` (and the flag) so all ranks issue its 4 collectives or
@@ -3308,236 +3444,32 @@ def run_pipeline(
             # broadcast (when one exists). A non-final weight-sync failure therefore broadcasts one
             # poison sentinel that workers consume at next-step Phase C; the final step has no
             # Phase-C receiver, so rank 0 just raises.
-            t_sync = 0.0
             if master_process:
                 try:
-                    t_sync_start = time.monotonic()
-                    names, dtype_names, shapes = wsync.metadata()
-                    current_version += 1
-                    control_q.put({"type": MSG_SYNC_WEIGHTS, "names": names, "dtype_names": dtype_names,
-                                   "shapes": shapes, "version": current_version})
-                    send_result: dict = {}
-
-                    def _do_send():
-                        # Daemon-thread constraint: drive ONLY the PyNccl weight-transfer group
-                        # (wsync.send). Never call dist.* here — the trainer NCCL group is single-
-                        # threaded on rank 0's main thread and a dist.* call would deadlock it.
-                        try:
-                            wsync.send()
-                        except BaseException as exc:  # surface NCCL/other errors to the parent
-                            send_result["error"] = exc
-
-                    send_thread = threading.Thread(target=_do_send, daemon=True)
-                    send_thread.start()
-                    t_send_wait_start = time.monotonic()
-                    send_thread.join(timeout=WEIGHT_SYNC_TIMEOUT_S)
-                    t_weight_sync_send = time.monotonic() - t_send_wait_start
-                    if send_thread.is_alive() or not child.is_alive():
-                        raise RuntimeError(
-                            "weight broadcast stalled or the vLLM child died during weight sync "
-                            f"(child_alive={child.is_alive()})"
-                        )
-                    if "error" in send_result:
-                        raise send_result["error"]
-                    t_status_wait_start = time.monotonic()
-                    _await_status(status_q, MSG_WEIGHTS_READY)
-                    t_weight_sync_wait = time.monotonic() - t_status_wait_start
-                    t_sync = time.monotonic() - t_sync_start
+                    _sync_weights_to_generators(times)
                     if (
                         args.inloop_eval_every > 0
                         and has_next_step
                         and step > 0
                         and step % args.inloop_eval_every == 0
                     ):
-                        _launch_inloop_eval_round(step)
+                        inloop_eval.launch_round(step, current_version)
                 except BaseException:
                     if has_next_step:
                         _broadcast_poison(poison_sent)
                     raise
-            t_step = time.monotonic() - t_step_start
+            times["step"] = time.monotonic() - t_step_start
 
             # ---- metrics (RANK 0 ONLY): the collect-side counts are rank-0-local; the
             # all-reduced global_token_count drives train throughput. Workers skip to the next
             # step's Phase-C scatter. ----
-            num_microbatches_step = num_microbatches
             if master_process:
                 try:
-                    rewards_all = torch.tensor([e.reward for e in step_examples], dtype=torch.float32)
-                    adv_raw = torch.tensor([e.advantage for e in step_examples], dtype=torch.float32)
-                    gen_lens = torch.tensor([float(len(e.behavior_logprobs)) for e in step_examples])
-                    n_length_trunc = sum(1 for f in finish_reasons if f == "length")
-                    n_eos = sum(1 for f in finish_reasons if f == "stop")
-                    n_seqs = len(step_examples)
-                    answer_rate = samples_answered_total / max(1, samples_seen_total)
-                    solve_given_answer = samples_solved_total / max(1, samples_answered_total)
-                    if samples_answered_total > 0:
-                        if solve_given_answer_ewma is None:
-                            solve_given_answer_ewma = solve_given_answer
-                        else:
-                            solve_given_answer_ewma = (
-                                0.9 * solve_given_answer_ewma + 0.1 * solve_given_answer
-                            )
-                    metrics = {
-                        "step": step, "lr": lr, "weight_version": current_version,
-                        "groups/used": puzzles_used,
-                        "groups/zero_variance_dropped": groups_zero_variance,
-                        "groups/zero_variance_allfail": groups_zv_allfail,
-                        "groups/zero_variance_allpass": groups_zv_allpass,
-                        "groups/zero_variance_allfail_frac": groups_zv_allfail / max(1, groups_seen_total),
-                        "groups/zero_variance_allpass_frac": groups_zv_allpass / max(1, groups_seen_total),
-                        "groups/stale_dropped": groups_stale,
-                        # Signal yield this step: accepted groups / all fresh groups seen. Falls as the
-                        # train set is mastered (all-pass drops climb) or staleness tightens; the
-                        # high-water mark foreshadows the reject_limit hard abort.
-                        "groups/acceptance_ratio": puzzles_used / max(1, groups_seen_total),
-                        "groups/consecutive_rejected_max": consecutive_rejected_max,
-                        "seqs": n_seqs,
-                        "reward/mean": float(rewards_all.mean()),
-                        "reward/std": float(rewards_all.std(unbiased=False)),
-                        "reward/solved_frac": float((rewards_all > 0.5).float().mean()),
-                        "reward/group_pass_at_k": float(sum(group_solved) / max(1, len(group_solved))),
-                        # Unbiased proxies over all fresh generated groups (pre-filter). Use these,
-                        # not solved_frac/group_pass_at_k, to gauge live progress; see run_held_out_eval.
-                        "reward/online_solved_frac_unfiltered": samples_solved_total / max(1, samples_seen_total),
-                        "reward/online_group_any_solved_unfiltered": groups_any_solved_total / max(1, groups_seen_total),
-                        "reward/answer_rate": answer_rate,
-                        "reward/solve_given_answer": solve_given_answer,
-                        "reward/solve_given_answer_ewma": (
-                            solve_given_answer_ewma if solve_given_answer_ewma is not None else 0.0
-                        ),
-                        "adv/raw_std": float(adv_raw.std(unbiased=False)),
-                        "adv/norm_std": float(adv_all.std(unbiased=False)),
-                        "loss": loss_sum,
-                        "grad_norm": grad_norm,
-                        "train/logits_chunk_size": args.logits_chunk_size,
-                        "train/device_batch_size": args.device_batch_size,
-                        "is_ratio/mean": (is_ratio_acc / is_tok_acc) if is_tok_acc else 0.0,
-                        "is_ratio/clipped_frac": (is_clip_acc / is_tok_acc) if is_tok_acc else 0.0,
-                        # Effective sample size fraction (Σw)²/(N·Σw²) over valid tokens: 1.0 == on
-                        # policy, →0 as the bf16-behavior/fp32-trainer mismatch + staleness widen.
-                        "is_ratio/ess_frac": (
-                            (is_ratio_acc * is_ratio_acc) / (is_tok_acc * is_ratio_sq_acc)
-                            if is_tok_acc and is_ratio_sq_acc > 0.0 else 0.0
-                        ),
-                        # Mean log(pi_theta / pi_behavior) over valid tokens (signed drift; ~0 = matched).
-                        "mismatch/mean_log_ratio": (log_ratio_acc / is_tok_acc) if is_tok_acc else 0.0,
-                        "gen/mean_tokens": float(gen_lens.mean()),
-                        "gen/max_tokens": float(gen_lens.max()),
-                        "gen/total_tokens": int(gen_tokens_total),
-                        "gen/length_trunc_frac": n_length_trunc / max(1, n_seqs),
-                        "gen/length_trunc_frac_unfiltered": (
-                            samples_length_trunc_unfiltered / max(1, samples_seen_total)
-                        ),
-                        "gen/eos_frac": n_eos / max(1, n_seqs),
-                        "staleness/mean": sum(staleness) / max(1, len(staleness)),
-                        "staleness/max": (max(staleness) if staleness else 0),
-                        "time/collect_s": t_collect,
-                        "time/result_queue_wait_s": t_result_queue_wait,
-                        "time/decode_trim_score_s": t_decode_trim_score,
-                        "time/rollout_logging_s": t_rollout_logging,
-                        "time/object_scatter_broadcast_s": t_object_scatter_broadcast,
-                        "time/batch_tensorize_s": t_batch_tensorize,
-                        "time/grad_allreduce_s": t_grad_allreduce,
-                        "time/optimizer_clip_s": t_optimizer_clip,
-                        "time/weight_sync_send_s": t_weight_sync_send,
-                        "time/weight_sync_wait_s": t_weight_sync_wait,
-                        "time/train_s": t_train,
-                        "time/sync_s": t_sync,
-                        "time/step_s": t_step,
-                        "throughput/gen_tokens_per_s": gen_tokens_total / max(1e-6, t_collect),
-                        "throughput/train_tokens_per_s": global_token_count / max(1e-6, t_train),
-                        "throughput/seqs_per_s": n_seqs / max(1e-6, t_step),
-                        "throughput/result_q_backlog": _safe_qsize(result_q),
-                    }
-                    metrics.update(estimate_step_perf_metrics(
-                        model_info=model_perf_info,
-                        train_padded_tokens=float(global_token_count),
-                        train_forward_backward_passes=float(num_microbatches_step),
-                        rollout_prefill_tokens=float(prefill_tokens_total),
-                        rollout_decode_tokens=float(gen_tokens_total),
-                        rollout_forward_passes=float(gen_tokens_total),
-                        train_seconds=t_train,
-                        rollout_seconds=t_collect,
-                    ))
-
-                    # Truncation EWMA (ScaleRL A.15 leading-spiral indicator): logged to W&B and
-                    # WARN-only (no hard-abort). During warmup the EWMA just tracks the raw (high,
-                    # expected) cold-start truncation and is re-seeded at the first post-warmup step,
-                    # so that history doesn't skew the steady-state value.
-                    if step <= args.warmup_steps:
-                        trunc_ewma = metrics["gen/length_trunc_frac"]
-                    else:
-                        trunc_ewma = (1.0 - TRUNC_EWMA_ALPHA) * trunc_ewma + TRUNC_EWMA_ALPHA * metrics["gen/length_trunc_frac"]
-                    metrics["gen/length_trunc_ewma"] = trunc_ewma
-
-                    # Grad-norm EWMA (run1's collapse mode was gnorm 0.4->4.9): logged + WARN-only.
-                    # Mirror the truncation EWMA: seed on warmup, smooth after. A non-finite grad_norm
-                    # is immediate divergence and still hard-aborts (NaN poisons the weights).
-                    gnorm_val = float(grad_norm)
-                    gnorm_finite = (gnorm_val == gnorm_val) and gnorm_val not in (float("inf"), float("-inf"))
-                    if not gnorm_finite:
-                        gnorm_ewma = float("inf")
-                    elif step <= args.warmup_steps:
-                        gnorm_ewma = gnorm_val
-                    else:
-                        gnorm_ewma = (1.0 - GNORM_EWMA_ALPHA) * gnorm_ewma + GNORM_EWMA_ALPHA * gnorm_val
-                    metrics["grad_norm_ewma"] = gnorm_ewma
-
-                    print0(
-                        f"step {step:3d} | rew {metrics['reward/mean']:.3f} pass@k {metrics['reward/group_pass_at_k']:.2f} "
-                        f"solved {metrics['reward/solved_frac']:.2f} ans {metrics['reward/answer_rate']:.2f} "
-                        f"s|a {metrics['reward/solve_given_answer']:.2f} | loss {loss_sum:.4f} gnorm {grad_norm:.2f} "
-                        f"| IS {metrics['is_ratio/mean']:.2f} clip {metrics['is_ratio/clipped_frac']:.2f} "
-                        f"| genlen {metrics['gen/mean_tokens']:.0f} trunc {metrics['gen/length_trunc_frac']:.2f} "
-                        f"| gen {metrics['throughput/gen_tokens_per_s']:.0f} tok/s tr {metrics['throughput/train_tokens_per_s']:.0f} tok/s "
-                        f"| t {t_step:.1f}s (gen {t_collect:.1f}/tr {t_train:.1f}/sync {t_sync:.1f}) "
-                        f"| v{current_version} stale {metrics['staleness/mean']:.1f}"
+                    _finish_step_rank0(
+                        step, lr, cs, times, adv_all, loss_sum, grad_norm,
+                        is_ratio_acc, is_clip_acc, is_tok_acc, log_ratio_acc, is_ratio_sq_acc,
+                        global_token_count, num_microbatches,
                     )
-                    if wandb_rollouts_enabled and n_seqs > 0:
-                        import wandb
-                        # Sample a spread of this step's rollouts by reward (solved + middle + unsolved).
-                        order = sorted(range(n_seqs), key=lambda i: step_examples[i].reward)
-                        n = min(args.wandb_rollout_samples, n_seqs)
-                        picks = [order[round(j * (n_seqs - 1) / (n - 1))] for j in range(n)] if n > 1 else [order[0]]
-                        step_rows = [[step, step_examples[i].weight_version, staleness[i],
-                                      step_examples[i].puzzle_id, "trained", float(step_examples[i].reward),
-                                      float(step_examples[i].advantage), len(step_examples[i].behavior_logprobs),
-                                      finish_reasons[i], (step_examples[i].completion or "")] for i in picks]
-                        # LIVE per-step rollouts: fold an n-row table into the SAME metrics log (no extra log()
-                        # call => no wandb-step desync; survives an early kill, unlike the once-at-end dump).
-                        # FULL completions logged (already decoded; ~few hundred KB/step at N=10, async upload)
-                        # so the tail — where late repetition / non-termination shows — is visible.
-                        metrics["rollouts_live"] = wandb.Table(columns=wandb_rollout_columns, data=step_rows)
-                        wandb_rollout_rows.extend(step_rows)        # running record; full table dumped in finally
-                        wandb_rollout_rows = wandb_rollout_rows[-1500:]  # covers a full 120-step run at N=10
-                    wandb_run.log(metrics)
-                    run_logger.log_step(step, num_steps, metrics)
-                    _maybe_finalize_inloop_eval_rounds(step)
-                    if rollout_fh is not None:
-                        rollout_fh.flush()
-                    # (per-step rollout sampling now happens just before wandb_run.log(metrics) above,
-                    # folded into the metrics log as the live "rollouts_live" table)
-                    if should_save_checkpoint_for_step(step, num_steps, args.save_every, args.save_final):
-                        checkpoint_dir = save_hf_checkpoint(model, tokenizer, run_dir, step)
-                        print0(f"Saved checkpoint to {checkpoint_dir}")
-                        if step == num_steps - 1 and args.save_final:
-                            # Official record clock stops here: the final checkpoint has finished writing.
-                            run_logger.log_final_checkpoint(checkpoint_dir)
-                    if trunc_ewma >= TRUNC_WARN_EWMA:
-                        print0(f"WARNING step {step}: gen/length_trunc_ewma={trunc_ewma:.3f} "
-                               f">= {TRUNC_WARN_EWMA:.2f} (truncation climbing; ScaleRL A.15 spiral risk)")
-                    if not gnorm_finite:
-                        raise _abort_step(
-                            f"non-finite grad_norm ({grad_norm}) at step {step} — divergence; "
-                            f"aborting; resume from the last saved checkpoint"
-                        )
-                    if gnorm_ewma >= GNORM_WARN_EWMA:
-                        print0(f"WARNING step {step}: grad_norm_ewma={gnorm_ewma:.2f} "
-                               f">= {GNORM_WARN_EWMA:.1f} (gradient climbing; run1-style explosion risk)")
-                    if metrics["groups/zero_variance_allpass_frac"] >= ALLPASS_WARN_FRAC:
-                        print0(f"WARNING step {step}: groups/zero_variance_allpass_frac="
-                               f"{metrics['groups/zero_variance_allpass_frac']:.2f} >= {ALLPASS_WARN_FRAC:.2f} "
-                               f"(train set being mastered; curriculum starvation / wasted generation)")
                 except BaseException:
                     if has_next_step:
                         _broadcast_poison(poison_sent)
@@ -3566,46 +3498,6 @@ def run_pipeline(
         run_logger.close()
         if world_size > 1:
             compute_cleanup()
-
-
-def get_lr_multiplier(
-    step: int,
-    num_steps: int,
-    init_lr_frac: float = 1.0,
-    warmup_steps: int = 0,
-    schedule: str = "linear",
-    min_lr_frac: float = 0.0,
-    lr_decay_steps: int | None = None,
-    lr_decay_start: int | None = None,
-) -> float:
-    if warmup_steps > 0 and step < warmup_steps:
-        if warmup_steps == 1:
-            return 1.0
-        progress = step / (warmup_steps - 1)
-        return init_lr_frac + (1.0 - init_lr_frac) * progress
-    if schedule == "constant":
-        return 1.0
-    if schedule != "linear":
-        raise ValueError(f"Unsupported LR schedule: {schedule}")
-    # Linear decay from peak (1.0, at the end of warmup) down to the floor `min_lr_frac`, reached at
-    # absolute step `lr_decay_steps` (defaults to num_steps), then HELD at the floor for the rest of
-    # the run. With min_lr_frac=0.0 and lr_decay_steps=None this is the legacy decay-to-zero schedule.
-    decay_end = lr_decay_steps if lr_decay_steps is not None else num_steps
-    if warmup_steps == 0:
-        if num_steps <= 1:
-            return 1.0
-        if step == 0:
-            return init_lr_frac
-        decay_span = max(1, decay_end)
-        decay_progress = min(1.0, max(0.0, (step - 1) / decay_span))
-        return min_lr_frac + (1.0 - min_lr_frac) * (1.0 - decay_progress)
-    # Optional HOLD at peak until `lr_decay_start` (defaults to the end of warmup), then linear decay.
-    decay_start = lr_decay_start if lr_decay_start is not None else warmup_steps
-    if step < decay_start:
-        return 1.0
-    decay_span = max(1, decay_end - decay_start)
-    decay_progress = min(1.0, max(0.0, (step - decay_start) / decay_span))
-    return min_lr_frac + (1.0 - min_lr_frac) * (1.0 - decay_progress)
 
 
 def strip_compiled_state_dict_keys(state_dict: Mapping[str, Any]) -> dict[str, Any]:
@@ -3729,6 +3621,42 @@ def load_model_and_tokenizer(args: argparse.Namespace, device: torch.device):
         print0("torch.compile enabled on the transformer body (dynamic=True)")
 
     return model, tokenizer
+
+
+def _vllm_flag(prefix: str, key: str) -> str:
+    """CLI flag for one VLLM_TUNE_KEYS knob, e.g. ('eval_', 'max_num_seqs') -> '--eval-vllm-max-num-seqs'."""
+    return f"--{prefix}vllm_{key}".replace("_", "-")
+
+
+def _add_vllm_tuning_args(parser: argparse.ArgumentParser, *, prefix: str, ctx: str,
+                          seqs_note: str, batched_note: str) -> None:
+    """Register one --[eval-]vllm-* flag family (exactly the VLLM_TUNE_KEYS knobs, all
+    defaulting to None = preserve vLLM's default; see vllm_tuning_from_args)."""
+    flag = lambda key: _vllm_flag(prefix, key)  # noqa: E731
+    parser.add_argument(flag("max_num_seqs"), type=int, default=None,
+                        help=f"vLLM scheduler max_num_seqs for {ctx}. {seqs_note}")
+    parser.add_argument(flag("max_num_batched_tokens"), type=int, default=None,
+                        help=f"vLLM scheduler max_num_batched_tokens for {ctx}. {batched_note}")
+    parser.add_argument(flag("max_num_scheduled_tokens"), type=int, default=None,
+                        help=f"Optional vLLM scheduler max_num_scheduled_tokens for {ctx}. "
+                             "Unset defaults to max_num_batched_tokens.")
+    parser.add_argument(flag("max_num_partial_prefills"), type=int, default=None,
+                        help=f"Optional vLLM chunked-prefill concurrency for {ctx}.")
+    parser.add_argument(flag("max_long_partial_prefills"), type=int, default=None,
+                        help=f"Optional vLLM max concurrent long partial prefills for {ctx}.")
+    parser.add_argument(flag("long_prefill_token_threshold"), type=int, default=None,
+                        help=f"Optional vLLM token threshold for treating a prefill as long ({ctx}).")
+    parser.add_argument(flag("enable_chunked_prefill"), action=argparse.BooleanOptionalAction, default=None,
+                        help=f"Optionally force vLLM chunked prefill on/off for {ctx}. "
+                             "Unset preserves vLLM's default.")
+    parser.add_argument(flag("scheduler_reserve_full_isl"), action=argparse.BooleanOptionalAction, default=None,
+                        help=f"Optionally force vLLM scheduler_reserve_full_isl on/off for {ctx}. "
+                             "Unset preserves vLLM's default.")
+    parser.add_argument(flag("stream_interval"), type=int, default=None,
+                        help=f"Optional vLLM streaming interval for {ctx}.")
+    parser.add_argument(flag("performance_mode"), choices=["balanced", "interactivity", "throughput"],
+                        default=None,
+                        help=f"Optional vLLM performance_mode for {ctx}. Unset preserves vLLM's default.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3863,35 +3791,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vllm-enforce-eager", action=argparse.BooleanOptionalAction, default=False,
                         help="Pass enforce_eager=True to the rollout vLLM engine. This can reduce cold-start "
                              "CUDA graph capture time but may lower steady-state generation throughput; off by default.")
-    parser.add_argument("--vllm-max-num-seqs", type=int, default=None,
-                        help="vLLM scheduler max_num_seqs for rollout generation. NOTE: when unset, the "
-                             "in-process AsyncLLM (ENGINE_CONTEXT) falls back to 128, NOT the H100 1024 "
-                             "tier, so the RECIPE sets it explicitly. Re-clamped to "
-                             "min(max_num_seqs, max_num_batched_tokens) — raise both together.")
-    parser.add_argument("--vllm-max-num-batched-tokens", type=int, default=None,
-                        help="vLLM scheduler max_num_batched_tokens for rollout generation. NOTE: when "
-                             "unset, the in-process AsyncLLM (ENGINE_CONTEXT) falls back to 2048, NOT the "
-                             "H100 8192 tier, so the RECIPE sets it explicitly.")
-    parser.add_argument("--vllm-max-num-scheduled-tokens", type=int, default=None,
-                        help="Optional vLLM scheduler max_num_scheduled_tokens for rollout generation. "
-                             "Unset defaults to max_num_batched_tokens.")
-    parser.add_argument("--vllm-max-num-partial-prefills", type=int, default=None,
-                        help="Optional vLLM chunked-prefill concurrency for rollout generation.")
-    parser.add_argument("--vllm-max-long-partial-prefills", type=int, default=None,
-                        help="Optional vLLM max concurrent long partial prefills for rollout generation.")
-    parser.add_argument("--vllm-long-prefill-token-threshold", type=int, default=None,
-                        help="Optional vLLM token threshold for treating a prefill as long.")
-    parser.add_argument("--vllm-enable-chunked-prefill", action=argparse.BooleanOptionalAction, default=None,
-                        help="Optionally force vLLM chunked prefill on/off for rollout generation. "
-                             "Unset preserves vLLM's default.")
-    parser.add_argument("--vllm-scheduler-reserve-full-isl", action=argparse.BooleanOptionalAction, default=None,
-                        help="Optionally force vLLM scheduler_reserve_full_isl on/off for rollout generation. "
-                             "Unset preserves vLLM's default.")
-    parser.add_argument("--vllm-stream-interval", type=int, default=None,
-                        help="Optional vLLM streaming interval for rollout generation.")
-    parser.add_argument("--vllm-performance-mode", choices=["balanced", "interactivity", "throughput"], default=None,
-                        help="Optional vLLM performance_mode for rollout generation. "
-                             "Unset preserves vLLM's default.")
+    _add_vllm_tuning_args(
+        parser, prefix="", ctx="rollout generation",
+        seqs_note="NOTE: when unset, the in-process AsyncLLM (ENGINE_CONTEXT) falls back to 128, "
+                  "NOT the H100 1024 tier, so the RECIPE sets it explicitly. Re-clamped to "
+                  "min(max_num_seqs, max_num_batched_tokens) — raise both together.",
+        batched_note="NOTE: when unset, the in-process AsyncLLM (ENGINE_CONTEXT) falls back to "
+                     "2048, NOT the H100 8192 tier, so the RECIPE sets it explicitly.",
+    )
     parser.add_argument("--inflight-requests", type=int, default=16,
                         help="Target number of puzzle generations kept in flight")
     parser.add_argument("--max-staleness", type=int, default=4,
@@ -3992,34 +3899,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="gpu_memory_utilization for the eval engine.")
     parser.add_argument("--eval-vllm-enforce-eager", action=argparse.BooleanOptionalAction, default=False,
                         help="Pass enforce_eager=True to the standalone eval vLLM engine.")
-    parser.add_argument("--eval-vllm-max-num-seqs", type=int, default=None,
-                        help="vLLM scheduler max_num_seqs for the standalone eval engine. When unset, "
-                             "the AsyncLLM (ENGINE_CONTEXT) falls back to 128, NOT the H100 1024 tier. "
-                             "To realize a higher value you must also raise --eval-concurrency in lockstep.")
-    parser.add_argument("--eval-vllm-max-num-batched-tokens", type=int, default=None,
-                        help="vLLM scheduler max_num_batched_tokens for the standalone eval engine. When "
-                             "unset, the AsyncLLM (ENGINE_CONTEXT) falls back to 2048, NOT the H100 8192 tier.")
-    parser.add_argument("--eval-vllm-max-num-scheduled-tokens", type=int, default=None,
-                        help="Optional vLLM scheduler max_num_scheduled_tokens for the standalone eval engine. "
-                             "Unset defaults to max_num_batched_tokens.")
-    parser.add_argument("--eval-vllm-max-num-partial-prefills", type=int, default=None,
-                        help="Optional vLLM chunked-prefill concurrency for the standalone eval engine.")
-    parser.add_argument("--eval-vllm-max-long-partial-prefills", type=int, default=None,
-                        help="Optional vLLM max concurrent long partial prefills for the standalone eval engine.")
-    parser.add_argument("--eval-vllm-long-prefill-token-threshold", type=int, default=None,
-                        help="Optional vLLM token threshold for treating an eval prefill as long.")
-    parser.add_argument("--eval-vllm-enable-chunked-prefill", action=argparse.BooleanOptionalAction, default=None,
-                        help="Optionally force vLLM chunked prefill on/off for the standalone eval engine. "
-                             "Unset preserves vLLM's default.")
-    parser.add_argument("--eval-vllm-scheduler-reserve-full-isl", action=argparse.BooleanOptionalAction, default=None,
-                        help="Optionally force vLLM scheduler_reserve_full_isl on/off for the standalone eval engine. "
-                             "Unset preserves vLLM's default.")
-    parser.add_argument("--eval-vllm-stream-interval", type=int, default=None,
-                        help="Optional vLLM streaming interval for the standalone eval engine.")
-    parser.add_argument("--eval-vllm-performance-mode", choices=["balanced", "interactivity", "throughput"],
-                        default=None,
-                        help="Optional vLLM performance_mode for the standalone eval engine. "
-                             "Unset preserves vLLM's default.")
+    _add_vllm_tuning_args(
+        parser, prefix="eval_", ctx="the standalone eval engine",
+        seqs_note="When unset, the AsyncLLM (ENGINE_CONTEXT) falls back to 128, NOT the H100 1024 "
+                  "tier. To realize a higher value you must also raise --eval-concurrency in lockstep.",
+        batched_note="When unset, the AsyncLLM (ENGINE_CONTEXT) falls back to 2048, NOT the H100 "
+                     "8192 tier.",
+    )
     parser.add_argument("--eval-limit", type=int, default=None,
                         help="Evaluate only the first N puzzles (smoke tests); default = full eval set.")
     parser.add_argument("--eval-concurrency", type=int, default=128,
@@ -4045,38 +3931,83 @@ def _validate_sampling_args(args: argparse.Namespace) -> None:
     _validate_vllm_scheduler_args(args)
 
 
+_VLLM_POSITIVE_KEYS = (
+    "max_num_seqs",
+    "max_num_batched_tokens",
+    "max_num_scheduled_tokens",
+    "max_num_partial_prefills",
+    "max_long_partial_prefills",
+    "stream_interval",
+)
+
+
 def _validate_vllm_scheduler_args(args: argparse.Namespace) -> None:
-    positive_names = (
-        "vllm_max_num_seqs",
-        "vllm_max_num_batched_tokens",
-        "vllm_max_num_scheduled_tokens",
-        "vllm_max_num_partial_prefills",
-        "vllm_max_long_partial_prefills",
-        "vllm_stream_interval",
-        "eval_vllm_max_num_seqs",
-        "eval_vllm_max_num_batched_tokens",
-        "eval_vllm_max_num_scheduled_tokens",
-        "eval_vllm_max_num_partial_prefills",
-        "eval_vllm_max_long_partial_prefills",
-        "eval_vllm_stream_interval",
-    )
-    for name in positive_names:
-        value = getattr(args, name)
-        if value is not None and value < 1:
-            raise ValueError(f"--{name.replace('_', '-')} must be positive")
-    for name in ("vllm_long_prefill_token_threshold", "eval_vllm_long_prefill_token_threshold"):
-        value = getattr(args, name)
-        if value is not None and value < 0:
-            raise ValueError(f"--{name.replace('_', '-')} must be non-negative")
     for prefix in ("", "eval_"):
+        for key in _VLLM_POSITIVE_KEYS:
+            value = getattr(args, f"{prefix}vllm_{key}")
+            if value is not None and value < 1:
+                raise ValueError(f"{_vllm_flag(prefix, key)} must be positive")
+        threshold = getattr(args, f"{prefix}vllm_long_prefill_token_threshold")
+        if threshold is not None and threshold < 0:
+            raise ValueError(f"{_vllm_flag(prefix, 'long_prefill_token_threshold')} must be non-negative")
         partial = getattr(args, f"{prefix}vllm_max_num_partial_prefills")
         long_partial = getattr(args, f"{prefix}vllm_max_long_partial_prefills")
-        effective_partial = partial if partial is not None else 1
-        effective_long_partial = long_partial if long_partial is not None else 1
-        if effective_long_partial > effective_partial:
-            flag = f"--{prefix}vllm-max-long-partial-prefills".replace("_", "-")
-            limit = f"--{prefix}vllm-max-num-partial-prefills".replace("_", "-")
-            raise ValueError(f"{flag} must be <= {limit}")
+        if (long_partial if long_partial is not None else 1) > (partial if partial is not None else 1):
+            raise ValueError(f"{_vllm_flag(prefix, 'max_long_partial_prefills')} must be <= "
+                             f"{_vllm_flag(prefix, 'max_num_partial_prefills')}")
+
+
+# Training-pipeline integer-bound checks: (attr, minimum, requirement phrase). Bespoke checks
+# (num_samples >= 2, init_lr_frac range, adam_eps > 0, the interrupt min/max relation) live in
+# _validate_pipeline_args below.
+_PIPELINE_MIN_ARGS = (
+    ("device_batch_size", 1, "at least 1"),
+    ("max_new_tokens", 1, "positive"),
+    ("logits_chunk_size", 1, "positive"),
+    ("interrupt_answer_tokens", 1, "positive"),
+    ("warmup_steps", 0, "non-negative"),
+    ("inloop_eval_every", 0, "non-negative"),
+    ("inloop_eval_k", 1, "at least 1"),
+    ("inloop_eval_max_tokens", 1, "positive"),
+    ("inloop_eval_interrupt_answer_tokens", 1, "positive"),
+    ("inloop_eval_deadline_steps", 1, "at least 1"),
+    ("eval_max_tokens", 1, "positive"),
+    ("eval_interrupt_answer_tokens", 1, "positive"),
+)
+
+
+def _validate_pipeline_args(args: argparse.Namespace) -> None:
+    """Bounds checks for a TRAINING launch (the eval-only/verify-only paths skip these)."""
+    for attr, minimum, requirement in _PIPELINE_MIN_ARGS:
+        if getattr(args, attr) < minimum:
+            raise ValueError(f"--{attr.replace('_', '-')} must be {requirement}")
+    if args.num_samples < 2:
+        raise ValueError("--num-samples must be at least 2 so per-puzzle advantages are non-zero")
+    if not (0.0 < args.init_lr_frac <= 1.0):
+        raise ValueError("--init-lr-frac must be in (0, 1]")
+    if args.adam_eps <= 0:
+        raise ValueError("--adam-eps must be positive")
+    if args.interrupt_min_tokens is not None or args.interrupt_max_tokens is not None:
+        if not args.interruption:
+            raise ValueError("--interrupt-min-tokens/--interrupt-max-tokens require --interruption")
+        interrupt_min = (
+            args.interrupt_min_tokens
+            if args.interrupt_min_tokens is not None
+            else args.interrupt_max_tokens
+        )
+        interrupt_max = (
+            args.interrupt_max_tokens
+            if args.interrupt_max_tokens is not None
+            else args.max_new_tokens
+        )
+        if interrupt_min < 1:
+            raise ValueError("--interrupt-min-tokens must be positive")
+        if interrupt_max < 1:
+            raise ValueError("--interrupt-max-tokens must be positive")
+        if interrupt_min > interrupt_max:
+            raise ValueError("--interrupt-min-tokens must be <= --interrupt-max-tokens")
+        if interrupt_max > args.max_new_tokens:
+            raise ValueError("--interrupt-max-tokens must be <= --max-new-tokens")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -4109,57 +4040,7 @@ def main(argv: list[str] | None = None) -> None:
         )
         return
 
-    if args.device_batch_size < 1:
-        raise ValueError("--device-batch-size must be at least 1")
-    if args.num_samples < 2:
-        raise ValueError("--num-samples must be at least 2 so per-puzzle advantages are non-zero")
-    if args.max_new_tokens < 1:
-        raise ValueError("--max-new-tokens must be positive")
-    if args.logits_chunk_size < 1:
-        raise ValueError("--logits-chunk-size must be positive")
-    if args.interrupt_answer_tokens < 1:
-        raise ValueError("--interrupt-answer-tokens must be positive")
-    if args.interrupt_min_tokens is not None or args.interrupt_max_tokens is not None:
-        if not args.interruption:
-            raise ValueError("--interrupt-min-tokens/--interrupt-max-tokens require --interruption")
-        interrupt_min = (
-            args.interrupt_min_tokens
-            if args.interrupt_min_tokens is not None
-            else args.interrupt_max_tokens
-        )
-        interrupt_max = (
-            args.interrupt_max_tokens
-            if args.interrupt_max_tokens is not None
-            else args.max_new_tokens
-        )
-        if interrupt_min < 1:
-            raise ValueError("--interrupt-min-tokens must be positive")
-        if interrupt_max < 1:
-            raise ValueError("--interrupt-max-tokens must be positive")
-        if interrupt_min > interrupt_max:
-            raise ValueError("--interrupt-min-tokens must be <= --interrupt-max-tokens")
-        if interrupt_max > args.max_new_tokens:
-            raise ValueError("--interrupt-max-tokens must be <= --max-new-tokens")
-    if not (0.0 < args.init_lr_frac <= 1.0):
-        raise ValueError("--init-lr-frac must be in (0, 1]")
-    if args.warmup_steps < 0:
-        raise ValueError("--warmup-steps must be non-negative")
-    if args.inloop_eval_every < 0:
-        raise ValueError("--inloop-eval-every must be non-negative")
-    if args.inloop_eval_k < 1:
-        raise ValueError("--inloop-eval-k must be at least 1")
-    if args.inloop_eval_max_tokens < 1:
-        raise ValueError("--inloop-eval-max-tokens must be positive")
-    if args.inloop_eval_interrupt_answer_tokens < 1:
-        raise ValueError("--inloop-eval-interrupt-answer-tokens must be positive")
-    if args.inloop_eval_deadline_steps < 1:
-        raise ValueError("--inloop-eval-deadline-steps must be at least 1")
-    if args.eval_max_tokens < 1:
-        raise ValueError("--eval-max-tokens must be positive")
-    if args.eval_interrupt_answer_tokens < 1:
-        raise ValueError("--eval-interrupt-answer-tokens must be positive")
-    if args.adam_eps <= 0:
-        raise ValueError("--adam-eps must be positive")
+    _validate_pipeline_args(args)
 
     train_task = load_sokoban_jsonl_dataset(
         args.train_data,
