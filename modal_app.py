@@ -257,7 +257,7 @@ def _parse_seeds(spec: str) -> list[int]:
 
 
 def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: list[int],
-                  target: float = 0.70, eval_max_tokens: int = 12288, eval_max_model_len: int = 14336,
+                  target: float = 0.55, eval_max_tokens: int = 12288, eval_max_model_len: int = 14336,
                   interruption: bool = True, interrupt_answer_tokens: int = 512) -> list[list[str]]:
     """speedrun --eval-only command(s). `checkpoint` may be a comma-separated list of final
     checkpoints (one per training seed): that emits ONE record-eval command that evaluates all
@@ -314,7 +314,7 @@ def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds
     secrets=runtime_secrets,
 )
 def evaluate(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: str = "12345",
-             target: float = 0.70, eval_max_tokens: int = 12288, eval_max_model_len: int = 14336,
+             target: float = 0.55, eval_max_tokens: int = 12288, eval_max_model_len: int = 14336,
              interruption: bool = True) -> None:
     """Authoritative held-out eval (speedrun.py --eval-only): own vLLM engine over all GPUs at the
     full 6144-token leaderboard budget. `checkpoint` is a /vol path or an HF id (e.g. Qwen/Qwen3-4B
@@ -428,13 +428,13 @@ def main() -> None:
         return
     # Eval mode: EVAL_CHECKPOINT=<vol path or HF id> modal run --detach modal_app.py
     # Record mode: EVAL_CHECKPOINT="ckptA,ckptB,..." (one final checkpoint per training seed) runs
-    # the whole record eval + significance verdict in one call; EVAL_TARGET sets the bar (0.70).
+    # the whole record eval + significance verdict in one call; EVAL_TARGET sets the bar (default = the leaderboard TARGET, 0.55).
     eval_ckpt = os.environ.get("EVAL_CHECKPOINT")
     if eval_ckpt:
         k = int(os.environ.get("EVAL_K", "8"))
         eval_limit = int(os.environ.get("EVAL_LIMIT", "0"))  # 0 = full eval set; >0 = first N (cheap dev)
         seeds = ",".join(str(s) for s in _parse_seeds(os.environ.get("EVAL_SEEDS", "12345")))
-        target = float(os.environ.get("EVAL_TARGET", "0.70"))
+        target = float(os.environ.get("EVAL_TARGET", "0.55"))
         eval_max_tokens = int(os.environ.get("EVAL_MAX_TOKENS", "12288"))
         eval_max_model_len = int(os.environ.get("EVAL_MAX_MODEL_LEN", "14336"))
         eval_interruption = os.environ.get("EVAL_INTERRUPTION", "1") not in ("0", "false", "False", "")
