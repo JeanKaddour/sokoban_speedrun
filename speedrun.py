@@ -73,16 +73,17 @@ EVAL_PID_BASE = 1_000_000_000
 # args, so a bare `python -m speedrun --run X --max-steps N` (or the Modal launcher, which now only
 # passes --run/--max-steps/--extra) reproduces it exactly. Any flag passed on the CLI appears AFTER
 # the recipe and therefore OVERRIDES the recipe value (argparse last-wins). --run and --max-steps are
-# deliberately NOT here (they vary per launch). Eval-only invocations also get the recipe prepended,
-# which is harmless: eval reads the eval_* args and ignores the training-side flags.
+# deliberately NOT here (they vary per launch). Eval-only invocations also get the recipe prepended;
+# NOTE that --eval-data below is therefore the LEADERBOARD eval set for record evals — it must stay
+# pinned to the published datasets/sokoban_eval.jsonl (frozen 2026-06-10).
 # TRAINER COUNT: the canonical sprint runs NTRAINERS=3 (3 trainer ranks + 5 vLLM) — the trainer-bound
 # sweet spot at inflight 96, ~30% faster per step than nt2 (rvvtdz8w's setting). That is a torchrun
 # launch param, NOT a speedrun CLI arg, so it is pinned as the default in modal_app.py (NTRAINERS=3),
 # not in this list.
 RECIPE = [
     "--dtype", "float32",            
-    "--train-data", "datasets/sokoban_70_easy_train.jsonl",
-    "--eval-data", "datasets/sokoban_70_easy_eval.jsonl",
+    "--train-data", "datasets/sokoban_train.jsonl",
+    "--eval-data", "datasets/sokoban_eval.jsonl",
     "--examples-per-step", "16",     
     "--num-samples", "8",            
     "--temperature", "0.8",          
@@ -120,37 +121,43 @@ RECIPE = [
 ]
 # ============================================================================================
 _BOARD_PLACEHOLDER = "{board}"
-SOKOBAN_RG_PROMPT_TEMPLATE = """You are solving a Sokoban puzzle. You are the player (*); push every box (@) onto a goal (X).
+SOKOBAN_RG_PROMPT_TEMPLATE = """You are solving Sokoban under final-state scoring.
 
 The board is shown with 0-indexed row numbers down the left side and column numbers across the top, so every cell has an address (row, col). Rows increase downward and columns increase rightward.
 
-Legend:
-* - The player
-% - The player on a goal
-@ - A box
-X - A goal
-$ - A box already on a goal (leave it there)
-+ - A wall
-- - An empty position
+Symbols:
+* = player on floor
+% = player on goal
+@ = box on floor
+$ = box on goal
+X = empty goal
++ = wall
+- = empty floor
 
-Moves (each steps the player one cell):
+Basic rules:
+- Moves are U, D, L, R.
 - U = up (row - 1), D = down (row + 1), L = left (col - 1), R = right (col + 1).
+- Each move attempts to move the player one cell in that direction.
+- The player may move onto empty floor (-) or an empty goal (X), but not through a wall (+).
+- If the target cell contains a box (@ or $), the player tries to push that box one cell in the same direction.
+- A box can be pushed only if the cell beyond it is empty floor (-) or an empty goal (X).
+- A box cannot be pushed into a wall, another box, or off the board.
+- Boxes can only be pushed, never pulled.
+- Invalid or blocked moves are ignored.
 
-Rules:
-- You may step onto empty cells (-) and goals (X), but never onto a wall (+).
-- To push a box, step toward it and the box slides one cell in the same direction. The cell beyond the box must be empty or a goal.
-- You cannot push a box into a wall or into another box, and you can never pull a box.
-- Some boxes ($) already sit on goals; the board may start partly solved. Keep those boxes on their goals.
-- The puzzle is solved when every box sits on a goal (no @ remain).
+State rules:
+- Boxes are @ and $. Goals are X, %, and $.
+- Moving off % leaves X behind.
+- Moving off * leaves - behind.
+- Pushing a $ off its goal leaves X behind.
+- Pushing an @ onto a goal makes it $.
+- Pushing a $ onto another goal keeps it $.
+- Pushing any box onto floor makes it @.
+- A $ is not fixed; it is a movable box that is currently on a goal.
 
-A blocked or off-board move is simply ignored, and extra moves do no harm, so prefer a sequence you are confident in and give your answer as soon as you have one.
+The puzzle is solved only if, after executing the entire move string, there are no @ boxes left. Do not append extra legal moves after solving, because they can make the final state unsolved.
 
-Solve it step by step:
-1. List the player position, every box (@) position, and every goal (X) position as (row, col).
-2. For each box not already on a goal, plan how to reach the cell that lets you push it onto a goal, choosing an order that does not trap another box in a corner or against a wall.
-3. Write out the full move string and simulate it in your head to confirm every box ends on a goal.
-
-End with exactly one final line that wraps your move string in answer tags, like `<answer>...</answer>` — put only your U/D/L/R moves between the tags.
+Think through the board, simulate your move string, then give exactly one final line that wraps your move string in answer tags, like `<answer>...</answer>`. Put only your U/D/L/R moves between the tags.
 
 Here is your puzzle:
 {board}
@@ -3948,8 +3955,8 @@ def build_parser() -> argparse.ArgumentParser:
                              "Pass one final checkpoint per training seed to run the full record eval: "
                              "each is evaluated under the pinned protocol, then the significance test "
                              "(mean pass@1 > --eval-target at --eval-alpha) prints a PASS/FAIL verdict.")
-    parser.add_argument("--eval-target", type=float, default=0.70,
-                        help="Target solve-rate the mean pass@1 must clear for a record (multi-checkpoint eval).")
+    parser.add_argument("--eval-target", type=float, default=0.55,
+                        help="Leaderboard TARGET: the pass@1 a record must clear (see README rules).")
     parser.add_argument("--eval-alpha", type=float, default=0.01,
                         help="Significance level for the record t-test (multi-checkpoint eval).")
     parser.add_argument("--eval-k", type=int, default=16,
