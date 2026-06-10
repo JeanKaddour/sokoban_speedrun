@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import gzip
+import hashlib
 import json
 import math
 import os
@@ -17,7 +19,7 @@ import time
 import uuid
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import asdict, dataclass, field, replace
 from datetime import timedelta
 from functools import lru_cache
@@ -119,7 +121,6 @@ RECIPE = [
     "--eval-top-p", "0.95",
     "--save-every", "0",
     "--save-final",
-    "--no-save-rollouts",             # no rollout jsonl on disk (avoids volume-commit churn)
     "--wandb-rollout-samples", "20",  # rollouts/step logged to the wandb "rollouts_live" + final "rollouts" tables
 ]
 # ============================================================================================
@@ -1741,11 +1742,14 @@ async def run_held_out_eval(
     pass_at_ks: tuple[int, ...] = (1, 4, 8, 16),
     concurrency: int = 128,
     progress_every: int = 200,
+    collect_rollouts: bool = False,
 ) -> dict:
     """Evaluate the policy served by `engine` on `eval_task`: k samples per puzzle, each scored
     with reasoning_gym's binary solve check via `eval_task.evaluate`. Returns pass@1, unbiased
     pass@k, per-puzzle solve fractions and a confidence interval. Pure measurement (no logprobs,
-    no training); reuses the same prompt/scoring path as the trainer for an apples-to-apples set."""
+    no training); reuses the same prompt/scoring path as the trainer for an apples-to-apples set.
+    With collect_rollouts, also returns result["rollouts"]: one row per sample (completion text,
+    extracted moves, solved, finish_reason) so records can be re-scored offline (verify_record.py)."""
     if indices is None:
         indices = list(range(len(eval_task)))
     eval_sampling = dict(sampling)
@@ -1761,15 +1765,24 @@ async def run_held_out_eval(
         async with sem:
             samples = await generate_group(engine, prompt_ids.tolist(), k, eval_sampling)
         c = answered = extract_fail = length_trunc = 0
-        for s in samples:
+        rows: list[dict] = []
+        for j, s in enumerate(samples):
             completion = tokenizer.decode(s["token_ids"], skip_special_tokens=True)
-            if extract_sokoban_answer(completion) is None:
+            moves = extract_sokoban_answer(completion)
+            if moves is None:
                 extract_fail += 1
             else:
                 answered += 1
             if s.get("finish_reason") == "length":
                 length_trunc += 1
-            c += eval_task.evaluate(conv, completion)
+            solved = eval_task.evaluate(conv, completion)
+            c += solved
+            if collect_rollouts:
+                rows.append({
+                    "puzzle_idx": idx, "sample": j, "solved": solved, "moves": moves,
+                    "finish_reason": s.get("finish_reason"),
+                    "gen_tokens": len(s["token_ids"]), "completion": completion,
+                })
         done += 1
         if progress_every and done % progress_every == 0:
             print(f"  eval progress: {done}/{n_total} puzzles", flush=True)
@@ -1779,6 +1792,7 @@ async def run_held_out_eval(
             "answered": answered,
             "extract_fail": extract_fail,
             "length_trunc": length_trunc,
+            "rows": rows,
         }
 
     results = await asyncio.gather(*[_one(i) for i in indices])
@@ -1835,6 +1849,7 @@ async def run_held_out_eval(
         "solve_given_answer": total_solved / max(1, total_answered),
         "trunc_frac": total_length_trunc / max(1, total_samples),
         "sampling": eval_sampling,
+        **({"rollouts": [row for r in results for row in r["rows"]]} if collect_rollouts else {}),
     }
 
 
@@ -1963,6 +1978,7 @@ def _eval_one_checkpoint(args: argparse.Namespace, model_path: str, multi: bool)
                 enable_thinking=args.enable_thinking,
                 indices=indices,
                 concurrency=args.eval_concurrency,
+                collect_rollouts=args.eval_save_rollouts,
             )
         finally:
             try:
@@ -2007,6 +2023,24 @@ def _eval_one_checkpoint(args: argparse.Namespace, model_path: str, multi: bool)
         else:
             out_path = args.output_dir / safe / f"eval_{suffix}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Eval rollouts artifact: full completions for offline re-scoring (verify_record.py). Written
+    # BEFORE the JSON so the record can name its artifact; gzipped (~3x) since completions dominate.
+    rollouts = result.get("rollouts")
+    if rollouts is not None:
+        rollouts_path = out_path.with_name(out_path.stem + ".rollouts.jsonl.gz")
+        meta = {
+            "type": "meta", "seed": args.eval_seed, "run": args.run, "step": step,
+            "checkpoint": model_path, "model": args.model,
+            "eval_data": str(args.eval_data), "eval_data_sha256": _file_sha256(args.eval_data),
+            "k": args.eval_k, "n_puzzles": result["n_puzzles"],
+            "git_commit": _git_commit(), "sampling": result["sampling"],
+        }
+        with gzip.open(rollouts_path, "wt", encoding="utf-8") as fh:
+            fh.write(json.dumps(meta, ensure_ascii=False) + "\n")
+            for row in rollouts:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        record["rollouts_file"] = rollouts_path.name
+        print(f"[eval] saved {len(rollouts)} eval rollouts -> {rollouts_path}", flush=True)
     with out_path.open("w", encoding="utf-8") as fh:
         json.dump(record, fh, indent=2)
         fh.write("\n")
@@ -2250,6 +2284,14 @@ class DummyWandb:
 def sanitize_run_name(name: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.strip())
     return safe or "run"
+
+
+def _file_sha256(path: Path | str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _git_commit() -> str | None:
@@ -2854,7 +2896,6 @@ def run_pipeline(
         )
     wandb_run = DummyWandb()
     model_perf_info = None
-    rollout_fh = None
     run_logger = RunLogger(run_dir=run_dir, args=args, enabled=master_process)
     inloop_eval: InloopEval | None = None  # rank 0 only; built in _rank0_setup (needs queues + wandb)
 
@@ -2879,7 +2920,7 @@ def run_pipeline(
     def _rank0_setup() -> None:
         nonlocal train_prompt_cache, train_bands
         nonlocal child, wsync, prompt_q, result_q, control_q, status_q
-        nonlocal wandb_run, model_perf_info, rollout_fh, inloop_eval
+        nonlocal wandb_run, model_perf_info, rollout_stream_q, rollout_stream_thread, inloop_eval
         # Rendezvous steps (2)-(4); see the two-NCCL-group invariant above. All of this runs on
         # rank 0 only, with NO dist.* collective between (2) and (4): the workers are parked at the
         # (5) init-status broadcast, so a stray trainer-group collective here would have no peer
@@ -2929,8 +2970,12 @@ def run_pipeline(
         model_perf_info = collect_model_perf_info(model)
         if args.save_rollouts:
             run_dir.mkdir(parents=True, exist_ok=True)
-            rollout_fh = open(run_dir / "rollouts.jsonl", "a", encoding="utf-8")
-            print0(f"Saving rollouts to {run_dir / 'rollouts.jsonl'}")
+            rollout_stream_q = queue.Queue()
+            rollout_stream_thread = threading.Thread(
+                target=_rollout_stream_writer, name="rollout-stream", daemon=True)
+            rollout_stream_thread.start()
+            print0(f"Streaming rollouts to {run_dir / 'rollouts.jsonl.gz'} "
+                   f"(async, every {args.rollout_flush_every} steps)")
         inloop_eval = InloopEval(args, tokenizer, eval_task, interrupt_marker_ids,
                                  prompt_q, wandb_run, run_logger)
         if args.inloop_eval_every > 0:
@@ -2939,6 +2984,38 @@ def run_pipeline(
     wandb_rollout_rows: list[list] = []
     wandb_rollout_columns = ["step", "weight_version", "staleness", "puzzle_id", "status",
                              "reward", "advantage", "gen_tokens", "finish_reason", "completion"]
+    # Last-N-steps FULL rollouts (bounded record artifact, written once at teardown; crash
+    # coverage comes from the rollout stream below, which holds the same rows and more).
+    final_rollout_buf: deque[list[dict]] | None = (
+        deque(maxlen=args.final_rollout_steps) if master_process and args.final_rollout_steps > 0 else None
+    )
+    # Append-only rollout stream (--save-rollouts): EVERY consumed group (trained + zero-variance)
+    # lands in <run_dir>/rollouts.jsonl.gz, batched per --rollout-flush-every steps and appended by
+    # a daemon thread — the training loop never does I/O. Each flush is its own gzip member
+    # (gzip.open reads concatenated members natively); a kill mid-write costs at most the
+    # unflushed tail, so a prematurely stopped run keeps its full history for forensics.
+    rollout_stream_pending: list[dict] = []
+    rollout_stream_q: queue.Queue | None = None
+    rollout_stream_thread: threading.Thread | None = None
+
+    def _rollout_stream_writer() -> None:
+        path = run_dir / "rollouts.jsonl.gz"
+        while True:
+            chunk = rollout_stream_q.get()
+            if chunk is None:
+                return
+            try:
+                with gzip.open(path, "at", encoding="utf-8") as fh:
+                    for row in chunk:
+                        fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+            except Exception as exc:
+                print0(f"rollout-stream append failed (non-fatal): {exc!r}")
+
+    def _stream_flush_pending() -> None:
+        nonlocal rollout_stream_pending
+        if rollout_stream_q is not None and rollout_stream_pending:
+            rollout_stream_q.put(rollout_stream_pending)
+            rollout_stream_pending = []
 
     # Abort protocol. `_abort_step` turns a controlled rank-0 reject into a RuntimeError without
     # broadcasting; the single poison broadcast on the failure path comes from `_broadcast_poison`,
@@ -3089,19 +3166,20 @@ def run_pipeline(
                 cs.band_samples_solved.get(band, 0) + sum(1 for r in rewards if r == 1.0))
             is_zero_var = args.zero_variance_filter and not group_has_signal(rewards)
             t_log_start = time.monotonic()
-            if rollout_fh is not None:
+            if rollout_stream_q is not None:
+                # Dict building only — the gz append happens on the stream writer thread. The
+                # question text is omitted (puzzle_id + the pinned dataset reproduce it).
                 status = "zero_variance" if is_zero_var else "trained"
                 for sample, a in zip(processed_samples, adv_values):
-                    rollout_fh.write(json.dumps({
+                    rollout_stream_pending.append({
                         "step": step, "weight_version": version,
                         "staleness": current_version - version,
                         "puzzle_id": pid, "status": status,
                         "reward": float(sample.reward), "advantage": float(a),
                         "gen_tokens": len(sample.behavior_logprobs),
                         "finish_reason": sample.finish_reason,
-                        "question": meta["conversation"]["question"],
                         "completion": sample.completion,
-                    }, ensure_ascii=False) + "\n")
+                    })
             times["rollout_logging"] += time.monotonic() - t_log_start
             if is_zero_var:
                 cs.groups_zero_variance += 1
@@ -3323,11 +3401,18 @@ def run_pipeline(
             # Cap the cumulative table at 150 steps' worth of the CONFIGURED sample count (the old
             # fixed 1500 assumed N=10 and silently halved coverage at N=20).
             wandb_rollout_rows = wandb_rollout_rows[-150 * max(1, args.wandb_rollout_samples):]
+        if final_rollout_buf is not None and n_seqs > 0:
+            final_rollout_buf.append([
+                {"step": step, "weight_version": e.weight_version, "staleness": cs.staleness[i],
+                 "puzzle_id": e.puzzle_id, "reward": float(e.reward), "advantage": float(e.advantage),
+                 "gen_tokens": len(e.behavior_logprobs), "finish_reason": cs.finish_reasons[i],
+                 "completion": e.completion or ""}
+                for i, e in enumerate(cs.step_examples)])
+        if args.rollout_flush_every > 0 and step % args.rollout_flush_every == 0:
+            _stream_flush_pending()
         wandb_run.log(metrics)
         run_logger.log_step(step, num_steps, metrics)
         inloop_eval.warn_overdue(step)
-        if rollout_fh is not None:
-            rollout_fh.flush()
         if should_save_checkpoint_for_step(step, num_steps, args.save_every, args.save_final):
             checkpoint_dir = save_hf_checkpoint(model, tokenizer, run_dir, step)
             print0(f"Saved checkpoint to {checkpoint_dir}")
@@ -3686,9 +3771,27 @@ def run_pipeline(
         if master_process and wandb_rollouts_enabled and wandb_rollout_rows:
             import wandb
             wandb_run.log({"rollouts": wandb.Table(columns=wandb_rollout_columns, data=wandb_rollout_rows)})
+        if master_process and final_rollout_buf:
+            try:
+                run_dir.mkdir(parents=True, exist_ok=True)
+                final_path = run_dir / "final_rollouts.jsonl.gz"
+                with gzip.open(final_path, "wt", encoding="utf-8") as fh:
+                    fh.write(json.dumps({
+                        "type": "meta", "run": args.run, "train_data": str(args.train_data),
+                        "steps": [rows[0]["step"] for rows in final_rollout_buf if rows],
+                        "git_commit": _git_commit(),
+                    }) + "\n")
+                    for rows in final_rollout_buf:
+                        for row in rows:
+                            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+                print0(f"Saved final {len(final_rollout_buf)}-step rollouts to {final_path}")
+            except Exception as exc:
+                print0(f"final-rollouts write failed (non-fatal): {exc!r}")
+        if rollout_stream_q is not None:
+            _stream_flush_pending()
+            rollout_stream_q.put(None)            # writer drains FIFO, then exits
+            rollout_stream_thread.join(timeout=30)  # bounded: don't hang teardown on a wedged write
         wandb_run.finish()
-        if rollout_fh is not None:
-            rollout_fh.close()
         run_logger.close()
         if world_size > 1:
             compute_cleanup()
@@ -3904,10 +4007,24 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Drop puzzle groups whose rewards are all equal (zero advantage). "
                              "Disable to keep them (e.g. plumbing smoke tests where the model gets no reward).")
     parser.add_argument("--save-rollouts", action=argparse.BooleanOptionalAction, default=True,
-                        help="Write every decoded rollout (prompt, completion, reward, advantage, finish "
-                             "reason, staleness, disposition) to <output-dir>/<run>/rollouts.jsonl for later analysis.")
+                        help="Stream every consumed rollout group (trained + zero-variance) to "
+                             "<output-dir>/<run>/rollouts.jsonl.gz, appended by a background thread "
+                             "every --rollout-flush-every steps. A prematurely stopped run keeps its "
+                             "full history up to the last flush.")
     parser.add_argument("--wandb-rollout-samples", type=int, default=8,
                         help="Rollouts sampled per step (spread by reward) into a browsable W&B Table; 0 disables.")
+    parser.add_argument("--final-rollout-steps", type=int, default=10,
+                        help="Keep the last N steps' FULL rollouts in memory and write them to "
+                             "<output-dir>/<run>/final_rollouts.jsonl.gz at run end (record artifact: "
+                             "end-of-training health is auditable offline); 0 disables.")
+    parser.add_argument("--rollout-flush-every", type=int, default=10,
+                        help="Hand the pending rollout-stream rows to the background writer every N "
+                             "steps (each flush = one gzip member appended to rollouts.jsonl.gz); "
+                             "0 = flush only at teardown.")
+    parser.add_argument("--eval-save-rollouts", action=argparse.BooleanOptionalAction, default=True,
+                        help="With --eval-output/--eval-only: write every eval completion to "
+                             "<eval-json-stem>.rollouts.jsonl.gz so the record can be re-scored "
+                             "offline by verify_record.py.")
 
     parser.add_argument("--inloop-eval-every", type=int, default=0,
                         help="Run held-out eval through the shared vLLM engine every N training steps; "
