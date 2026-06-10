@@ -10,7 +10,7 @@ Motivation: A lot of LLM RL papers don't reproduce and there are many high-varia
 
 | # | Record time | Description | Date | Log | pass@1 | Contributors |
 | - | - | - | - | - | - | - |
-| 1 | TBD | Async CISPO, annealed LR | TBD | TBD | TBD | @JeanKaddour |
+| 1 | TBD | [ScaleRL](https://arxiv.org/abs/2510.13786)-like (CISPO, annealed LR) | TBD | TBD | TBD | @JeanKaddour |
 
 Each record links its full training log (script source, environment attestation, per-step record clock, final-checkpoint stamp); the eval JSON and verification-run logs live in the same [`records/`](records/) directory.
 
@@ -86,23 +86,22 @@ All eval puzzles have 2 boxes and 5–14-move solutions. Under the leaderboard p
 
 ## Why is the training set ordered?
 
-The file ordering is a built-in curriculum: easy 1-box puzzles ignite learning, a probabilistic ramp hands over to 2-box puzzles by row 2,000, and a harder tail (2–3 boxes, 9–14 moves) provides frontier difficulty for longer runs. 
-
-The ordering is part of the frozen dataset — every recipe trains on the same puzzle sequence, so records differ by algorithm and systems, not data shuffling. (Dynamic filtering of *sampled* rollouts, e.g. the zero-variance filter, is part of the algorithm and remains fair game.)
-
-## What prompt changes are allowed?
-
-The point of the benchmark is generalizable reasoning, not overfitting to Sokoban. The puzzle definition (board legend, move semantics — the published template in `speedrun.py`) is the task statement and stays as is. 
-
-Around it you may add or restructure freely, as long as the additions are **domain-agnostic**: generic reasoning scaffolds ("plan, then verify each step"), output-format or termination guidance, self-check instructions. 
-
-Prompt changes are legal if they would be equally sensible for a different puzzle domain. What's not allowed are Sokoban strategy hints, heuristics, or deadlock rules ("don't push a box into a goal-less corner"), and no worked examples (zero-shot). 
+- The file ordering is a built-in curriculum: easy 1-box puzzles ignite learning, a probabilistic ramp hands over to 2-box puzzles by row 2,000, and a harder tail (2–3 boxes, 9–14 moves) provides frontier difficulty for longer runs. 
+- Every recipe should train on the same puzzle sequence, so records differ by algorithm and systems, not data shuffling.
+- Dynamic filtering is part of the algorithm and remains fair game, e.g. the zero-variance filter in DAPO.  
 
 ## Why handroll an async RL stack instead of using verl/slime/TRL/etc.?
 
 - Since wall-clock time to a target solve-rate is the metric, the RL stack itself is part of the optimization target.
 - General-purpose RL frameworks optimize for broad coverage; here we want a narrow, inspectable fast path.
 - This follows the spirit of [modded-nanoGPT](https://github.com/KellerJordan/modded-nanogpt): strip the stack down until bottlenecks are visible, then make the fastest version easy to reproduce and improve.
+
+## What prompt changes are allowed?
+
+- The point of the benchmark is generalizable reasoning, not overfitting to Sokoban.
+- Changes are allowed as long as they remain **domain-agnostic**: generic reasoning scaffolds ("plan, then verify each step"), output-format or termination guidance, self-check instructions. 
+- In other words, they are allowed if they would be equally sensible for a different puzzle domain. 
+- What's not allowed are Sokoban strategy hints, heuristics, or deadlock rules ("don't push a box into a goal-less corner"), and no worked examples (zero-shot). 
 
 # Shoutouts
 
