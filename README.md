@@ -81,7 +81,7 @@ EVAL_CHECKPOINT=/vol/outputs/<run>/step_NNNNNN modal run modal_app.py
 * Small contamination risk: We generate fresh puzzles, so unlike eg. GSM8k there is less risk the base model has memorized them.
 * Simple enough to yield RL gains in `O(10)` GPU hours.
 * Hard enough for gains to be meaningful: Sokoban is PSPACE-complete and can't be brute-forced; it requires genuine reasoning capabilities.
-* Diverse reasoning paths are encouraged. Puzzles naturally permit multiple solutions.
+* Naturally disincentivizes entropy collapse, as puzzles naturally permit multiple solutions.
 
 
 ## Why is the training set ordered?
