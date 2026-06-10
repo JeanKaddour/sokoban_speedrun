@@ -97,7 +97,13 @@ RECIPE = [
     "--learning-rate", "8e-7",       
     "--init-lr-frac", "0.05",       
     "--warmup-steps", "5",           
-    "--lr-schedule", "constant",
+    # Annealed schedule (reports/annealing-prevents-collapse.md): continuous linear decay from
+    # end-of-warmup to a nonzero floor prevents the saturation-collapse (constant LR collapses at
+    # ~step 89-116; lower LR only delays it). Floor by ~step 85-100 fits the canonical 150-step
+    # sprint; shorter sprints should override --lr-decay-steps to ~90% of their step count.
+    "--lr-schedule", "linear",
+    "--min-lr-frac", "0.15",
+    "--lr-decay-steps", "90",
     "--grad-clip", "1.0",            
     "--cispo-eps", "4.0",            
     "--loss-normalization", "sequence",  # sample-level (GRPO). 
