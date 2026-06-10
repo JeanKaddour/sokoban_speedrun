@@ -257,8 +257,10 @@ def _parse_seeds(spec: str) -> list[int]:
 
 
 def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: list[int],
-                  target: float = 0.55, eval_max_tokens: int = 12288, eval_max_model_len: int = 14336,
-                  interruption: bool = True, interrupt_answer_tokens: int = 512) -> list[list[str]]:
+                  target: float = 0.55, eval_max_tokens: int = 32768, eval_max_model_len: int = 36864,
+                  interruption: bool = True, interrupt_answer_tokens: int = 512,
+                  eval_gpu_mem_util: float = 0.9, eval_vllm_max_num_batched_tokens: int = 40960,
+                  eval_vllm_max_num_seqs: int = 16, eval_concurrency: int = 16) -> list[list[str]]:
     """speedrun --eval-only command(s). `checkpoint` may be a comma-separated list of final
     checkpoints (one per training seed): that emits ONE record-eval command that evaluates all
     of them under the pinned protocol at a single eval seed and ends with the built-in
@@ -274,17 +276,21 @@ def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds
         raise ValueError(f"EVAL_CHECKPOINT must name at least one checkpoint, got {checkpoint!r}")
     # --eval-data and --eval-top-p come from speedrun's RECIPE (prepended by speedrun.main());
     # --eval-only reads them and ignores the training-side flags. Only the standalone eval-engine
-    # specifics are set here. Defaults are the LEADERBOARD protocol (decided 2026-06-10): GENEROUS
-    # 12288-token budget + interruption answer-forcing, which eliminates the budget-truncation
-    # confound and measures solving (see reports/calibration/official-mix-rehearsal.md). The
-    # strict 6144/no-interruption protocol remains available via EVAL_MAX_TOKENS/EVAL_MAX_MODEL_LEN/
-    # EVAL_INTERRUPTION for diagnostics.
-    # EVAL_MAX_TOKENS / EVAL_MAX_MODEL_LEN / EVAL_INTERRUPTION override (e.g. a generous training-like
-    # eval); --eval-max-model-len must cover prompt + max_tokens + the forced-answer continuation.
+    # specifics are set here. Defaults are the LEADERBOARD protocol (updated 2026-06-10): generous
+    # 32768-token budget + interruption answer-forcing, which eliminates the budget-truncation
+    # confound and measures solving. The strict 6144/no-interruption protocol remains available
+    # via EVAL_MAX_TOKENS/EVAL_MAX_MODEL_LEN/EVAL_INTERRUPTION for diagnostics.
+    # EVAL_MAX_TOKENS / EVAL_MAX_MODEL_LEN / EVAL_INTERRUPTION override the protocol; --eval-max-model-len
+    # must cover prompt + max_tokens + the forced-answer continuation. The long-context scheduler
+    # defaults intentionally override speedrun.py's old 1024-way eval recipe to avoid overfeeding KV.
     common = [sys.executable, "-m", "speedrun", "--eval-only",
               "--run", run_name,
               "--eval-k", str(k), "--eval-max-tokens", str(eval_max_tokens),
-              "--eval-max-model-len", str(eval_max_model_len), "--eval-vllm-dp", str(NUM_GPUS)]
+              "--eval-max-model-len", str(eval_max_model_len), "--eval-vllm-dp", str(NUM_GPUS),
+              "--eval-gpu-mem-util", str(eval_gpu_mem_util),
+              "--eval-vllm-max-num-batched-tokens", str(eval_vllm_max_num_batched_tokens),
+              "--eval-vllm-max-num-seqs", str(eval_vllm_max_num_seqs),
+              "--eval-concurrency", str(eval_concurrency)]
     if interruption:
         common += ["--eval-interruption", "--eval-interrupt-answer-tokens", str(interrupt_answer_tokens)]
     if eval_limit > 0:
@@ -314,10 +320,12 @@ def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds
     secrets=runtime_secrets,
 )
 def evaluate(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: str = "12345",
-             target: float = 0.55, eval_max_tokens: int = 12288, eval_max_model_len: int = 14336,
-             interruption: bool = True) -> None:
+             target: float = 0.55, eval_max_tokens: int = 32768, eval_max_model_len: int = 36864,
+             interruption: bool = True, eval_gpu_mem_util: float = 0.9,
+             eval_vllm_max_num_batched_tokens: int = 40960,
+             eval_vllm_max_num_seqs: int = 16, eval_concurrency: int = 16) -> None:
     """Authoritative held-out eval (speedrun.py --eval-only): own vLLM engine over all GPUs at the
-    full 6144-token leaderboard budget. `checkpoint` is a /vol path or an HF id (e.g. Qwen/Qwen3-4B
+    full 32768-token leaderboard budget. `checkpoint` is a /vol path or an HF id (e.g. Qwen/Qwen3-4B
     for the base) — or a COMMA-SEPARATED list of final checkpoints (one per training seed), which
     runs the whole record eval end-to-end in one call: every checkpoint evaluated under the pinned
     protocol, one JSON each, then the significance verdict (mean pass@1 > `target`, p<0.01).
@@ -337,7 +345,11 @@ def evaluate(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: str
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     record_mode = "," in checkpoint
     for command in eval_commands(checkpoint, run_name, k, eval_limit, _parse_seeds(seeds), target,
-                                 eval_max_tokens, eval_max_model_len, interruption):
+                                 eval_max_tokens, eval_max_model_len, interruption,
+                                 eval_gpu_mem_util=eval_gpu_mem_util,
+                                 eval_vllm_max_num_batched_tokens=eval_vllm_max_num_batched_tokens,
+                                 eval_vllm_max_num_seqs=eval_vllm_max_num_seqs,
+                                 eval_concurrency=eval_concurrency):
         print(f"Eval: {' '.join(command)} (cwd={VOLUME_MOUNT_PATH})", flush=True)
         try:
             if record_mode:
@@ -431,19 +443,27 @@ def main() -> None:
     # the whole record eval + significance verdict in one call; EVAL_TARGET sets the bar (default = the leaderboard TARGET, 0.55).
     eval_ckpt = os.environ.get("EVAL_CHECKPOINT")
     if eval_ckpt:
-        k = int(os.environ.get("EVAL_K", "8"))
+        k = int(os.environ.get("EVAL_K", "16"))
         eval_limit = int(os.environ.get("EVAL_LIMIT", "0"))  # 0 = full eval set; >0 = first N (cheap dev)
         seeds = ",".join(str(s) for s in _parse_seeds(os.environ.get("EVAL_SEEDS", "12345")))
         target = float(os.environ.get("EVAL_TARGET", "0.55"))
-        eval_max_tokens = int(os.environ.get("EVAL_MAX_TOKENS", "12288"))
-        eval_max_model_len = int(os.environ.get("EVAL_MAX_MODEL_LEN", "14336"))
+        eval_max_tokens = int(os.environ.get("EVAL_MAX_TOKENS", "32768"))
+        eval_max_model_len = int(os.environ.get("EVAL_MAX_MODEL_LEN", "36864"))
         eval_interruption = os.environ.get("EVAL_INTERRUPTION", "1") not in ("0", "false", "False", "")
+        eval_gpu_mem_util = float(os.environ.get("EVAL_GPU_MEM_UTIL", "0.9"))
+        eval_vllm_max_num_batched_tokens = int(os.environ.get("EVAL_VLLM_MAX_NUM_BATCHED_TOKENS", "40960"))
+        eval_vllm_max_num_seqs = int(os.environ.get("EVAL_VLLM_MAX_NUM_SEQS", "16"))
+        eval_concurrency = int(os.environ.get("EVAL_CONCURRENCY", "16"))
         run_name = os.environ.get("RUN_NAME") or f"sokoban-eval-{datetime.now():%Y%m%d-%H%M%S}"
         print(f"Running eval: ckpt={eval_ckpt}, run={run_name}, k={k}, limit={eval_limit}, "
               f"seeds=[{seeds}], target={target}, max_tokens={eval_max_tokens}, "
-              f"max_model_len={eval_max_model_len}, interruption={eval_interruption}", flush=True)
+              f"max_model_len={eval_max_model_len}, interruption={eval_interruption}, "
+              f"gpu_mem_util={eval_gpu_mem_util}, batched_tokens={eval_vllm_max_num_batched_tokens}, "
+              f"max_num_seqs={eval_vllm_max_num_seqs}, concurrency={eval_concurrency}", flush=True)
         evaluate.remote(eval_ckpt, run_name, k, eval_limit, seeds, target,
-                        eval_max_tokens, eval_max_model_len, eval_interruption)
+                        eval_max_tokens, eval_max_model_len, eval_interruption,
+                        eval_gpu_mem_util, eval_vllm_max_num_batched_tokens,
+                        eval_vllm_max_num_seqs, eval_concurrency)
         return
     # NTRAINERS=1 => single trainer + 7 vLLM; NTRAINERS=2 => 2 trainers + 6 vLLM (torchrun), etc.
     # Default NTRAINERS=3 is the CANONICAL sprint trainer count: the node is trainer-bound at inflight 96
