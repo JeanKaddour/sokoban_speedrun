@@ -1,12 +1,4 @@
-"""
-Sokoban Speedrun
-Run it directly (`python speedrun.py ...`), as a module (`python -m speedrun ...`), or under torchrun
-for the multi-trainer data-parallel pipeline. The vLLM child process produces
-rollouts on-policy while a CISPO trainer learns from them:
-- sample several completions per puzzle, reward Sokoban solutions verified by Reasoning Gym
-- advantage = reward minus per-puzzle mean, trained only on generated tokens
-- CISPO importance weighting corrects for off-policy / stale rollouts
-"""
+"""Sokoban Speedrun"""
 
 from __future__ import annotations
 
@@ -71,16 +63,14 @@ MSG_ERROR = "error"
 EVAL_PID_BASE = 1_000_000_000
 # ============================ RUN RECIPE (single source of truth) ============================
 # The benchmark sprint recipe lives here as a top-level constant. main() PREPENDS it to the CLI
-# args, so a bare `python -m speedrun --run X --max-steps N` (or the Modal launcher, which now only
+# args, so a bare `python -m speedrun --run X --max-steps N` (or the Modal launcher, which only
 # passes --run/--max-steps/--extra) reproduces it exactly. Any flag passed on the CLI appears AFTER
 # the recipe and therefore OVERRIDES the recipe value (argparse last-wins). --run and --max-steps are
-# deliberately NOT here (they vary per launch). Eval-only invocations also get the recipe prepended;
-# NOTE that --eval-data below is therefore the LEADERBOARD eval set for record evals — it must stay
-# pinned to the published datasets/sokoban_eval.jsonl (frozen 2026-06-10).
+# deliberately NOT here (they vary per launch). Eval-only invocations also get the recipe prepended,
+# so --eval-data below is also the eval set --eval-only scores against unless overridden.
 # TRAINER COUNT: the canonical sprint runs NTRAINERS=3 (3 trainer ranks + 5 vLLM) — the trainer-bound
-# sweet spot at inflight 96, ~30% faster per step than nt2 (rvvtdz8w's setting). That is a torchrun
-# launch param, NOT a speedrun CLI arg, so it is pinned as the default in modal_app.py (NTRAINERS=3),
-# not in this list.
+# sweet spot at inflight 96, ~30% faster per step than 2 trainers. That is a torchrun launch param,
+# NOT a speedrun CLI arg, so it is pinned as the default in modal_app.py (NTRAINERS=3), not in this list.
 RECIPE = [
     "--dtype", "float32",       # load trainer params/head fp32; train autocast runs body bf16, head/logits fp32
     "--train-data", "datasets/sokoban_train.jsonl",
@@ -105,7 +95,7 @@ RECIPE = [
     "--grad-clip", "1.0",
     "--cispo-eps", "4.0",
     "--loss-normalization", "sequence",  # sample-level (GRPO).
-    "--max-staleness", "4",          # less off-policy than ScaleRL's 8 (run2-proven stability lever)
+    "--max-staleness", "4",          # less off-policy than ScaleRL's 8; a proven stability lever
     "--inflight-requests", "96",     # measured generator-throughput sweet spot (~22k tok/s); non-monotonic
     "--vllm-gpu-mem-util", "0.9",
     "--vllm-stream-interval", "8",   # buffer token streaming to cut host/IPC overhead; no sampling/budget change
@@ -121,6 +111,7 @@ RECIPE = [
     "--wandb-rollout-samples", "20",  # log N=10 rollouts/step to the wandb "rollouts_live" + final "rollouts" tables
 ]
 # ============================================================================================
+# ============================ SOKOBAN DOMAIN: prompt, answer extraction, scoring, dataset ============================
 _BOARD_PLACEHOLDER = "{board}"
 SOKOBAN_RG_PROMPT_TEMPLATE = """You are solving Sokoban under final-state scoring.
 
@@ -165,6 +156,211 @@ Here is your puzzle:
 """
 
 
+def format_board_with_axes(board: str) -> str:
+    """Render a raw space-separated Sokoban board with 0-indexed row/column labels."""
+    rows = [line.split() for line in board.splitlines() if line.strip()]
+    n_cols = max((len(row) for row in rows), default=0)
+    gutter = max(len(str(len(rows) - 1)), 1) if rows else 1
+
+    def cell(text: str) -> str:
+        return f"{text:>2}"
+
+    header = " " * (gutter + 1) + " ".join(cell(str(c)) for c in range(n_cols))
+    body = [
+        f"{row_idx:>{gutter}} " + " ".join(cell(c) for c in row)
+        for row_idx, row in enumerate(rows)
+    ]
+    return "\n".join([header, *body])
+
+
+def render_sokoban_rg_prompt(board: str) -> str:
+    return SOKOBAN_RG_PROMPT_TEMPLATE.replace(_BOARD_PLACEHOLDER, format_board_with_axes(board))
+
+
+def extract_sokoban_board(question: str) -> str:
+    """Accept board-only dataset records, with backward compatibility for old RG questions."""
+    return question.split("Here is your puzzle:", 1)[-1].strip()
+
+
+def build_sokoban_prompt(question: str) -> str:
+    """Render the canonical Sokoban prompt."""
+    board = extract_sokoban_board(question)
+    return render_sokoban_rg_prompt(board)
+
+
+SOKOBAN_MARKER_RE = re.compile(r"####")
+SOKOBAN_MOVE_STRING_RE = re.compile(r"[UDLR]+")
+SOKOBAN_ANSWER_TAG_RE = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.IGNORECASE | re.DOTALL)
+SOKOBAN_ACTION_TOKEN_RE = re.compile(r"\b(?:up|down|left|right|[UDLR])\b", re.IGNORECASE)
+SOKOBAN_ACTION_SEPARATOR_RE = re.compile(
+    r"\b(?:up|down|left|right|[UDLR])\b|[\s,;|:\-.]+",
+    re.IGNORECASE,
+)
+SOKOBAN_ACTION_MAP = {
+    "U": "U",
+    "UP": "U",
+    "D": "D",
+    "DOWN": "D",
+    "L": "L",
+    "LEFT": "L",
+    "R": "R",
+    "RIGHT": "R",
+}
+
+
+def normalize_sokoban_moves(candidate: str) -> str | None:
+    compact = "".join(candidate.split()).upper()
+    if compact and SOKOBAN_MOVE_STRING_RE.fullmatch(compact):
+        return compact
+
+    tokens = SOKOBAN_ACTION_TOKEN_RE.findall(candidate)
+    if not tokens:
+        return None
+    leftover = SOKOBAN_ACTION_SEPARATOR_RE.sub("", candidate)
+    if leftover:
+        return None
+    return "".join(SOKOBAN_ACTION_MAP[token.upper()] for token in tokens)
+
+
+def find_sokoban_answer_end_and_moves(text: str) -> tuple[int | None, str | None]:
+    """Locate the answer that scoring uses, as (answer_end, moves).
+
+    SINGLE SOURCE OF TRUTH for answer extraction. Precedence: the FIRST <answer> tag wins;
+    only when no tag exists anywhere does the first '####' marker's first non-blank
+    line count. `moves` is what gets scored; `answer_end` is the
+    char offset just past the scored answer, for --trim-after-answer. answer_end is non-None
+    only when the answer parsed (an unparseable answer leaves the sequence untrimmed)."""
+    tag = SOKOBAN_ANSWER_TAG_RE.search(text)
+    if tag is not None:
+        moves = normalize_sokoban_moves(tag.group(1))
+        return (tag.end() if moves is not None else None), moves
+    marker = SOKOBAN_MARKER_RE.search(text)
+    if marker is None:
+        return None, None
+    pos = marker.end()
+    for line in text[pos:].splitlines(keepends=True):
+        content = line.rstrip("\r\n")
+        if not content.strip():
+            pos += len(line)
+            continue
+        moves = normalize_sokoban_moves(content)
+        return (pos + len(content) if moves is not None else None), moves
+    return None, None
+
+
+def extract_sokoban_answer(completion: str) -> str | None:
+    """Extract normalized Sokoban moves from answer tags or after the first #### marker.
+
+    Thin wrapper over find_sokoban_answer_end_and_moves — the single source of truth for
+    answer extraction — so the training trim/score path and every eval path score identically
+    by construction (they used to disagree on tag-vs-marker precedence and on spaced/word-form
+    '####' answers, making the trained reward diverge from the eval reward)."""
+    _, moves = find_sokoban_answer_end_and_moves(completion)
+    return moves
+
+
+@lru_cache(maxsize=1)
+def _sokoban_scorer():
+    return reasoning_gym.create_dataset("sokoban", size=1, seed=0)
+
+
+def score_sokoban_moves(moves: str | None, entry: dict[str, Any]) -> float:
+    return float(_sokoban_scorer().score_answer(answer=moves, entry=entry))
+
+
+def _validate_sokoban_record(record: Any, *, path: Path, line_no: int) -> dict[str, Any]:
+    prefix = f"{path}:{line_no}"
+    if not isinstance(record, dict):
+        raise ValueError(f"{prefix}: expected a JSON object")
+    question = record.get("question")
+    answer = record.get("answer")
+    metadata = record.get("metadata")
+    if not isinstance(question, str) or not question:
+        raise ValueError(f"{prefix}: field 'question' must be a non-empty string")
+    if not isinstance(answer, str) or not answer:
+        raise ValueError(f"{prefix}: field 'answer' must be a non-empty string")
+    if not isinstance(metadata, dict):
+        raise ValueError(f"{prefix}: field 'metadata' must be an object")
+    gamestr = metadata.get("gamestr")
+    if not isinstance(gamestr, str) or not gamestr.strip():
+        raise ValueError(f"{prefix}: field 'metadata.gamestr' must be a non-empty string")
+    return {"question": question, "answer": answer, "metadata": metadata}
+
+
+class FixedSokobanDataset:
+    """Fixed JSONL Sokoban dataset with Reasoning Gym reward semantics."""
+
+    def __init__(self, examples: list[dict[str, Any]], *, path: Path, split_name: str):
+        if not examples:
+            raise ValueError(f"{path}: {split_name} dataset is empty")
+        self.examples = examples
+        self.path = path
+        self.split_name = split_name
+
+    def __len__(self) -> int:
+        return len(self.examples)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        entry = dict(self.examples[index])
+        entry["metadata"] = dict(entry["metadata"])
+        entry["messages"] = [
+            {"role": "user", "content": entry["question"]},
+            {"role": "assistant", "content": entry["answer"]},
+        ]
+        return entry
+
+    @property
+    def eval_type(self) -> str:
+        return "generative"
+
+    def reward(self, conversation: dict[str, Any], assistant_response: str) -> float:
+        if not isinstance(assistant_response, str):
+            raise TypeError("assistant_response must be a string")
+        moves = extract_sokoban_answer(assistant_response)
+        return score_sokoban_moves(moves, conversation)
+
+    def evaluate(self, conversation: dict[str, Any], assistant_response: str) -> int:
+        return int(self.reward(conversation, assistant_response) == 1.0)
+
+
+def load_sokoban_jsonl_dataset(
+    path: Path | str,
+    *,
+    split_name: str,
+    verify_gold: bool = False,
+) -> FixedSokobanDataset:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"{split_name} data file does not exist: {path}")
+    examples: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as fh:
+        for line_no, line in enumerate(fh, start=1):
+            if not line.strip():
+                raise ValueError(f"{path}:{line_no}: blank lines are not valid JSONL records")
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}:{line_no}: invalid JSON: {exc}") from exc
+            examples.append(_validate_sokoban_record(record, path=path, line_no=line_no))
+
+    dataset = FixedSokobanDataset(examples, path=path, split_name=split_name)
+    if verify_gold:
+        failures: list[str] = []
+        for idx, entry in enumerate(dataset.examples):
+            moves = normalize_sokoban_moves(entry["answer"])
+            if moves is None or score_sokoban_moves(moves, entry) != 1.0:
+                failures.append(f"{path}:{idx + 1}")
+                if len(failures) >= 5:
+                    break
+        if failures:
+            raise ValueError(
+                f"{split_name} dataset has gold answers that do not solve their boards: "
+                + ", ".join(failures)
+            )
+    return dataset
+
+
+# ============================ VLLM GENERATION CHILD (rollout + in-loop-eval producer) ============================
 # vLLM scheduler/engine knobs plumbed verbatim from the CLI (`--vllm-*` for rollout generation,
 # `--eval-vllm-*` for the standalone eval engine) into AsyncEngineArgs. None means "preserve
 # vLLM's default" everywhere along the way. Adding a knob = one entry here + one add_argument in
@@ -384,19 +580,6 @@ def _safe_get(q):
         return None
 
 
-def _safe_qsize(q) -> float:
-    """qsize() is unimplemented on some platforms; report -1 instead of crashing."""
-    try:
-        return float(q.qsize())
-    except (NotImplementedError, OSError):
-        return -1.0
-
-
-def ewma_update(prev: float, value: float, alpha: float, *, seed: bool) -> float:
-    """One EWMA step; `seed` (e.g. during warmup) resets the average to the raw value."""
-    return value if seed else (1.0 - alpha) * prev + alpha * value
-
-
 async def _drain_prompts(engine, prompt_q, result_q, state, inflight: int):
     """Keep up to `inflight` vLLM generations running."""
     pending: set = set()
@@ -541,17 +724,34 @@ def engine_child_main(cfg, prompt_q, result_q, control_q, status_q):
         raise
 
 
-class DummyWandb:
-    def log(self, *args, **kwargs):
-        pass
+def _await_status(status_q, expected_type, timeout: float = 600.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            msg = status_q.get(timeout=1.0)
+        except Exception:
+            continue
+        if msg["type"] == "error":
+            raise RuntimeError(f"engine child error: {msg['msg']}")
+        if msg["type"] == expected_type:
+            return msg
+    raise TimeoutError(f"timed out waiting for child status {expected_type!r}")
 
-    def define_metric(self, *args, **kwargs):
-        pass
 
-    def finish(self):
-        pass
+def _start_process_with_cuda_visible_devices(process, visible_gpus: str) -> None:
+    """Start a spawn child with CVD already present in its inherited environment."""
+    old_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    os.environ["CUDA_VISIBLE_DEVICES"] = visible_gpus
+    try:
+        process.start()
+    finally:
+        if old_cvd is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = old_cvd
 
 
+# ============================ TRAINER DATA STRUCTURES & DISTRIBUTED PLUMBING ============================
 @dataclass
 class RolloutExample:
     """One generated sequence carried through the async pipeline.
@@ -567,13 +767,7 @@ class RolloutExample:
     weight_version: int
     puzzle_id: int
     completion: str = ""
-    # False at injected interruption-marker positions (forced, not sampled => no policy gradient);
-    # None means every generated token is trainable. Aligned 1:1 with behavior_logprobs.
     loss_mask: list[bool] | None = None
-    # ScaleRL prompt-level loss aggregation: total valid (trainable) token count of this sample's
-    # PROMPT GROUP (same value for every sample sharing puzzle_id). Set on rank 0 over the full
-    # batch so it survives length-sort/shard/scatter; 0 on pad examples. Ignored by token/sequence
-    # aggregation. See policy_gradient_loss_from_token_logprobs's prompt-level branch.
     group_token_count: int = 0
 
 
@@ -673,32 +867,6 @@ def estimate_step_perf_metrics(
     }
 
 
-class FP32LMHead(torch.nn.Module):
-    """LM head that holds an fp32 weight and upcasts hidden states on the fly.
-
-    Constructed from an existing `nn.Linear` (typically `model.lm_head` after the
-    base model is loaded in bf16). Detaches and clones the weight so it stands
-    independent of any tied embedding parameter.
-    """
-
-    def __init__(self, lm_head: torch.nn.Linear):
-        super().__init__()
-        self.in_features = lm_head.in_features
-        self.out_features = lm_head.out_features
-        self.weight = torch.nn.Parameter(
-            lm_head.weight.detach().clone().to(torch.float32)
-        )
-        if lm_head.bias is not None:
-            self.bias = torch.nn.Parameter(
-                lm_head.bias.detach().clone().to(torch.float32)
-            )
-        else:
-            self.bias = None
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return F.linear(hidden_states.to(self.weight.dtype), self.weight, self.bias)
-
-
 def print0(message: str = "", **kwargs) -> None:
     if int(os.environ.get("RANK", 0)) == 0:
         kwargs.setdefault("flush", True)
@@ -730,12 +898,6 @@ def get_dist_info(env: Mapping[str, str] | None = None) -> tuple[bool, int, int,
     if ddp_local_rank < 0:
         raise ValueError("LOCAL_RANK must be non-negative")
     return True, ddp_rank, ddp_local_rank, ddp_world_size
-
-
-def should_save_checkpoint_for_step(step: int, num_steps: int, save_every: int, save_final: bool) -> bool:
-    final_step = step == num_steps - 1
-    periodic_save = save_every > 0 and step > 0 and step % save_every == 0
-    return periodic_save or (final_step and save_final)
 
 
 def build_optimizer(parameters: Iterator[torch.nn.Parameter], args: argparse.Namespace) -> torch.optim.Optimizer:
@@ -1026,11 +1188,6 @@ def assert_replica_sync(model: torch.nn.Module, step: int, group=None) -> None:
         )
 
 
-def sanitize_run_name(name: str) -> str:
-    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.strip())
-    return safe or "run"
-
-
 def set_seed(seed: int, device: torch.device | str | None = None) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
@@ -1038,19 +1195,7 @@ def set_seed(seed: int, device: torch.device | str | None = None) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-_TORCH_DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
-
-
-def resolve_torch_dtype(dtype_name: str, device: torch.device) -> torch.dtype:
-    if dtype_name == "auto":
-        bf16_ok = device.type == "cuda" and torch.cuda.is_bf16_supported()
-        return torch.bfloat16 if bf16_ok else torch.float32
-    try:
-        return _TORCH_DTYPES[dtype_name]
-    except KeyError:
-        raise ValueError(f"Unsupported dtype: {dtype_name}") from None
-
-
+# ============================ PROMPT ENCODING & ROLLOUT POST-PROCESSING ============================
 def as_1d_token_tensor(encoded) -> torch.Tensor:
     if isinstance(encoded, torch.Tensor):
         if encoded.ndim == 2:
@@ -1070,184 +1215,6 @@ def as_1d_token_tensor(encoded) -> torch.Tensor:
             return torch.tensor(encoded, dtype=torch.long)
         return as_1d_token_tensor(first)
     raise TypeError(f"Unsupported tokenizer output type: {type(encoded)}")
-
-
-def format_board_with_axes(board: str) -> str:
-    """Render a raw space-separated Sokoban board with 0-indexed row/column labels."""
-    rows = [line.split() for line in board.splitlines() if line.strip()]
-    n_cols = max((len(row) for row in rows), default=0)
-    gutter = max(len(str(len(rows) - 1)), 1) if rows else 1
-
-    def cell(text: str) -> str:
-        return f"{text:>2}"
-
-    header = " " * (gutter + 1) + " ".join(cell(str(c)) for c in range(n_cols))
-    body = [
-        f"{row_idx:>{gutter}} " + " ".join(cell(c) for c in row)
-        for row_idx, row in enumerate(rows)
-    ]
-    return "\n".join([header, *body])
-
-
-def render_sokoban_rg_prompt(board: str) -> str:
-    return SOKOBAN_RG_PROMPT_TEMPLATE.replace(_BOARD_PLACEHOLDER, format_board_with_axes(board))
-
-
-def extract_sokoban_board(question: str) -> str:
-    """Accept board-only dataset records, with backward compatibility for old RG questions."""
-    return question.split("Here is your puzzle:", 1)[-1].strip()
-
-
-def build_sokoban_prompt(question: str) -> str:
-    """Render the canonical Sokoban prompt."""
-    board = extract_sokoban_board(question)
-    return render_sokoban_rg_prompt(board)
-
-
-SOKOBAN_MARKER_RE = re.compile(r"####")
-SOKOBAN_MOVE_STRING_RE = re.compile(r"[UDLR]+")
-SOKOBAN_ANSWER_TAG_RE = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.IGNORECASE | re.DOTALL)
-SOKOBAN_ACTION_TOKEN_RE = re.compile(r"\b(?:up|down|left|right|[UDLR])\b", re.IGNORECASE)
-SOKOBAN_ACTION_SEPARATOR_RE = re.compile(
-    r"\b(?:up|down|left|right|[UDLR])\b|[\s,;|:\-.]+",
-    re.IGNORECASE,
-)
-SOKOBAN_ACTION_MAP = {
-    "U": "U",
-    "UP": "U",
-    "D": "D",
-    "DOWN": "D",
-    "L": "L",
-    "LEFT": "L",
-    "R": "R",
-    "RIGHT": "R",
-}
-
-
-def normalize_sokoban_moves(candidate: str) -> str | None:
-    compact = "".join(candidate.split()).upper()
-    if compact and SOKOBAN_MOVE_STRING_RE.fullmatch(compact):
-        return compact
-
-    tokens = SOKOBAN_ACTION_TOKEN_RE.findall(candidate)
-    if not tokens:
-        return None
-    leftover = SOKOBAN_ACTION_SEPARATOR_RE.sub("", candidate)
-    if leftover:
-        return None
-    return "".join(SOKOBAN_ACTION_MAP[token.upper()] for token in tokens)
-
-
-def extract_sokoban_answer(completion: str) -> str | None:
-    """Extract normalized Sokoban moves from answer tags or after the first #### marker.
-
-    Thin wrapper over find_sokoban_answer_end_and_moves — the single source of truth for
-    answer extraction — so the training trim/score path and every eval path score identically
-    by construction (they used to disagree on tag-vs-marker precedence and on spaced/word-form
-    '####' answers, making the trained reward diverge from the eval reward)."""
-    _, moves = find_sokoban_answer_end_and_moves(completion)
-    return moves
-
-
-@lru_cache(maxsize=1)
-def _sokoban_scorer():
-    return reasoning_gym.create_dataset("sokoban", size=1, seed=0)
-
-
-def score_sokoban_moves(moves: str | None, entry: dict[str, Any]) -> float:
-    return float(_sokoban_scorer().score_answer(answer=moves, entry=entry))
-
-
-def _validate_sokoban_record(record: Any, *, path: Path, line_no: int) -> dict[str, Any]:
-    prefix = f"{path}:{line_no}"
-    if not isinstance(record, dict):
-        raise ValueError(f"{prefix}: expected a JSON object")
-    question = record.get("question")
-    answer = record.get("answer")
-    metadata = record.get("metadata")
-    if not isinstance(question, str) or not question:
-        raise ValueError(f"{prefix}: field 'question' must be a non-empty string")
-    if not isinstance(answer, str) or not answer:
-        raise ValueError(f"{prefix}: field 'answer' must be a non-empty string")
-    if not isinstance(metadata, dict):
-        raise ValueError(f"{prefix}: field 'metadata' must be an object")
-    gamestr = metadata.get("gamestr")
-    if not isinstance(gamestr, str) or not gamestr.strip():
-        raise ValueError(f"{prefix}: field 'metadata.gamestr' must be a non-empty string")
-    return {"question": question, "answer": answer, "metadata": metadata}
-
-
-class FixedSokobanDataset:
-    """Fixed JSONL Sokoban dataset with Reasoning Gym reward semantics."""
-
-    def __init__(self, examples: list[dict[str, Any]], *, path: Path, split_name: str):
-        if not examples:
-            raise ValueError(f"{path}: {split_name} dataset is empty")
-        self.examples = examples
-        self.path = path
-        self.split_name = split_name
-
-    def __len__(self) -> int:
-        return len(self.examples)
-
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        entry = dict(self.examples[index])
-        entry["metadata"] = dict(entry["metadata"])
-        entry["messages"] = [
-            {"role": "user", "content": entry["question"]},
-            {"role": "assistant", "content": entry["answer"]},
-        ]
-        return entry
-
-    @property
-    def eval_type(self) -> str:
-        return "generative"
-
-    def reward(self, conversation: dict[str, Any], assistant_response: str) -> float:
-        if not isinstance(assistant_response, str):
-            raise TypeError("assistant_response must be a string")
-        moves = extract_sokoban_answer(assistant_response)
-        return score_sokoban_moves(moves, conversation)
-
-    def evaluate(self, conversation: dict[str, Any], assistant_response: str) -> int:
-        return int(self.reward(conversation, assistant_response) == 1.0)
-
-
-def load_sokoban_jsonl_dataset(
-    path: Path | str,
-    *,
-    split_name: str,
-    verify_gold: bool = False,
-) -> FixedSokobanDataset:
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"{split_name} data file does not exist: {path}")
-    examples: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as fh:
-        for line_no, line in enumerate(fh, start=1):
-            if not line.strip():
-                raise ValueError(f"{path}:{line_no}: blank lines are not valid JSONL records")
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"{path}:{line_no}: invalid JSON: {exc}") from exc
-            examples.append(_validate_sokoban_record(record, path=path, line_no=line_no))
-
-    dataset = FixedSokobanDataset(examples, path=path, split_name=split_name)
-    if verify_gold:
-        failures: list[str] = []
-        for idx, entry in enumerate(dataset.examples):
-            moves = normalize_sokoban_moves(entry["answer"])
-            if moves is None or score_sokoban_moves(moves, entry) != 1.0:
-                failures.append(f"{path}:{idx + 1}")
-                if len(failures) >= 5:
-                    break
-        if failures:
-            raise ValueError(
-                f"{split_name} dataset has gold answers that do not solve their boards: "
-                + ", ".join(failures)
-            )
-    return dataset
 
 
 def encode_prompt(
@@ -1310,32 +1277,6 @@ def build_prompt_cache(
 def decode_completion(tokenizer, sequence: torch.Tensor, prefix_length: int) -> str:
     generated = sequence[prefix_length:]
     return tokenizer.decode(generated.tolist(), skip_special_tokens=True)
-
-
-def find_sokoban_answer_end_and_moves(text: str) -> tuple[int | None, str | None]:
-    """Locate the answer that scoring uses, as (answer_end, moves).
-
-    SINGLE SOURCE OF TRUTH for answer extraction. Precedence is the pinned eval semantics:
-    the FIRST <answer> tag wins; only when no tag exists anywhere does the first '####'
-    marker's first non-blank line count. `moves` is what gets scored; `answer_end` is the
-    char offset just past the scored answer, for --trim-after-answer. answer_end is non-None
-    only when the answer parsed (an unparseable answer leaves the sequence untrimmed)."""
-    tag = SOKOBAN_ANSWER_TAG_RE.search(text)
-    if tag is not None:
-        moves = normalize_sokoban_moves(tag.group(1))
-        return (tag.end() if moves is not None else None), moves
-    marker = SOKOBAN_MARKER_RE.search(text)
-    if marker is None:
-        return None, None
-    pos = marker.end()
-    for line in text[pos:].splitlines(keepends=True):
-        content = line.rstrip("\r\n")
-        if not content.strip():
-            pos += len(line)
-            continue
-        moves = normalize_sokoban_moves(content)
-        return (pos + len(content) if moves is not None else None), moves
-    return None, None
 
 
 def trim_generated_with_logprobs_and_text(
@@ -1419,11 +1360,12 @@ def process_rollout_sample(
     )
 
 
+# ============================ MICROBATCH TENSORIZATION & CISPO LOSS ============================
 def build_rl_batch_varprefix_cpu(sequences, prefixes, pad_token_id, masks=None, pin_memory=False):
     """Pad/concat + mask construction for one RL microbatch, with NO CUDA calls beyond
     optional pinned allocation, so a prefetch thread can build the NEXT microbatch while
-    the current one's fwd/bwd runs; the train loop then issues one non_blocking H2D copy per
-    tensor instead of the old per-row pageable copies. Values are identical to the old path."""
+    the current one's fwd/bwd runs; the train loop then issues one non_blocking H2D copy
+    per tensor instead of per-row pageable copies."""
     if not sequences:
         raise ValueError("Cannot create an RL batch from zero sequences")
     if len(sequences) != len(prefixes):
@@ -1587,7 +1529,7 @@ def policy_gradient_loss_from_token_logprobs(
         token_weight = advantage_weight              # (B, 1) broadcasts
     weighted_logprobs = token_logprobs * token_weight
     if prompt_lengths is not None:
-        # ScaleRL prompt-level aggregation (scaleRL.md §3.2 + the J_ScaleRL objective): each
+        # ScaleRL prompt-level aggregation (ScaleRL §3.2, the J_ScaleRL objective): each
         # sample's token-summed loss is divided by its PROMPT GROUP's total valid-token count L_p
         # (prompt_lengths — the same value for every sample of a group), then averaged over the
         # prompts. prompt_lengths is computed over the FULL batch on rank 0 and carried per-sample,
@@ -1673,6 +1615,7 @@ def is_fresh_enough(example_version: int, current_version: int, max_staleness: i
     return (current_version - example_version) <= max_staleness
 
 
+# ============================ WEIGHT SYNC (trainer rank 0 -> vLLM child) ============================
 class PipelineWeightSync:
     """Trainer-side (rank 0) half of vLLM 0.22.0 native NCCL weight transfer."""
 
@@ -1883,18 +1826,6 @@ async def run_held_out_eval(
     }
 
 
-def _git_commit() -> str | None:
-    try:
-        import subprocess
-        return subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            cwd=str(Path(__file__).resolve().parent),
-            text=True, stderr=subprocess.DEVNULL,
-        ).strip()
-    except Exception:
-        return None
-
-
 # --- Student-t survival function P(T >= t) for the record significance test; scipy fast-path,
 # --- pure-stdlib fallback (Numerical Recipes incomplete beta). -------------------------------
 
@@ -1958,6 +1889,367 @@ def student_t_sf(t: float, df: float) -> float:
     x = df / (df + t * t)
     ib = _betai(df / 2.0, 0.5, x)  # = I_x(df/2, 1/2)
     return 0.5 * ib if t > 0 else 1.0 - 0.5 * ib
+
+
+def _eval_one_checkpoint(args: argparse.Namespace, model_path: str, multi: bool) -> dict:
+    """Authoritative held-out evaluation of one checkpoint (or the base model), decoupled from
+    training: builds its own vLLM engine sized for the full rollout budget (and shuts it down
+    afterwards), runs the leaderboard pass@1/pass@k protocol on the fixed eval set, and writes a
+    per-checkpoint JSON. Returns the JSON record. No torchrun/DDP."""
+    eval_task = load_sokoban_jsonl_dataset(args.eval_data, split_name="eval")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=args.trust_remote_code)
+    if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    indices = None
+    if args.eval_limit is not None and args.eval_limit > 0:
+        indices = list(range(min(args.eval_limit, len(eval_task))))
+
+    sampling = dict(
+        temperature=args.eval_temperature,
+        top_p=args.eval_top_p,
+        top_k=args.eval_top_k,
+        max_tokens=args.eval_max_tokens,
+        seed=args.eval_seed,
+        logprobs=0,
+    )
+    if args.eval_interruption:
+        marker_ids = tokenizer(INTERRUPTION_TEXT, add_special_tokens=False)["input_ids"]
+        sampling["interrupt"] = make_interrupt_config(
+            marker_ids, args.eval_interrupt_answer_tokens, args.eval_max_model_len,
+            base_temperature=args.eval_temperature, base_top_p=args.eval_top_p,
+            base_top_k=args.eval_top_k,
+            temperature=args.eval_interrupt_temperature,
+            top_p=args.eval_interrupt_top_p, top_k=args.eval_interrupt_top_k,
+        )
+
+    print(
+        f"[eval] model={model_path} eval_data={args.eval_data} "
+        f"n={len(indices) if indices is not None else len(eval_task)} k={args.eval_k} "
+        f"max_tokens={args.eval_max_tokens} sampling=temp{args.eval_temperature}/top_p{args.eval_top_p}/"
+        f"top_k{args.eval_top_k}/seed{args.eval_seed} "
+        f"interruption={args.eval_interruption}",
+        flush=True,
+    )
+
+    async def _run() -> dict:
+        engine = build_async_engine(
+            model_path,
+            num_dp=args.eval_vllm_dp,
+            dtype="bfloat16",
+            max_model_len=args.eval_max_model_len,
+            gpu_memory_utilization=args.eval_gpu_mem_util,
+            seed=args.eval_seed,
+            enforce_eager=args.eval_vllm_enforce_eager,
+            **vllm_tuning_from_args(args, prefix="eval_"),
+        )
+        try:
+            return await run_held_out_eval(
+                engine, tokenizer, eval_task,
+                k=args.eval_k, sampling=sampling,
+                enable_thinking=args.enable_thinking,
+                indices=indices,
+                concurrency=args.eval_concurrency,
+            )
+        finally:
+            try:
+                engine.shutdown()
+            except Exception:
+                pass
+
+    result = asyncio.run(_run())
+
+    step = args.eval_step
+    if step is None:
+        m = re.search(r"step_?(\d+)", model_path)
+        step = int(m.group(1)) if m else None
+
+    record = {
+        "seed": args.eval_seed,
+        "run": args.run,
+        "step": step,
+        "checkpoint": model_path,
+        "model": args.model,
+        "eval_data": str(args.eval_data),
+        "git_commit": _git_commit(),
+        **{key: result[key] for key in (
+            "n_puzzles", "k", "pass_at_1", "pass_at_k", "ci_low", "ci_high", "se",
+            "n_extract_fail", "n_answered", "n_length_trunc", "answer_rate",
+            "solve_given_answer", "trunc_frac", "sampling", "per_puzzle_solve_frac",
+            "per_puzzle_n", "per_puzzle_solved_count", "per_puzzle_answered_count",
+            "per_puzzle_length_trunc_count",
+        )},
+    }
+
+    if args.eval_output is not None:
+        out_path = Path(args.eval_output)
+    else:
+        run_name = args.run if (args.run and args.run != "dummy") else "eval"
+        safe = sanitize_run_name(run_name)
+        suffix = f"step{step:06d}" if step is not None else "latest"
+        if multi:
+            # Disambiguate per-checkpoint JSONs by the checkpoint's run dir (outputs/<run>/step_NNNNNN).
+            ckpt_tag = sanitize_run_name(Path(model_path).parent.name or model_path)
+            out_path = args.output_dir / safe / f"eval_{ckpt_tag}_{suffix}.json"
+        else:
+            out_path = args.output_dir / safe / f"eval_{suffix}.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as fh:
+        json.dump(record, fh, indent=2)
+        fh.write("\n")
+
+    pk = " ".join(f"pass@{j}={result['pass_at_k'][j]:.4f}" for j in sorted(result["pass_at_k"]))
+    print(
+        f"[eval] {model_path} | n={result['n_puzzles']} k={result['k']} | "
+        f"pass@1={result['pass_at_1']:.4f} (95% CI [{result['ci_low']:.4f}, {result['ci_high']:.4f}], "
+        f"se={result['se']:.4f}) | {pk} | "
+        f"answer_rate={result['answer_rate']:.4f} solve|answer={result['solve_given_answer']:.4f} "
+        f"trunc={result['trunc_frac']:.4f} | extract_fail={result['n_extract_fail']} "
+        f"length_trunc={result['n_length_trunc']} | -> {out_path}",
+        flush=True,
+    )
+    return record
+
+
+def run_standalone_eval(args: argparse.Namespace) -> None:
+    """Single record-eval entrypoint: evaluates each --eval-checkpoint (one final checkpoint per
+    training seed) sequentially under the same protocol, writes one JSON per checkpoint, and —
+    given >=2 checkpoints — runs the leaderboard significance test (one-sided t-test that the
+    mean pass@1 clears --eval-target) and exits 0/1 on PASS/FAIL."""
+    checkpoints = [str(c) for c in args.eval_checkpoint] if args.eval_checkpoint else [args.model]
+    if len(set(checkpoints)) < len(checkpoints):
+        sys.exit(f"error: duplicate --eval-checkpoint paths {checkpoints} — each checkpoint must "
+                 "come from a distinct training run (the training run is the unit of replication).")
+    if args.eval_output is not None and len(checkpoints) > 1:
+        sys.exit("error: --eval-output is only valid with a single checkpoint; multi-checkpoint "
+                 "record evals auto-name one JSON per checkpoint.")
+
+    records = [_eval_one_checkpoint(args, mp, multi=len(checkpoints) > 1) for mp in checkpoints]
+    if len(records) < 2:
+        return
+
+    values = [float(r["pass_at_1"]) for r in records]
+    K = len(values)
+    mean = statistics.mean(values)
+    sd = statistics.stdev(values)  # ddof=1: checkpoint-to-checkpoint (seed-to-seed) variance
+    se = sd / math.sqrt(K)
+    df = K - 1
+    if se == 0.0:
+        t = math.inf if mean > args.eval_target else (-math.inf if mean < args.eval_target else 0.0)
+        p = 0.0 if mean > args.eval_target else (1.0 if mean < args.eval_target else 0.5)
+    else:
+        t = (mean - args.eval_target) / se
+        p = student_t_sf(t, df)
+    passed = p < args.eval_alpha and mean > args.eval_target
+
+    print(f"\n=== Record significance: mean(pass@1) > {args.eval_target} ===", flush=True)
+    print(f"  checkpoints (K) : {K}  {[round(v, 4) for v in values]}")
+    print(f"  mean +/- sd     : {mean:.4f} +/- {sd:.4f}   (se={se:.4f})")
+    print(f"  t / df          : {t:.3f} / {df}")
+    print(f"  one-sided p     : {p:.5f}   (alpha={args.eval_alpha})")
+    print("  decision        : " + ("PASS  "
+          f"(mean {mean:.4f} clears {args.eval_target} with p={p:.5f} < {args.eval_alpha})" if passed else
+          f"FAIL  (need mean>{args.eval_target} and p<{args.eval_alpha}; raise mean or add seeds)"),
+          flush=True)
+    raise SystemExit(0 if passed else 1)
+
+
+# ============================ MODEL LOAD / SAVE ============================
+class FP32LMHead(torch.nn.Module):
+    """LM head that holds an fp32 weight and upcasts hidden states on the fly.
+
+    Constructed from an existing `nn.Linear` (typically `model.lm_head` after the
+    base model is loaded in bf16). Detaches and clones the weight so it stands
+    independent of any tied embedding parameter.
+    """
+
+    def __init__(self, lm_head: torch.nn.Linear):
+        super().__init__()
+        self.in_features = lm_head.in_features
+        self.out_features = lm_head.out_features
+        self.weight = torch.nn.Parameter(
+            lm_head.weight.detach().clone().to(torch.float32)
+        )
+        if lm_head.bias is not None:
+            self.bias = torch.nn.Parameter(
+                lm_head.bias.detach().clone().to(torch.float32)
+            )
+        else:
+            self.bias = None
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return F.linear(hidden_states.to(self.weight.dtype), self.weight, self.bias)
+
+
+_TORCH_DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
+
+
+def resolve_torch_dtype(dtype_name: str, device: torch.device) -> torch.dtype:
+    if dtype_name == "auto":
+        bf16_ok = device.type == "cuda" and torch.cuda.is_bf16_supported()
+        return torch.bfloat16 if bf16_ok else torch.float32
+    try:
+        return _TORCH_DTYPES[dtype_name]
+    except KeyError:
+        raise ValueError(f"Unsupported dtype: {dtype_name}") from None
+
+
+def _resolve_flash_attention_2_or_raise() -> None:
+    """Fail fast (with an actionable message) if attn_implementation='flash_attention_2' cannot be
+    satisfied, instead of crashing mid-run on the first forward. transformers 5.8 can serve FA2 from
+    the HF `kernels` hub when the standalone flash-attn package is absent (the case here), but that
+    needs the `kernels` library + a one-time hub download of kernels-community/flash-attn2."""
+    try:
+        from transformers.utils import is_flash_attn_2_available
+        if is_flash_attn_2_available():
+            return  # native flash-attn build present
+    except Exception:
+        pass
+    try:
+        from transformers.modeling_flash_attention_utils import lazy_import_flash_attention
+    except Exception:
+        # Resolver API absent in this transformers version; let from_pretrained resolve at load time.
+        return
+    try:
+        from transformers.utils import is_kernels_available
+        kernels_ok = is_kernels_available()
+    except Exception:
+        kernels_ok = True  # let lazy_import_flash_attention be the judge
+    if not kernels_ok:
+        raise RuntimeError(
+            "--attn-implementation flash_attention_2 needs either the flash-attn package or the HF "
+            "`kernels` library (pip install kernels), or use --attn-implementation sdpa."
+        )
+    try:
+        lazy_import_flash_attention("kernels-community/flash-attn2")
+    except Exception as exc:
+        raise RuntimeError(
+            "--attn-implementation flash_attention_2: failed to load the kernels-hub flash-attn2 "
+            f"kernel (needs a one-time HF-hub download / network access): {exc!r}. Pre-download it "
+            "on the node or use --attn-implementation sdpa."
+        ) from exc
+
+
+def load_model_and_tokenizer(args: argparse.Namespace, device: torch.device):
+    dtype = resolve_torch_dtype(args.dtype, device)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=args.trust_remote_code)
+
+    added_pad_token = False
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+        else:
+            tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+            added_pad_token = True
+
+    loader_kwargs = dict(trust_remote_code=args.trust_remote_code)
+    # When flash_attention_2 (the default) is requested, resolve the kernel up front; if it's
+    # unavailable (no `kernels` pkg / no network / unsupported GPU), fall back to SDPA with a
+    # warning rather than crash the run — the fallback is visible in the log + as a higher train_s.
+    # fp32 head/tie is unaffected: the attention impl only runs the bf16-autocast body matmul.
+    requested_attn = args.attn_implementation
+    if requested_attn == "flash_attention_2":
+        try:
+            _resolve_flash_attention_2_or_raise()
+        except Exception as exc:
+            print0(f"WARNING: --attn-implementation flash_attention_2 unavailable; falling back to sdpa: {exc}")
+            requested_attn = "sdpa"
+    if requested_attn != "sdpa":
+        loader_kwargs["attn_implementation"] = requested_attn
+    try:
+        model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype, **loader_kwargs)
+    except TypeError:
+        model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype, **loader_kwargs)
+    if added_pad_token:
+        model.resize_token_embeddings(len(tokenizer))
+    model.to(device)
+    print0(f"Attention implementation: {getattr(model.config, '_attn_implementation', 'unknown')}")
+
+    if dtype != torch.float32 and hasattr(model, "lm_head") and isinstance(model.lm_head, torch.nn.Linear):
+        model.lm_head = FP32LMHead(model.lm_head)
+        model.lm_head.to(device)
+        if getattr(model.config, "tie_word_embeddings", False):
+            model.config.tie_word_embeddings = False
+
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        model.config.use_cache = False
+
+    if args.compile:
+        # Compile the transformer BODY only (the fp32 head + chunked CE stay eager — they run under
+        # their own checkpoint with autocast disabled). dynamic=True avoids recompiles on the varying
+        # per-microbatch sequence lengths (var-prefix batches); watch train_s for recompile churn.
+        model.model = torch.compile(model.model, dynamic=True)
+        print0("torch.compile enabled on the transformer body (dynamic=True)")
+
+    return model, tokenizer
+
+
+def strip_compiled_state_dict_keys(state_dict: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove torch.compile's `_orig_mod.` segment from state-dict keys.
+
+    With --compile, model.model is an OptimizedModule, so the raw state dict names body
+    keys `model._orig_mod.layers...`. transformers does NOT strip that prefix on load, so
+    from_pretrained would silently random-init the entire body (warning only) and any eval
+    of the checkpoint would score garbage. Mirrors PipelineWeightSync._named_parameters,
+    which is what keeps the live vLLM weight sync compile-safe; no-op when --compile is off.
+    """
+    return {name.replace("_orig_mod.", ""): value for name, value in state_dict.items()}
+
+
+def save_hf_checkpoint(
+    model,
+    tokenizer,
+    output_dir: Path,
+    step: int,
+) -> Path:
+    checkpoint_dir = output_dir / f"step_{step:06d}"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    state_dict = strip_compiled_state_dict_keys(model.state_dict())
+    # Belt-and-braces: a compiled-module prefix in the saved keys means from_pretrained
+    # would silently drop those weights — refuse to write such a checkpoint.
+    leaked = [name for name in state_dict if "_orig_mod" in name]
+    if leaked:
+        raise RuntimeError(f"compiled-module prefix leaked into checkpoint keys: {leaked[:3]}")
+    model.save_pretrained(checkpoint_dir, state_dict=state_dict)
+    tokenizer.save_pretrained(checkpoint_dir)
+    return checkpoint_dir
+
+
+def should_save_checkpoint_for_step(step: int, num_steps: int, save_every: int, save_final: bool) -> bool:
+    final_step = step == num_steps - 1
+    periodic_save = save_every > 0 and step > 0 and step % save_every == 0
+    return periodic_save or (final_step and save_final)
+
+
+# ============================ RECORD-KEEPING (wandb stub, run log, attestation) ============================
+class DummyWandb:
+    def log(self, *args, **kwargs):
+        pass
+
+    def define_metric(self, *args, **kwargs):
+        pass
+
+    def finish(self):
+        pass
+
+
+def sanitize_run_name(name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.strip())
+    return safe or "run"
+
+
+def _git_commit() -> str | None:
+    try:
+        import subprocess
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(Path(__file__).resolve().parent),
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return None
 
 
 class RunLogger:
@@ -2108,195 +2400,18 @@ class RunLogger:
             self._fh = None
 
 
-def _eval_one_checkpoint(args: argparse.Namespace, model_path: str, multi: bool) -> dict:
-    """Authoritative held-out evaluation of one checkpoint (or the base model), decoupled from
-    training: builds its own vLLM engine sized for the full rollout budget (and shuts it down
-    afterwards), runs the leaderboard pass@1/pass@k protocol on the fixed eval set, and writes a
-    per-checkpoint JSON. Returns the JSON record. No torchrun/DDP."""
-    eval_task = load_sokoban_jsonl_dataset(args.eval_data, split_name="eval")
-
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=args.trust_remote_code)
-    if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    indices = None
-    if args.eval_limit is not None and args.eval_limit > 0:
-        indices = list(range(min(args.eval_limit, len(eval_task))))
-
-    sampling = dict(
-        temperature=args.eval_temperature,
-        top_p=args.eval_top_p,
-        top_k=args.eval_top_k,
-        max_tokens=args.eval_max_tokens,
-        seed=args.eval_seed,
-        logprobs=0,
-    )
-    if args.eval_interruption:
-        marker_ids = tokenizer(INTERRUPTION_TEXT, add_special_tokens=False)["input_ids"]
-        sampling["interrupt"] = make_interrupt_config(
-            marker_ids, args.eval_interrupt_answer_tokens, args.eval_max_model_len,
-            base_temperature=args.eval_temperature, base_top_p=args.eval_top_p,
-            base_top_k=args.eval_top_k,
-            temperature=args.eval_interrupt_temperature,
-            top_p=args.eval_interrupt_top_p, top_k=args.eval_interrupt_top_k,
-        )
-
-    print(
-        f"[eval] model={model_path} eval_data={args.eval_data} "
-        f"n={len(indices) if indices is not None else len(eval_task)} k={args.eval_k} "
-        f"max_tokens={args.eval_max_tokens} sampling=temp{args.eval_temperature}/top_p{args.eval_top_p}/"
-        f"top_k{args.eval_top_k}/seed{args.eval_seed} "
-        f"interruption={args.eval_interruption}",
-        flush=True,
-    )
-
-    async def _run() -> dict:
-        engine = build_async_engine(
-            model_path,
-            num_dp=args.eval_vllm_dp,
-            dtype="bfloat16",
-            max_model_len=args.eval_max_model_len,
-            gpu_memory_utilization=args.eval_gpu_mem_util,
-            seed=args.eval_seed,
-            enforce_eager=args.eval_vllm_enforce_eager,
-            **vllm_tuning_from_args(args, prefix="eval_"),
-        )
-        try:
-            return await run_held_out_eval(
-                engine, tokenizer, eval_task,
-                k=args.eval_k, sampling=sampling,
-                enable_thinking=args.enable_thinking,
-                indices=indices,
-                concurrency=args.eval_concurrency,
-            )
-        finally:
-            try:
-                engine.shutdown()
-            except Exception:
-                pass
-
-    result = asyncio.run(_run())
-
-    step = args.eval_step
-    if step is None:
-        m = re.search(r"step_?(\d+)", model_path)
-        step = int(m.group(1)) if m else None
-
-    record = {
-        "seed": args.eval_seed,
-        "run": args.run,
-        "step": step,
-        "checkpoint": model_path,
-        "model": args.model,
-        "eval_data": str(args.eval_data),
-        "git_commit": _git_commit(),
-        **{key: result[key] for key in (
-            "n_puzzles", "k", "pass_at_1", "pass_at_k", "ci_low", "ci_high", "se",
-            "n_extract_fail", "n_answered", "n_length_trunc", "answer_rate",
-            "solve_given_answer", "trunc_frac", "sampling", "per_puzzle_solve_frac",
-            "per_puzzle_n", "per_puzzle_solved_count", "per_puzzle_answered_count",
-            "per_puzzle_length_trunc_count",
-        )},
-    }
-
-    if args.eval_output is not None:
-        out_path = Path(args.eval_output)
-    else:
-        run_name = args.run if (args.run and args.run != "dummy") else "eval"
-        safe = sanitize_run_name(run_name)
-        suffix = f"step{step:06d}" if step is not None else "latest"
-        if multi:
-            # Disambiguate per-checkpoint JSONs by the checkpoint's run dir (outputs/<run>/step_NNNNNN).
-            ckpt_tag = sanitize_run_name(Path(model_path).parent.name or model_path)
-            out_path = args.output_dir / safe / f"eval_{ckpt_tag}_{suffix}.json"
-        else:
-            out_path = args.output_dir / safe / f"eval_{suffix}.json"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w", encoding="utf-8") as fh:
-        json.dump(record, fh, indent=2)
-        fh.write("\n")
-
-    pk = " ".join(f"pass@{j}={result['pass_at_k'][j]:.4f}" for j in sorted(result["pass_at_k"]))
-    print(
-        f"[eval] {model_path} | n={result['n_puzzles']} k={result['k']} | "
-        f"pass@1={result['pass_at_1']:.4f} (95% CI [{result['ci_low']:.4f}, {result['ci_high']:.4f}], "
-        f"se={result['se']:.4f}) | {pk} | "
-        f"answer_rate={result['answer_rate']:.4f} solve|answer={result['solve_given_answer']:.4f} "
-        f"trunc={result['trunc_frac']:.4f} | extract_fail={result['n_extract_fail']} "
-        f"length_trunc={result['n_length_trunc']} | -> {out_path}",
-        flush=True,
-    )
-    return record
-
-
-def run_standalone_eval(args: argparse.Namespace) -> None:
-    """Single record-eval entrypoint: evaluates each --eval-checkpoint (one final checkpoint per
-    training seed) sequentially under the pinned protocol, writes one JSON per checkpoint, and —
-    given >=2 checkpoints — runs the leaderboard significance test (one-sided t-test that the
-    mean pass@1 clears --eval-target) and exits 0/1 on PASS/FAIL."""
-    checkpoints = [str(c) for c in args.eval_checkpoint] if args.eval_checkpoint else [args.model]
-    if len(set(checkpoints)) < len(checkpoints):
-        sys.exit(f"error: duplicate --eval-checkpoint paths {checkpoints} — each checkpoint must "
-                 "come from a distinct training run (the training run is the unit of replication).")
-    if args.eval_output is not None and len(checkpoints) > 1:
-        sys.exit("error: --eval-output is only valid with a single checkpoint; multi-checkpoint "
-                 "record evals auto-name one JSON per checkpoint.")
-
-    records = [_eval_one_checkpoint(args, mp, multi=len(checkpoints) > 1) for mp in checkpoints]
-    if len(records) < 2:
-        return
-
-    values = [float(r["pass_at_1"]) for r in records]
-    K = len(values)
-    mean = statistics.mean(values)
-    sd = statistics.stdev(values)  # ddof=1: checkpoint-to-checkpoint (seed-to-seed) variance
-    se = sd / math.sqrt(K)
-    df = K - 1
-    if se == 0.0:
-        t = math.inf if mean > args.eval_target else (-math.inf if mean < args.eval_target else 0.0)
-        p = 0.0 if mean > args.eval_target else (1.0 if mean < args.eval_target else 0.5)
-    else:
-        t = (mean - args.eval_target) / se
-        p = student_t_sf(t, df)
-    passed = p < args.eval_alpha and mean > args.eval_target
-
-    print(f"\n=== Record significance: mean(pass@1) > {args.eval_target} ===", flush=True)
-    print(f"  checkpoints (K) : {K}  {[round(v, 4) for v in values]}")
-    print(f"  mean +/- sd     : {mean:.4f} +/- {sd:.4f}   (se={se:.4f})")
-    print(f"  t / df          : {t:.3f} / {df}")
-    print(f"  one-sided p     : {p:.5f}   (alpha={args.eval_alpha})")
-    print("  decision        : " + ("PASS  "
-          f"(mean {mean:.4f} clears {args.eval_target} with p={p:.5f} < {args.eval_alpha})" if passed else
-          f"FAIL  (need mean>{args.eval_target} and p<{args.eval_alpha}; raise mean or add seeds)"),
-          flush=True)
-    raise SystemExit(0 if passed else 1)
-
-
-def _await_status(status_q, expected_type, timeout: float = 600.0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            msg = status_q.get(timeout=1.0)
-        except Exception:
-            continue
-        if msg["type"] == "error":
-            raise RuntimeError(f"engine child error: {msg['msg']}")
-        if msg["type"] == expected_type:
-            return msg
-    raise TimeoutError(f"timed out waiting for child status {expected_type!r}")
-
-
-def _start_process_with_cuda_visible_devices(process, visible_gpus: str) -> None:
-    """Start a spawn child with CVD already present in its inherited environment."""
-    old_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-    os.environ["CUDA_VISIBLE_DEVICES"] = visible_gpus
+# ============================ TRAINING PIPELINE ============================
+def _safe_qsize(q) -> float:
+    """qsize() is unimplemented on some platforms; report -1 instead of crashing."""
     try:
-        process.start()
-    finally:
-        if old_cvd is None:
-            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-        else:
-            os.environ["CUDA_VISIBLE_DEVICES"] = old_cvd
+        return float(q.qsize())
+    except (NotImplementedError, OSError):
+        return -1.0
+
+
+def ewma_update(prev: float, value: float, alpha: float, *, seed: bool) -> float:
+    """One EWMA step; `seed` (e.g. during warmup) resets the average to the raw value."""
+    return value if seed else (1.0 - alpha) * prev + alpha * value
 
 
 @dataclass
@@ -3089,9 +3204,10 @@ def run_pipeline(
                                  TRUNC_EWMA_ALPHA, seed=step <= args.warmup_steps)
         metrics["gen/length_trunc_ewma"] = trunc_ewma
 
-        # Grad-norm EWMA (run1's collapse mode was gnorm 0.4->4.9): logged + WARN-only.
-        # Mirror the truncation EWMA: seed on warmup, smooth after. A non-finite grad_norm
-        # is immediate divergence and still hard-aborts (NaN poisons the weights).
+        # Grad-norm EWMA: logged + WARN-only (a known collapse mode announces itself as the
+        # grad norm climbing ~10x over tens of steps). Mirror the truncation EWMA: seed on
+        # warmup, smooth after. A non-finite grad_norm is immediate divergence and still
+        # hard-aborts (NaN poisons the weights).
         gnorm_val = float(grad_norm)
         gnorm_finite = math.isfinite(gnorm_val)
         if not gnorm_finite:
@@ -3150,7 +3266,7 @@ def run_pipeline(
             )
         if gnorm_ewma >= GNORM_WARN_EWMA:
             print0(f"WARNING step {step}: grad_norm_ewma={gnorm_ewma:.2f} "
-                   f">= {GNORM_WARN_EWMA:.1f} (gradient climbing; run1-style explosion risk)")
+                   f">= {GNORM_WARN_EWMA:.1f} (gradient climbing; explosion risk)")
         if metrics["groups/zero_variance_allpass_frac"] >= ALLPASS_WARN_FRAC:
             print0(f"WARNING step {step}: groups/zero_variance_allpass_frac="
                    f"{metrics['groups/zero_variance_allpass_frac']:.2f} >= {ALLPASS_WARN_FRAC:.2f} "
@@ -3500,129 +3616,7 @@ def run_pipeline(
             compute_cleanup()
 
 
-def strip_compiled_state_dict_keys(state_dict: Mapping[str, Any]) -> dict[str, Any]:
-    """Remove torch.compile's `_orig_mod.` segment from state-dict keys.
-
-    With --compile, model.model is an OptimizedModule, so the raw state dict names body
-    keys `model._orig_mod.layers...`. transformers does NOT strip that prefix on load, so
-    from_pretrained would silently random-init the entire body (warning only) and any eval
-    of the checkpoint would score garbage. Mirrors PipelineWeightSync._named_parameters,
-    which is what keeps the live vLLM weight sync compile-safe; no-op when --compile is off.
-    """
-    return {name.replace("_orig_mod.", ""): value for name, value in state_dict.items()}
-
-
-def save_hf_checkpoint(
-    model,
-    tokenizer,
-    output_dir: Path,
-    step: int,
-) -> Path:
-    checkpoint_dir = output_dir / f"step_{step:06d}"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    state_dict = strip_compiled_state_dict_keys(model.state_dict())
-    # Belt-and-braces: a compiled-module prefix in the saved keys means from_pretrained
-    # would silently drop those weights — refuse to write such a checkpoint.
-    leaked = [name for name in state_dict if "_orig_mod" in name]
-    if leaked:
-        raise RuntimeError(f"compiled-module prefix leaked into checkpoint keys: {leaked[:3]}")
-    model.save_pretrained(checkpoint_dir, state_dict=state_dict)
-    tokenizer.save_pretrained(checkpoint_dir)
-    return checkpoint_dir
-
-
-def _resolve_flash_attention_2_or_raise() -> None:
-    """Fail fast (with an actionable message) if attn_implementation='flash_attention_2' cannot be
-    satisfied, instead of crashing mid-run on the first forward. transformers 5.8 can serve FA2 from
-    the HF `kernels` hub when the standalone flash-attn package is absent (the case here), but that
-    needs the `kernels` library + a one-time hub download of kernels-community/flash-attn2."""
-    try:
-        from transformers.utils import is_flash_attn_2_available
-        if is_flash_attn_2_available():
-            return  # native flash-attn build present
-    except Exception:
-        pass
-    try:
-        from transformers.modeling_flash_attention_utils import lazy_import_flash_attention
-    except Exception:
-        # Resolver API absent in this transformers version; let from_pretrained resolve at load time.
-        return
-    try:
-        from transformers.utils import is_kernels_available
-        kernels_ok = is_kernels_available()
-    except Exception:
-        kernels_ok = True  # let lazy_import_flash_attention be the judge
-    if not kernels_ok:
-        raise RuntimeError(
-            "--attn-implementation flash_attention_2 needs either the flash-attn package or the HF "
-            "`kernels` library (pip install kernels), or use --attn-implementation sdpa."
-        )
-    try:
-        lazy_import_flash_attention("kernels-community/flash-attn2")
-    except Exception as exc:
-        raise RuntimeError(
-            "--attn-implementation flash_attention_2: failed to load the kernels-hub flash-attn2 "
-            f"kernel (needs a one-time HF-hub download / network access): {exc!r}. Pre-download it "
-            "on the node or use --attn-implementation sdpa."
-        ) from exc
-
-
-def load_model_and_tokenizer(args: argparse.Namespace, device: torch.device):
-    dtype = resolve_torch_dtype(args.dtype, device)
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=args.trust_remote_code)
-
-    added_pad_token = False
-    if tokenizer.pad_token_id is None:
-        if tokenizer.eos_token is not None:
-            tokenizer.pad_token = tokenizer.eos_token
-        else:
-            tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
-            added_pad_token = True
-
-    loader_kwargs = dict(trust_remote_code=args.trust_remote_code)
-    # sdpa is the default proven path for the trainer body forward. FA2 is opt-in via
-    # --attn-implementation flash_attention_2 (re-testing at nt3). When requested, resolve the kernel
-    # up front; if it's unavailable (no `kernels` pkg / no network / non-Hopper), fall back to SDPA
-    # with a warning rather than crash the run — the fallback is visible in the log + as a higher train_s.
-    # fp32 head/tie is unaffected: the attention impl only runs the bf16-autocast body matmul.
-    requested_attn = args.attn_implementation
-    if requested_attn == "flash_attention_2":
-        try:
-            _resolve_flash_attention_2_or_raise()
-        except Exception as exc:
-            print0(f"WARNING: --attn-implementation flash_attention_2 unavailable; falling back to sdpa: {exc}")
-            requested_attn = "sdpa"
-    if requested_attn != "sdpa":
-        loader_kwargs["attn_implementation"] = requested_attn
-    try:
-        model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype, **loader_kwargs)
-    except TypeError:
-        model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype, **loader_kwargs)
-    if added_pad_token:
-        model.resize_token_embeddings(len(tokenizer))
-    model.to(device)
-    print0(f"Attention implementation: {getattr(model.config, '_attn_implementation', 'unknown')}")
-
-    if dtype != torch.float32 and hasattr(model, "lm_head") and isinstance(model.lm_head, torch.nn.Linear):
-        model.lm_head = FP32LMHead(model.lm_head)
-        model.lm_head.to(device)
-        if getattr(model.config, "tie_word_embeddings", False):
-            model.config.tie_word_embeddings = False
-
-    if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        model.config.use_cache = False
-
-    if args.compile:
-        # Compile the transformer BODY only (the fp32 head + chunked CE stay eager — they run under
-        # their own checkpoint with autocast disabled). dynamic=True avoids recompiles on the varying
-        # per-microbatch sequence lengths (var-prefix batches); watch train_s for recompile churn.
-        model.model = torch.compile(model.model, dynamic=True)
-        print0("torch.compile enabled on the transformer body (dynamic=True)")
-
-    return model, tokenizer
-
-
+# ============================ CLI ============================
 def _vllm_flag(prefix: str, key: str) -> str:
     """CLI flag for one VLLM_TUNE_KEYS knob, e.g. ('eval_', 'max_num_seqs') -> '--eval-vllm-max-num-seqs'."""
     return f"--{prefix}vllm_{key}".replace("_", "-")
@@ -3757,9 +3751,9 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["token", "sequence", "prompt"],
         default="sequence",
         help="Policy-gradient loss aggregation: 'sequence' (per-sequence mean then averaged over samples, "
-             "GRPO sample-level — the default, stable in this sprint regime), 'token' (per-token over the whole "
+             "GRPO sample-level — the default, stable in this regime), 'token' (per-token over the whole "
              "batch, DAPO), or 'prompt' (per-prompt-group token-average then averaged over prompts, ScaleRL §3.2 "
-             "/ J_ScaleRL — only safe in a low-truncation regime; see run odxkh0nl).",
+             "/ J_ScaleRL — only safe in a low-truncation regime).",
     )
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True,
                         help="Trade compute for activation memory. On by default: the fp32 trainer GPU "
@@ -3771,12 +3765,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--attn-implementation", choices=["sdpa", "flash_attention_2", "eager"],
                         default="flash_attention_2",
                         help="HF attention implementation for the TRAINER body forward. Default "
-                             "'flash_attention_2': in the nt3 A/B it ran ~60 us/tok vs sdpa's ~75-95 "
-                             "(~15-30%% faster, consistent with the original probe). Served from the HF "
-                             "`kernels` hub without a from-source flash-attn build (needs the `kernels` "
-                             "pkg + a one-time download, cached on the Modal volume). If the kernel can't "
-                             "load it falls back to 'sdpa' with a warning. fp32 head/tie is unaffected "
-                             "(FA2 runs only the bf16 body). Pass 'sdpa' to force the old path.")
+                             "'flash_attention_2': measured ~15-30%% faster than sdpa for this workload "
+                             "on H100 (~60 vs ~75-95 us/token). Served from the HF `kernels` hub without "
+                             "a from-source flash-attn build (needs the `kernels` pkg + a one-time hub "
+                             "download). If the kernel can't load it falls back to 'sdpa' with a warning. "
+                             "fp32 head/tie is unaffected (FA2 runs only the bf16 body). Pass 'sdpa' to "
+                             "force it instead.")
     parser.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--save-every", type=int, default=60, help="Save every N steps; 0 disables periodic saves")
     parser.add_argument("--save-final", action=argparse.BooleanOptionalAction, default=True)
@@ -3860,7 +3854,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-checkpoint", type=Path, nargs="+", default=None,
                         help="Checkpoint dir(s) to evaluate; defaults to --model (evaluate the base model). "
                              "Pass one final checkpoint per training seed to run the full record eval: "
-                             "each is evaluated under the pinned protocol, then the significance test "
+                             "each is evaluated under the same protocol, then the significance test "
                              "(mean pass@1 > --eval-target at --eval-alpha) prints a PASS/FAIL verdict.")
     parser.add_argument("--eval-target", type=float, default=0.55,
                         help="Leaderboard TARGET: the pass@1 a record must clear (see README rules).")
