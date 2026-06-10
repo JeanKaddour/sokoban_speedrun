@@ -185,6 +185,12 @@ def train(
     )
     env["LD_LIBRARY_PATH"] = _nvidia_ld_library_path()
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    # wandb's run dir must NOT live on the FUSE volume (cwd): wandb-core's many small appends to
+    # the .wandb transaction log wedge on FUSE and the run uploads nothing (observed n2rn8it1,
+    # 7-byte .wandb after 35 min). Container-local disk keeps the sender fed; the server +
+    # RunLogger hold the durable record, so losing the local dir with the container is fine.
+    env.setdefault("WANDB_DIR", "/tmp/wandb")
+    os.makedirs("/tmp/wandb", exist_ok=True)
 
     speedrun_args = ["--run", run_name, "--max-steps", str(max_steps), *(extra_args or [])]
     if num_trainers > 1:
@@ -251,8 +257,8 @@ def _parse_seeds(spec: str) -> list[int]:
 
 
 def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: list[int],
-                  target: float = 0.70, eval_max_tokens: int = 6144, eval_max_model_len: int = 8192,
-                  interruption: bool = False, interrupt_answer_tokens: int = 512) -> list[list[str]]:
+                  target: float = 0.70, eval_max_tokens: int = 12288, eval_max_model_len: int = 14336,
+                  interruption: bool = True, interrupt_answer_tokens: int = 512) -> list[list[str]]:
     """speedrun --eval-only command(s). `checkpoint` may be a comma-separated list of final
     checkpoints (one per training seed): that emits ONE record-eval command that evaluates all
     of them under the pinned protocol at a single eval seed and ends with the built-in
@@ -268,7 +274,11 @@ def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds
         raise ValueError(f"EVAL_CHECKPOINT must name at least one checkpoint, got {checkpoint!r}")
     # --eval-data and --eval-top-p come from speedrun's RECIPE (prepended by speedrun.main());
     # --eval-only reads them and ignores the training-side flags. Only the standalone eval-engine
-    # specifics are set here. Defaults are the record protocol: 6144-token budget, no interruption.
+    # specifics are set here. Defaults are the LEADERBOARD protocol (decided 2026-06-10): GENEROUS
+    # 12288-token budget + interruption answer-forcing, which eliminates the budget-truncation
+    # confound and measures solving (see reports/calibration/official-mix-rehearsal.md). The
+    # strict 6144/no-interruption protocol remains available via EVAL_MAX_TOKENS/EVAL_MAX_MODEL_LEN/
+    # EVAL_INTERRUPTION for diagnostics.
     # EVAL_MAX_TOKENS / EVAL_MAX_MODEL_LEN / EVAL_INTERRUPTION override (e.g. a generous training-like
     # eval); --eval-max-model-len must cover prompt + max_tokens + the forced-answer continuation.
     common = [sys.executable, "-m", "speedrun", "--eval-only",
@@ -304,8 +314,8 @@ def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds
     secrets=runtime_secrets,
 )
 def evaluate(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: str = "12345",
-             target: float = 0.70, eval_max_tokens: int = 6144, eval_max_model_len: int = 8192,
-             interruption: bool = False) -> None:
+             target: float = 0.70, eval_max_tokens: int = 12288, eval_max_model_len: int = 14336,
+             interruption: bool = True) -> None:
     """Authoritative held-out eval (speedrun.py --eval-only): own vLLM engine over all GPUs at the
     full 6144-token leaderboard budget. `checkpoint` is a /vol path or an HF id (e.g. Qwen/Qwen3-4B
     for the base) — or a COMMA-SEPARATED list of final checkpoints (one per training seed), which
@@ -425,9 +435,9 @@ def main() -> None:
         eval_limit = int(os.environ.get("EVAL_LIMIT", "0"))  # 0 = full eval set; >0 = first N (cheap dev)
         seeds = ",".join(str(s) for s in _parse_seeds(os.environ.get("EVAL_SEEDS", "12345")))
         target = float(os.environ.get("EVAL_TARGET", "0.70"))
-        eval_max_tokens = int(os.environ.get("EVAL_MAX_TOKENS", "6144"))
-        eval_max_model_len = int(os.environ.get("EVAL_MAX_MODEL_LEN", "8192"))
-        eval_interruption = os.environ.get("EVAL_INTERRUPTION", "0") not in ("0", "false", "False", "")
+        eval_max_tokens = int(os.environ.get("EVAL_MAX_TOKENS", "12288"))
+        eval_max_model_len = int(os.environ.get("EVAL_MAX_MODEL_LEN", "14336"))
+        eval_interruption = os.environ.get("EVAL_INTERRUPTION", "1") not in ("0", "false", "False", "")
         run_name = os.environ.get("RUN_NAME") or f"sokoban-eval-{datetime.now():%Y%m%d-%H%M%S}"
         print(f"Running eval: ckpt={eval_ckpt}, run={run_name}, k={k}, limit={eval_limit}, "
               f"seeds=[{seeds}], target={target}, max_tokens={eval_max_tokens}, "
