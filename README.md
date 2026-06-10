@@ -67,14 +67,16 @@ The function runs `python -m speedrun` from the `nanochat-rl-hf` volume (mounted
 
 ## Why Sokoban?
 
-* Small contamination risk: We generate fresh puzzles, so unlike Go or GSM8k there is little risk the base model has memorized them.
-* Simple enough to yield RL gains in `O(10)` GPU hours
+* Small contamination risk: We generate fresh puzzles, so unlike eg. GSM8k there is less risk the base model has memorized them.
+* Simple enough to yield RL gains in `O(10)` GPU hours.
 * Hard enough for gains to be meaningful: Sokoban is PSPACE-complete and can't be brute-forced; it requires genuine reasoning capabilities.
 * Diverse reasoning paths are encouraged. Puzzles naturally permit multiple solutions.
 
-## Why handroll your own asnyc RL stack?
-* Using an existing framework might help in the short term, but it comes with a lot of machinery and overhead that isn't needed here. General-purpose frameworks are built to support every RL scenario and layers of abstraction between you and the training loop. 
-* Our (initial) setup is minimal: torchrun launches a handful of data-parallel trainer ranks alongside one vLLM generator on its own GPUs of the same 8×H100 node, and the trainer broadcasts fresh weights to vLLM over NCCL. This makes it small enough to read end to end. 
+## Why handroll an async RL stack instead of using verl/slime/TRL/etc.?
+
+- Since wall-clock time to a target solve-rate is the metric, the RL stack itself is part of the optimization target.
+- General-purpose RL frameworks optimize for broad coverage; here we want a narrow, inspectable fast path.
+- This follows the spirit of [modded-nanoGPT](https://github.com/KellerJordan/modded-nanogpt): strip the stack down until bottlenecks are visible, then make the fastest version easy to reproduce and improve.
 
 # Shoutouts 
 
