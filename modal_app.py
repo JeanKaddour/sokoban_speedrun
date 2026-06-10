@@ -241,8 +241,8 @@ def train(
 
 
 def _parse_seeds(spec: str) -> list[int]:
-    """Comma-separated eval-seed list, e.g. "1,2,3,4,5" (single-checkpoint mode only; the record
-    protocol replicates over training runs via comma-separated EVAL_CHECKPOINT, with one pinned
+    """Comma-separated eval-seed list, e.g. "1,2,3,4,5" (single-checkpoint mode only; a record
+    eval replicates over training runs via comma-separated EVAL_CHECKPOINT, with a single
     eval seed). Duplicates are rejected: rerunning one seed would just overwrite its JSON."""
     tokens = [tok for tok in spec.replace(" ", "").split(",") if tok]
     if not tokens:
@@ -263,7 +263,7 @@ def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds
                   eval_vllm_max_num_seqs: int = 16, eval_concurrency: int = 16) -> list[list[str]]:
     """speedrun --eval-only command(s). `checkpoint` may be a comma-separated list of final
     checkpoints (one per training seed): that emits ONE record-eval command that evaluates all
-    of them under the pinned protocol at a single eval seed and ends with the built-in
+    of them under the same protocol at a single eval seed and ends with the built-in
     significance verdict (mean pass@1 > `target` at p<0.01). A single checkpoint keeps the
     legacy behavior: one command per eval seed, each with an EXPLICIT --eval-seed and a
     seed-distinct --eval-output. (Without these, every run silently sampled at speedrun.py's
@@ -276,13 +276,13 @@ def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds
         raise ValueError(f"EVAL_CHECKPOINT must name at least one checkpoint, got {checkpoint!r}")
     # --eval-data and --eval-top-p come from speedrun's RECIPE (prepended by speedrun.main());
     # --eval-only reads them and ignores the training-side flags. Only the standalone eval-engine
-    # specifics are set here. Defaults are the LEADERBOARD protocol (updated 2026-06-10): generous
-    # 32768-token budget + interruption answer-forcing, which eliminates the budget-truncation
-    # confound and measures solving. The strict 6144/no-interruption protocol remains available
-    # via EVAL_MAX_TOKENS/EVAL_MAX_MODEL_LEN/EVAL_INTERRUPTION for diagnostics.
-    # EVAL_MAX_TOKENS / EVAL_MAX_MODEL_LEN / EVAL_INTERRUPTION override the protocol; --eval-max-model-len
+    # specifics are set here. Defaults are the leaderboard protocol: a generous 32768-token
+    # budget + interruption answer-forcing, which eliminates the budget-truncation confound and
+    # measures solving. A strict 6144/no-interruption protocol remains available via
+    # EVAL_MAX_TOKENS/EVAL_MAX_MODEL_LEN/EVAL_INTERRUPTION for diagnostics; --eval-max-model-len
     # must cover prompt + max_tokens + the forced-answer continuation. The long-context scheduler
-    # defaults intentionally override speedrun.py's old 1024-way eval recipe to avoid overfeeding KV.
+    # defaults intentionally override speedrun.py's 1024-way eval recipe (sized for short budgets)
+    # to avoid overfeeding KV.
     common = [sys.executable, "-m", "speedrun", "--eval-only",
               "--run", run_name,
               "--eval-k", str(k), "--eval-max-tokens", str(eval_max_tokens),
@@ -327,7 +327,7 @@ def evaluate(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: str
     """Authoritative held-out eval (speedrun.py --eval-only): own vLLM engine over all GPUs at the
     full 32768-token leaderboard budget. `checkpoint` is a /vol path or an HF id (e.g. Qwen/Qwen3-4B
     for the base) — or a COMMA-SEPARATED list of final checkpoints (one per training seed), which
-    runs the whole record eval end-to-end in one call: every checkpoint evaluated under the pinned
+    runs the whole record eval end-to-end in one call: every checkpoint evaluated under the same
     protocol, one JSON each, then the significance verdict (mean pass@1 > `target`, p<0.01).
     For a single checkpoint, `seeds` (comma-separated) runs one eval/JSON per eval seed
     sequentially. `eval_limit`>0 evals only the first N puzzles (cheap dev runs); 0 = full set.
@@ -466,9 +466,8 @@ def main() -> None:
                         eval_vllm_max_num_seqs, eval_concurrency)
         return
     # NTRAINERS=1 => single trainer + 7 vLLM; NTRAINERS=2 => 2 trainers + 6 vLLM (torchrun), etc.
-    # Default NTRAINERS=3 is the CANONICAL sprint trainer count: the node is trainer-bound at inflight 96
-    # so 3 trainers (6 microbatches fewer per rank than nt2) is the sweet spot (~30% faster per step than
-    # nt2; rvvtdz8w's setting). PINNED here so we never accidentally launch nt2. Trainer count is a torchrun
+    # Default NTRAINERS=3: the node is trainer-bound at inflight 96, so 3 trainers is the sweet
+    # spot (~30% faster per step than 2 — fewer microbatches per rank). Trainer count is a torchrun
     # launch param (not a speedrun CLI arg), so it lives here; the rest of the recipe is speedrun.py RECIPE.
     # Full sprint e.g.: MAX_STEPS=150 modal run --detach modal_app.py
     max_steps = int(os.environ.get("MAX_STEPS", "4"))
