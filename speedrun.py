@@ -44,6 +44,9 @@ ALLPASS_WARN_FRAC = 0.5      # all-pass zero-variance drops >= this share of fre
                              # being mastered (curriculum starvation / wasted generation); warn at/above it
 WEIGHT_SYNC_TIMEOUT_S = 300.0  # bound the rank-0 weight broadcast so a dead vLLM child can't hang the trainer
 ROLLOUT_GET_TIMEOUT_S = 300.0  # bound result-queue waits so a silent vLLM child crash can't stall the trainer
+FIFO_HEAD_STALL_ABORT_S = 900.0  # abort if the next-in-file-order group never arrives while others flow: vLLM
+                                 # schedules FCFS, so the head is always among the earliest-started requests and
+                                 # this is far above any single group's worst-case latency (~6k tok under load)
 # Trainer-group NCCL timeout. Workers sit in the Phase-C broadcast recv for ALL of rank 0's
 # Phase A, which is legitimately unbounded (a reject storm needs >reject_limit consecutive groups,
 # ~15-35 min of generation, before the diagnostic abort; the rank-0 setup workers wait on can also
@@ -69,7 +72,8 @@ EVAL_PID_BASE = 1_000_000_000
 # deliberately NOT here (they vary per launch). Eval-only invocations also get the recipe prepended,
 # so --eval-data below is also the eval set --eval-only scores against unless overridden.
 # TRAINER COUNT: the canonical sprint runs NTRAINERS=3 (3 trainer ranks + 5 vLLM) — the trainer-bound
-# sweet spot at inflight 96, ~30% faster per step than 2 trainers. That is a torchrun launch param,
+# sweet spot (measured at inflight 96; still trainer-bound at the FIFO ticket budget of 64, which only
+# shrinks finished-inventory, not generation concurrency), ~30% faster per step than 2 trainers. That is a torchrun launch param,
 # NOT a speedrun CLI arg, so it is pinned as the default in modal_app.py (NTRAINERS=3), not in this list.
 RECIPE = [
     "--dtype", "float32",       # load trainer params/head fp32; train autocast runs body bf16, head/logits fp32
@@ -96,7 +100,11 @@ RECIPE = [
     "--cispo-eps", "4.0",
     "--loss-normalization", "sequence",  # sample-level (GRPO).
     "--max-staleness", "4",          # less off-policy than ScaleRL's 8; a proven stability lever
-    "--inflight-requests", "96",     # measured generator-throughput sweet spot (~22k tok/s); non-monotonic
+    "--inflight-requests", "64",     # outstanding-group tickets, reissued at CONSUME time: pins total unconsumed
+                                     # inventory, so worst-case FIFO staleness is 64/(16 groups/step) = max-staleness.
+                                     # Generation is unaffected: the node is trainer-bound (~20 groups actually
+                                     # generating; the rest of the old 96 sat finished in result_q) and the engine
+                                     # still sees up to 64*8 = 512 seqs = --vllm-max-num-seqs at cold start.
     "--vllm-gpu-mem-util", "0.9",
     "--vllm-stream-interval", "8",   # buffer token streaming to cut host/IPC overhead; no sampling/budget change
     "--vllm-max-num-batched-tokens", "8192",
@@ -2782,6 +2790,13 @@ def run_pipeline(
     current_version = 0
     puzzles: dict[int, dict] = {}
     next_puzzle_id = 0
+    # FIFO reorder state: results arrive in completion order, but training consumes groups in
+    # strict dataset-file order (the published ordering IS the curriculum; completion-order
+    # consumption biased early steps toward fast-finishing easy groups — the cold-start reward
+    # dip artifact — and stale-dropped the slowest ~5% of groups). pid -> (result msg, puzzle
+    # meta). Bounded by --inflight-requests: the replacement ticket is issued at consume time.
+    reorder_buffer: dict[int, tuple[dict, dict]] = {}
+    next_consume_pid = 0
     train_prompt_cache: list[PromptCacheEntry] = []
     interrupt_marker_ids: list[int] | None = None
     if args.interruption or args.inloop_eval_interruption:
@@ -2961,31 +2976,58 @@ def run_pipeline(
     )
 
     def _collect_step_batch(step: int, t_step_start: float, times: dict[str, float]) -> CollectStats:
-        """Phase A (RANK 0 ONLY): drain result_q until examples_per_step fresh, signal-bearing
-        rollout groups are banked. In-loop-eval results (pid >= EVAL_PID_BASE) are routed out of
-        band; stale / zero-variance / unusable groups are rejected (with the reject-limit safety
-        abort in CollectStats.register_reject). Raises on engine errors — the caller's blanket
-        handler broadcasts the poison sentinel."""
+        """Phase A (RANK 0 ONLY): bank examples_per_step fresh, signal-bearing rollout groups,
+        consuming groups in STRICT DATASET-FILE ORDER via the reorder buffer (results arrive in
+        completion order). In-loop-eval results (pid >= EVAL_PID_BASE) are routed out of band;
+        stale / zero-variance / unusable groups are rejected in file order (with the reject-limit
+        safety abort in CollectStats.register_reject). Raises on engine errors — the caller's
+        blanket handler broadcasts the poison sentinel."""
+        nonlocal next_consume_pid
         cs = CollectStats()
         reject_limit = max(256, args.examples_per_step * 64)
-        while cs.puzzles_used < args.examples_per_step:
-            t_wait_start = time.monotonic()
-            try:
-                msg = result_q.get(timeout=ROLLOUT_GET_TIMEOUT_S)
-            except queue.Empty:
-                if not child.is_alive():
-                    raise _abort_step("vLLM child died during generation (no rollouts received)")
-                continue
-            finally:
-                times["result_queue_wait"] += time.monotonic() - t_wait_start
+
+        def _absorb_result(msg: dict) -> None:
+            """Route one result_q message: engine errors raise, in-loop-eval results go out of
+            band, train groups land in the reorder buffer keyed by pid. No ticket reissue here —
+            that happens at consume time, otherwise the generator forms a closed enqueue loop
+            with itself and races arbitrarily far ahead of the trainer."""
             if msg["type"] == MSG_ERROR:
                 raise _abort_step(f"engine child error: {msg['msg']}")
-            pid, version = msg["puzzle_id"], msg["weight_version"]
+            pid = msg["puzzle_id"]
             if pid >= EVAL_PID_BASE:
                 inloop_eval.process_result(msg, step)
-                continue
-            meta = puzzles.pop(pid)
+                return
+            reorder_buffer[pid] = (msg, puzzles.pop(pid))
+
+        while cs.puzzles_used < args.examples_per_step:
+            head_wait_start = time.monotonic()
+            while next_consume_pid not in reorder_buffer:
+                if time.monotonic() - head_wait_start > FIFO_HEAD_STALL_ABORT_S:
+                    raise _abort_step(
+                        f"file-order head group pid={next_consume_pid} not produced after "
+                        f"{FIFO_HEAD_STALL_ABORT_S:.0f}s (generator dropped the request?)")
+                t_wait_start = time.monotonic()
+                try:
+                    msg = result_q.get(timeout=ROLLOUT_GET_TIMEOUT_S)
+                except queue.Empty:
+                    if not child.is_alive():
+                        raise _abort_step("vLLM child died during generation (no rollouts received)")
+                    continue
+                finally:
+                    times["result_queue_wait"] += time.monotonic() - t_wait_start
+                _absorb_result(msg)
+            # Opportunistic drain: absorb everything already finished so result_q stays empty
+            # and the buffer (not the IPC queue) holds the inventory.
+            while True:
+                try:
+                    msg = result_q.get_nowait()
+                except queue.Empty:
+                    break
+                _absorb_result(msg)
+            msg, meta = reorder_buffer.pop(next_consume_pid)
+            next_consume_pid += 1
             _enqueue_next_puzzle()
+            pid, version = msg["puzzle_id"], msg["weight_version"]
             if not is_fresh_enough(version, current_version, args.max_staleness):
                 cs.groups_stale += 1
                 cs.register_reject(step, reject_limit)
@@ -3184,6 +3226,8 @@ def run_pipeline(
             "throughput/train_tokens_per_s": global_token_count / max(1e-6, times["train"]),
             "throughput/seqs_per_s": n_seqs / max(1e-6, times["step"]),
             "throughput/result_q_backlog": _safe_qsize(result_q),
+            # Finished groups waiting for their file-order turn; bounded by inflight_requests.
+            "throughput/reorder_buffer": len(reorder_buffer),
         }
         metrics.update(estimate_step_perf_metrics(
             model_info=model_perf_info,
@@ -3794,7 +3838,9 @@ def build_parser() -> argparse.ArgumentParser:
                      "2048, NOT the H100 8192 tier, so the RECIPE sets it explicitly.",
     )
     parser.add_argument("--inflight-requests", type=int, default=16,
-                        help="Target number of puzzle generations kept in flight")
+                        help="Outstanding puzzle-group budget (generating + awaiting file-order "
+                             "consumption); tickets reissue as groups are consumed, so this also "
+                             "bounds behavior staleness at inflight/groups-consumed-per-step")
     parser.add_argument("--max-staleness", type=int, default=4,
                         help="Drop rollouts older than this many weight versions (PipelineRL-k)")
     parser.add_argument("--logits-chunk-size", type=int, default=1024,
