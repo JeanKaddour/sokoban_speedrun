@@ -35,7 +35,11 @@ IGNORE_INDEX = -100
 NODE_GPUS = 8  # the speedrun targets one 8xH100 node; trainers + vLLM generators must fit within it
 # Interruption-based length control (ScaleRL A.10): appended to a still-thinking rollout that hit the
 # generation cap, to force it to stop reasoning and emit a final answer instead of hard-truncating to 0.
-INTERRUPTION_TEXT = " Okay, time is up. Let me stop thinking and formulate a final answer now.\n</think>\n\n"
+# Ends with the OPEN <answer> tag: without it, models spend the whole forced-answer budget on a prose
+# recap and never reach the tag (observed ~10% of late-run samples => guaranteed reward 0). The tag is
+# output-format guidance (rules-legal), sits in the injected marker (loss-masked, no gradient), and the
+# first-tag-wins extractor scores it exactly like a model-emitted tag.
+INTERRUPTION_TEXT = " Okay, time is up. Let me stop thinking and formulate a final answer now.\n</think>\n\n<answer>"
 TRUNC_EWMA_ALPHA = 0.3        # weight on the current step (0.7 on history): smooths to a *sustained* climb, not a transient
 TRUNC_WARN_EWMA = 0.05        # ScaleRL's "keep <5%" line — log a warning at/above it
 GNORM_EWMA_ALPHA = 0.3
@@ -116,7 +120,7 @@ RECIPE = [
     "--save-every", "0",
     "--save-final",
     "--no-save-rollouts",             # no rollout jsonl on disk (avoids volume-commit churn)
-    "--wandb-rollout-samples", "20",  # log N=10 rollouts/step to the wandb "rollouts_live" + final "rollouts" tables
+    "--wandb-rollout-samples", "20",  # rollouts/step logged to the wandb "rollouts_live" + final "rollouts" tables
 ]
 # ============================================================================================
 # ============================ SOKOBAN DOMAIN: prompt, answer extraction, scoring, dataset ============================
@@ -2438,6 +2442,10 @@ class CollectStats:
     samples_answered_total: int = 0
     samples_solved_total: int = 0
     samples_length_trunc_unfiltered: int = 0
+    samples_interrupted_total: int = 0           # forced-answer marker survived into the scored sequence
+    samples_interrupted_answered_total: int = 0  # ... and the sample still produced a parseable answer
+    band_samples_seen: dict[str, int] = field(default_factory=dict)    # per difficulty band (metadata)
+    band_samples_solved: dict[str, int] = field(default_factory=dict)
     groups_any_solved_total: int = 0
     gen_tokens_total: int = 0
     prefill_tokens_total: int = 0
@@ -2790,6 +2798,7 @@ def run_pipeline(
     current_version = 0
     puzzles: dict[int, dict] = {}
     next_puzzle_id = 0
+    train_bands: list[str] = []  # pid % len -> difficulty band (dataset metadata); rank-0, for per-band metrics
     # FIFO reorder state: results arrive in completion order, but training consumes groups in
     # strict dataset-file order (the published ordering IS the curriculum; completion-order
     # consumption biased early steps toward fast-finishing easy groups — the cold-start reward
@@ -2868,7 +2877,7 @@ def run_pipeline(
         next_puzzle_id += 1
 
     def _rank0_setup() -> None:
-        nonlocal train_prompt_cache
+        nonlocal train_prompt_cache, train_bands
         nonlocal child, wsync, prompt_q, result_q, control_q, status_q
         nonlocal wandb_run, model_perf_info, rollout_fh, inloop_eval
         # Rendezvous steps (2)-(4); see the two-NCCL-group invariant above. All of this runs on
@@ -2879,6 +2888,7 @@ def run_pipeline(
         # --- (2) spawn the vLLM child on GPUs T..T+M-1 ---
         layout = pipeline_trainer_layout(ddp_world_size, vllm_dp)
         train_prompt_cache = build_prompt_cache(train_task, tokenizer, args.enable_thinking)
+        train_bands = [ex["metadata"].get("band", "?") for ex in train_task.examples]
         max_train_prompt_len = max(entry.prefix_length for entry in train_prompt_cache)
         print0(
             f"Precomputed train prompt cache: {len(train_prompt_cache)} prompts "
@@ -3067,6 +3077,16 @@ def run_pipeline(
             cs.samples_solved_total += sum(1 for r in rewards if r == 1.0)
             cs.samples_length_trunc_unfiltered += sum(1 for fin in fins if fin == "length")
             cs.groups_any_solved_total += 1 if any(r == 1.0 for r in rewards) else 0
+            # Interrupted = the forced-answer marker survived into the scored sequence (loss_mask
+            # carries False on injected positions; a pre-marker self-answer trims the marker away).
+            interrupted = [s.loss_mask is not None and not all(s.loss_mask) for s in processed_samples]
+            cs.samples_interrupted_total += sum(interrupted)
+            cs.samples_interrupted_answered_total += sum(
+                1 for s, was in zip(processed_samples, interrupted) if was and s.moves is not None)
+            band = train_bands[pid % len(train_bands)] if train_bands else "?"
+            cs.band_samples_seen[band] = cs.band_samples_seen.get(band, 0) + len(rewards)
+            cs.band_samples_solved[band] = (
+                cs.band_samples_solved.get(band, 0) + sum(1 for r in rewards if r == 1.0))
             is_zero_var = args.zero_variance_filter and not group_has_signal(rewards)
             t_log_start = time.monotonic()
             if rollout_fh is not None:
@@ -3219,6 +3239,18 @@ def run_pipeline(
                 cs.samples_length_trunc_unfiltered / max(1, cs.samples_seen_total)
             ),
             "gen/eos_frac": n_eos / max(1, n_seqs),
+            "gen/interrupted_frac": cs.samples_interrupted_total / max(1, cs.samples_seen_total),
+            # Of marker-interrupted samples, how many produced a parseable answer. The open-
+            # <answer>-tag marker should pin this near 1.0; a sag means the model rambles inside
+            # the tag or never closes it. Sparse: omitted on steps with no interruptions.
+            **({"reward/answered_given_interrupted":
+                cs.samples_interrupted_answered_total / cs.samples_interrupted_total}
+               if cs.samples_interrupted_total else {}),
+            # Online solve rate split by curriculum band, so curriculum position never reads as
+            # policy regression (a late-run dip in the aggregate is invisible per band).
+            **{f"reward/online_solved_frac_band/{b}":
+               cs.band_samples_solved.get(b, 0) / max(1, n)
+               for b, n in sorted(cs.band_samples_seen.items())},
             "staleness/mean": sum(cs.staleness) / max(1, len(cs.staleness)),
             "staleness/max": (max(cs.staleness) if cs.staleness else 0),
             **{f"time/{name}_s": value for name, value in times.items()},
@@ -3288,7 +3320,9 @@ def run_pipeline(
             # so the tail — where late repetition / non-termination shows — is visible.
             metrics["rollouts_live"] = wandb.Table(columns=wandb_rollout_columns, data=step_rows)
             wandb_rollout_rows.extend(step_rows)        # running record; full table dumped in finally
-            wandb_rollout_rows = wandb_rollout_rows[-1500:]  # covers a full 120-step run at N=10
+            # Cap the cumulative table at 150 steps' worth of the CONFIGURED sample count (the old
+            # fixed 1500 assumed N=10 and silently halved coverage at N=20).
+            wandb_rollout_rows = wandb_rollout_rows[-150 * max(1, args.wandb_rollout_samples):]
         wandb_run.log(metrics)
         run_logger.log_step(step, num_steps, metrics)
         inloop_eval.warn_overdue(step)
