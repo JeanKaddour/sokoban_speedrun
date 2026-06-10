@@ -77,12 +77,12 @@ EVAL_CHECKPOINT=/vol/outputs/<run>/step_NNNNNN modal run modal_app.py
 
 ## Why Sokoban?
 
+* The base model pass@1 is 21.8%.
 * Small contamination risk: We generate fresh puzzles, so unlike eg. GSM8k there is less risk the base model has memorized them.
 * Simple enough to yield RL gains in `O(10)` GPU hours.
 * Hard enough for gains to be meaningful: Sokoban is PSPACE-complete and can't be brute-forced; it requires genuine reasoning capabilities.
 * Diverse reasoning paths are encouraged. Puzzles naturally permit multiple solutions.
 
-All eval puzzles have 2 boxes and 5–14-move solutions. Under the leaderboard protocol the base model answers 95% of the time but is right on only 23% of attempts: base pass@1 is **0.218**, so the 0.55 TARGET sits far above any luck path.
 
 ## Why is the training set ordered?
 
