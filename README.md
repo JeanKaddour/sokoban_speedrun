@@ -85,7 +85,9 @@ EVAL_CHECKPOINT=/vol/outputs/<run>/step_NNNNNN modal run modal_app.py
 
 - Its base pass@1 is 14.0%.
 - It got released around the same time as [ReasoningGym](https://arxiv.org/abs/2505.24760) (which includes Sokoban), so it is unlikely to have been trained on it.
-- In my (Jean's) experience, 4B seems just large enough for the model to elicit meaningful CoT traces, which are necessary for RL.  
+- In my (Jean's) experience, 4B seems just large enough for the model to elicit meaningful CoT traces, which are necessary for RL. 
+    - Using larger models would require more compute and make the speedrun less accessible.  
+- I tried [Qwen3-4B-Base](https://huggingface.co/Qwen/Qwen3-4B-Base) too but training was much less stable. 
 
 
 ## Why is the training set ordered?
