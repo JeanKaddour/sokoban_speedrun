@@ -34,7 +34,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 IGNORE_INDEX = -100
-NODE_GPUS = 8  # the speedrun targets one 8xH100 node; trainers + vLLM generators must fit within it
+# One node; trainers + vLLM generators must fit within it. Default is the benchmark's 8xH100;
+# the env override supports smaller boxes (e.g. NODE_GPUS=4 with a smaller model). modal_app.py
+# bakes the launch-time GPU allocation into the container env so this always matches the GPUs
+# actually present.
+NODE_GPUS = int(os.environ.get("NODE_GPUS", "8"))
 # Interruption-based length control (ScaleRL A.10): appended to a still-thinking rollout that hit the
 # generation cap, to force it to stop reasoning and emit a final answer instead of hard-truncating to 0.
 # Ends with the OPEN <answer> tag: without it, models spend the whole forced-answer budget on a prose
@@ -432,6 +436,12 @@ def build_async_engine(
         "enable_log_requests": False,
         "seed": seed,
         "weight_transfer_config": WeightTransferConfig(backend="nccl"),
+        # CISPO behavior logprobs must be PRE-temperature/top-p (the trainer recomputes
+        # log pi at temperature 1.0, so the IS ratio is only consistent against raw
+        # logprobs). This is vLLM's current default; pin it so an upstream default flip
+        # to processed_logprobs can't silently bake a temperature offset into every IS
+        # weight and the mismatch/ESS diagnostics.
+        "logprobs_mode": "raw_logprobs",
     }
     engine_kwargs.update({key: value for key, value in tuning.items() if value is not None})
     engine_args = AsyncEngineArgs(**engine_kwargs)
@@ -1022,9 +1032,10 @@ def sort_and_shard_for_microbatching(
     3. Pad every rank to the same count with `pad_example` (zero gradient by construction, see
        make_pad_example) so no rank stalls the grad all-reduce.
 
-    Gradient-identical to the unsorted contiguous path up to fp summation order: the CISPO loss
-    is per-sequence separable with step-GLOBAL normalizers (Phase D), so neither order, pairing,
-    nor rank assignment changes the summed gradient.
+    Gradient-identical to the unsorted contiguous path up to fp summation order: every policy
+    loss here (cispo/grpo/gspo) is per-sequence separable with step-GLOBAL normalizers (Phase D)
+    — gspo's sequence ratio is computed within each row — so neither order, pairing, nor rank
+    assignment changes the summed gradient.
     """
     if world_size < 1:
         raise ValueError("world_size must be at least 1")
@@ -1138,7 +1149,7 @@ def compute_cleanup() -> None:
 
 def all_reduce_grads_sum(model: torch.nn.Module, group=None) -> None:
     """Manual replacement for DDP's grad hooks (the trainer never DDP-wraps the model, since
-    chunked_cispo_loss reaches into model.model / model.lm_head directly). Each rank runs its
+    chunked_policy_loss reaches into model.model / model.lm_head directly). Each rank runs its
     per-shard loss with normalizer=1.0 over GLOBAL counts, then all_reduce(SUM) every grad to
     recover the exact single-GPU full-batch gradient.
 
@@ -1500,38 +1511,86 @@ def policy_gradient_loss_from_token_logprobs(
     normalizer: float = 1.0,
     sequence_normalize: bool = False,
     behavior_logprobs: torch.Tensor | None = None,
+    loss_fn: str = "cispo",
     cispo_eps: float | None = None,
+    clip_eps_low: float | None = None,
+    clip_eps_high: float | None = None,
+    clip_ratio_c: float | None = None,
     stats: dict | None = None,
     prompt_lengths: torch.Tensor | None = None,
     kl_tau: float = 0.0,
 ) -> torch.Tensor:
+    """Each loss variant builds a per-token OBJECTIVE tensor J (to be maximized); the
+    token/sequence/prompt aggregation below is shared and identical across variants.
+    CISPO is the only variant whose J is zero at IGNORE positions by construction
+    (token_logprobs is masked to 0 there); grpo/gspo objectives are exp(log_ratio)-shaped,
+    which is A (not 0) at IGNORE positions (pads, injected interruption markers, where
+    behavior holds 0.0 placeholders), so they MUST be explicitly masked."""
     advantage_weight = advantages.to(token_logprobs.dtype).unsqueeze(-1)  # (B, 1)
-    kl_per_token = None  # set below when the optional KL anchor is active (CISPO branch only)
+    kl_per_token = None  # set below when the optional KL anchor is active (behavior-logprob branch only)
     if behavior_logprobs is not None:
-        if cispo_eps is None or cispo_eps <= 0:
-            raise ValueError("cispo_eps must be a positive float when behavior_logprobs is provided")
-        # CISPO: stop-grad clipped importance weight min(rho, eps_max) multiplies the
-        # advantage; only log pi_theta carries the gradient. Clamp in log-space before
-        # exp to avoid overflow: exp(min(log_ratio, log eps)) == min(ratio, eps).
         log_ratio = token_logprobs - behavior_logprobs.to(token_logprobs.dtype)
-        is_weight = torch.exp(torch.clamp(log_ratio, max=math.log(cispo_eps))).detach()
-        token_weight = is_weight * advantage_weight  # (B, T)
+        valid = labels != IGNORE_INDEX
+        if loss_fn == "cispo":
+            if cispo_eps is None or cispo_eps <= 0:
+                raise ValueError("cispo_eps must be a positive float for the cispo loss")
+            # CISPO: stop-grad clipped importance weight min(rho, eps_max) multiplies the
+            # advantage; only log pi_theta carries the gradient. Clamp in log-space before
+            # exp to avoid overflow: exp(min(log_ratio, log eps)) == min(ratio, eps).
+            is_weight = torch.exp(torch.clamp(log_ratio, max=math.log(cispo_eps))).detach()
+            token_weight = is_weight * advantage_weight  # (B, T)
+            per_token_objective = token_logprobs * token_weight
+            clip_active = (log_ratio > math.log(cispo_eps)) & valid
+        elif loss_fn == "grpo":
+            if clip_eps_low is None or clip_eps_high is None:
+                raise ValueError("clip_eps_low/clip_eps_high are required for the grpo loss")
+            # PPO-clip surrogate (GRPO/DAPO): gradient flows through the ratio itself.
+            # min in objective space == max in loss space (verl compute_policy_loss_vanilla).
+            ratio = torch.exp(torch.clamp(log_ratio, min=-20.0, max=20.0))
+            obj_unclipped = ratio * advantage_weight
+            obj_clipped = torch.clamp(ratio, 1.0 - clip_eps_low, 1.0 + clip_eps_high) * advantage_weight
+            objective = torch.minimum(obj_unclipped, obj_clipped)
+            clip_active = (obj_clipped < obj_unclipped) & valid
+            if clip_ratio_c is not None:
+                # Dual-clip PPO (arXiv 1912.09729): for A<0 the unclipped term -rho*|A| is unbounded
+                # below as rho grows; floor the objective at c*A so one stale/mismatched token
+                # can't dominate the batch gradient.
+                objective = torch.where(advantage_weight < 0,
+                                        torch.maximum(objective, clip_ratio_c * advantage_weight),
+                                        objective)
+            per_token_objective = objective.masked_fill(~valid, 0.0)
+        elif loss_fn == "gspo":
+            if clip_eps_low is None or clip_eps_high is None:
+                raise ValueError("clip_eps_low/clip_eps_high are required for the gspo loss")
+            # GSPO (arXiv 2507.18071): length-normalized SEQUENCE ratio s_i, clipped; the
+            # stop-grad identity logpi - sg(logpi) + sg(log s_i) makes the forward value equal
+            # s_i at every token while the gradient distributes over the sequence's tokens.
+            seq_lengths = valid.sum(dim=-1).clamp(min=1).to(token_logprobs.dtype)
+            log_seq_ratio = log_ratio.masked_fill(~valid, 0.0).sum(dim=-1) / seq_lengths
+            log_token_seq_ratio = token_logprobs - token_logprobs.detach() + log_seq_ratio.detach().unsqueeze(-1)
+            seq_ratio = torch.exp(torch.clamp(log_token_seq_ratio, max=10.0))
+            obj_unclipped = seq_ratio * advantage_weight
+            obj_clipped = torch.clamp(seq_ratio, 1.0 - clip_eps_low, 1.0 + clip_eps_high) * advantage_weight
+            per_token_objective = torch.minimum(obj_unclipped, obj_clipped).masked_fill(~valid, 0.0)
+            clip_active = (obj_clipped < obj_unclipped) & valid
+        else:
+            raise ValueError(f"unknown loss_fn: {loss_fn!r}")
         # Optional prime-rl-style mismatch-KL anchor: penalize kl_tau * mean(log_ratio**2) over
-        # valid tokens, aggregated per-branch with the SAME denominator as weighted_logprobs (so
+        # valid tokens, aggregated per-branch with the SAME denominator as the policy objective (so
         # kl_tau means the same thing across token/sequence/prompt modes). Grad flows through
         # token_logprobs only (behavior_logprobs is detached). Mask to valid tokens because log_ratio
         # is not necessarily 0 at IGNORE positions (token_logprobs is, but behavior may not be).
         if kl_tau != 0.0:
             kl_per_token = (log_ratio * log_ratio).masked_fill(labels == IGNORE_INDEX, 0.0)
         if stats is not None:
-            # Off-policy drift diagnostics over valid (generated) tokens.
+            # Off-policy drift diagnostics over valid (generated) tokens. Loss-agnostic except
+            # is_clipped_count, which counts the tokens where THIS loss's clip is active.
             with torch.no_grad():
-                valid = labels != IGNORE_INDEX
                 raw_ratio = torch.exp(torch.clamp(log_ratio, max=20.0))
                 # Keep diagnostics on-device inside the microbatch loop. Converting these to
                 # Python scalars here forces a GPU sync for every microbatch.
                 stats["is_ratio_sum"] = ((raw_ratio * valid).sum()).detach()
-                stats["is_clipped_count"] = (((log_ratio > math.log(cispo_eps)) & valid).sum()).detach()
+                stats["is_clipped_count"] = (clip_active.sum()).detach()
                 stats["valid_tokens"] = valid.sum().detach()
                 # Train/infer mismatch diagnostics (vLLM bf16 behavior vs fp32 trainer recompute):
                 # Σ log_ratio gives the mean log-ratio drift; Σ w² (with Σ w = is_ratio_sum) gives the
@@ -1540,18 +1599,18 @@ def policy_gradient_loss_from_token_logprobs(
                 stats["is_ratio_sq_sum"] = (((raw_ratio * raw_ratio) * valid).sum()).detach()
     else:
         token_weight = advantage_weight              # (B, 1) broadcasts
-    weighted_logprobs = token_logprobs * token_weight
+        per_token_objective = token_logprobs * token_weight
     if prompt_lengths is not None:
         # ScaleRL prompt-level aggregation (ScaleRL §3.2, the J_ScaleRL objective): each
         # sample's token-summed loss is divided by its PROMPT GROUP's total valid-token count L_p
         # (prompt_lengths — the same value for every sample of a group), then averaged over the
         # prompts. prompt_lengths is computed over the FULL batch on rank 0 and carried per-sample,
         # so the result is correct even when a group is split across ranks/microbatches; the global
-        # prompt count P arrives via valid_sample_normalizer. token_logprobs are already 0 at
-        # IGNORE positions (token_logprobs_from_logits), so the per-sample sum spans valid tokens.
+        # prompt count P arrives via valid_sample_normalizer. per_token_objective is 0 at
+        # IGNORE positions (see the loss branches above), so the per-sample sum spans valid tokens.
         denom = prompt_lengths.to(token_logprobs.dtype).clamp(min=1.0)
         prompt_normalizer = labels.size(0) if valid_sample_normalizer is None else valid_sample_normalizer
-        pg_objective = (weighted_logprobs.sum(dim=-1) / denom).sum() / (prompt_normalizer * normalizer)
+        pg_objective = (per_token_objective.sum(dim=-1) / denom).sum() / (prompt_normalizer * normalizer)
         loss = -pg_objective
         if kl_per_token is not None:
             kl_objective = (kl_per_token.sum(dim=-1) / denom).sum() / (prompt_normalizer * normalizer)
@@ -1561,7 +1620,7 @@ def policy_gradient_loss_from_token_logprobs(
         valid_mask = labels != IGNORE_INDEX
         sample_lengths = valid_mask.sum(dim=-1).clamp(min=1).to(token_logprobs.dtype)
         sample_normalizer = labels.size(0) if valid_sample_normalizer is None else valid_sample_normalizer
-        pg_objective = (weighted_logprobs.sum(dim=-1) / sample_lengths).sum() / (sample_normalizer * normalizer)
+        pg_objective = (per_token_objective.sum(dim=-1) / sample_lengths).sum() / (sample_normalizer * normalizer)
         loss = -pg_objective
         if kl_per_token is not None:
             kl_objective = (kl_per_token.sum(dim=-1) / sample_lengths).sum() / (sample_normalizer * normalizer)
@@ -1569,7 +1628,7 @@ def policy_gradient_loss_from_token_logprobs(
         return loss
     valid_count = (labels != IGNORE_INDEX).sum().clamp(min=1)
     token_normalizer = valid_count if valid_token_normalizer is None else valid_token_normalizer
-    pg_objective = weighted_logprobs.sum() / (token_normalizer * normalizer)
+    pg_objective = per_token_objective.sum() / (token_normalizer * normalizer)
     loss = -pg_objective
     if kl_per_token is not None:
         kl_objective = kl_per_token.sum() / (token_normalizer * normalizer)
@@ -1577,21 +1636,23 @@ def policy_gradient_loss_from_token_logprobs(
     return loss
 
 
-def chunked_cispo_loss(model, input_ids, attention_mask, labels, advantages, *,
-                       behavior_logprobs=None, cispo_eps=None, chunk_size=1024,
-                       valid_token_normalizer=None, valid_sample_normalizer=None,
-                       normalizer=1.0, sequence_normalize=False, stats=None,
-                       autocast_dtype=None, prompt_lengths=None, kl_tau=0.0):
-    """Memory-efficient CISPO loss: run the base model to hidden states (small: B,T,H),
-    then apply the LM head + cross-entropy in checkpointed sequence chunks to avoid
-    materializing the full (T, vocab) fp32 logits. The head always runs in fp32; with
+def chunked_policy_loss(model, input_ids, attention_mask, labels, advantages, *,
+                        behavior_logprobs=None, loss_fn="cispo", cispo_eps=None,
+                        clip_eps_low=None, clip_eps_high=None, clip_ratio_c=None,
+                        chunk_size=1024,
+                        valid_token_normalizer=None, valid_sample_normalizer=None,
+                        normalizer=1.0, sequence_normalize=False, stats=None,
+                        autocast_dtype=None, prompt_lengths=None, kl_tau=0.0):
+    """Memory-efficient policy loss (cispo/grpo/gspo): run the base model to hidden states
+    (small: B,T,H), then apply the LM head + cross-entropy in checkpointed sequence chunks to
+    avoid materializing the full (T, vocab) fp32 logits. The head always runs in fp32; with
     autocast_dtype set, only the body forward is bf16 (halving activation memory). In the
     fp32 path (autocast_dtype=None) this equals computing the full logits in one shot and
     feeding them through policy_gradient_loss_from_token_logprobs."""
     base = getattr(model, "model", None)
     lm_head = getattr(model, "lm_head", None)
     if base is None or lm_head is None:
-        raise AttributeError("chunked_cispo_loss requires model.model + model.lm_head (HF CausalLM)")
+        raise AttributeError("chunked_policy_loss requires model.model + model.lm_head (HF CausalLM)")
     with torch.autocast(device_type=input_ids.device.type, dtype=autocast_dtype,
                         enabled=autocast_dtype is not None):
         outputs = base(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
@@ -1602,8 +1663,9 @@ def chunked_cispo_loss(model, input_ids, attention_mask, labels, advantages, *,
         valid_token_normalizer=valid_token_normalizer,
         valid_sample_normalizer=valid_sample_normalizer,
         normalizer=normalizer, sequence_normalize=sequence_normalize,
-        behavior_logprobs=behavior_logprobs, cispo_eps=cispo_eps, stats=stats,
-        prompt_lengths=prompt_lengths, kl_tau=kl_tau)
+        behavior_logprobs=behavior_logprobs, loss_fn=loss_fn, cispo_eps=cispo_eps,
+        clip_eps_low=clip_eps_low, clip_eps_high=clip_eps_high, clip_ratio_c=clip_ratio_c,
+        stats=stats, prompt_lengths=prompt_lengths, kl_tau=kl_tau)
 
 
 def batch_normalize_advantages(advantages: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -3632,9 +3694,11 @@ def run_pipeline(
                     torch.tensor([e.group_token_count for e in mb], dtype=torch.float32, device=device)
                     if prompt_mode else None
                 )
-                loss = chunked_cispo_loss(
+                loss = chunked_policy_loss(
                     model, input_ids, attention_mask, labels, my_adv[start:start + len(mb)],
-                    behavior_logprobs=beh, cispo_eps=args.cispo_eps, chunk_size=args.logits_chunk_size,
+                    behavior_logprobs=beh, loss_fn=args.loss_fn, cispo_eps=args.cispo_eps,
+                    clip_eps_low=args.clip_eps_low, clip_eps_high=args.clip_eps_high,
+                    clip_ratio_c=args.clip_ratio_c, chunk_size=args.logits_chunk_size,
                     valid_token_normalizer=global_token_count,
                     valid_sample_normalizer=(global_num_prompts if prompt_mode else global_sample_count),
                     normalizer=1.0,
@@ -3968,7 +4032,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-staleness", type=int, default=4,
                         help="Drop rollouts older than this many weight versions (PipelineRL-k)")
     parser.add_argument("--logits-chunk-size", type=int, default=1024,
-                        help="Sequence chunk size for the memory-efficient chunked LM-head CISPO loss. "
+                        help="Sequence chunk size for the memory-efficient chunked LM-head policy loss. "
                              "Larger values reduce LM-head loop overhead but increase fp32 logits memory; "
                              "the Modal recipe uses 2048 with --device-batch-size 2.")
     parser.add_argument("--train-autocast-dtype", choices=["none", "bfloat16"], default="bfloat16",
@@ -3979,8 +4043,28 @@ def build_parser() -> argparse.ArgumentParser:
                         help="After each optimizer step (first few steps), assert all trainer-rank "
                              "model replicas are bit-identical via an all-reduce MIN==MAX checksum. "
                              "Debug guard; small overhead. No-op at world_size==1.")
+    parser.add_argument("--loss-fn", choices=["cispo", "grpo", "gspo"], default="cispo",
+                        help="Policy loss. 'cispo' (default, record 1): stop-grad clipped IS weight times "
+                             "log-prob — clipped tokens keep a capped gradient. 'grpo': PPO-clip surrogate "
+                             "(gradient through the ratio; clipped tokens get ZERO gradient), DAPO = grpo + "
+                             "--clip-eps-high 0.28 + --loss-normalization token. 'gspo': length-normalized "
+                             "SEQUENCE-level IS ratio, clipped (use with --loss-normalization sequence). "
+                             "All ratios are vs the vLLM behavior logprobs (async off-policy, up to "
+                             "--max-staleness versions stale; there is no second 'old policy' forward), so "
+                             "the clip also absorbs the bf16-generator/fp32-trainer mismatch.")
     parser.add_argument("--cispo-eps", type=float, default=4.0,
                         help="CISPO upper clip epsilon_max for the importance weight")
+    parser.add_argument("--clip-eps-low", type=float, default=None,
+                        help="Lower clip epsilon for grpo/gspo (ratio floored at 1-eps_low). Default "
+                             "resolves per loss: grpo 0.2 (PPO/GRPO), gspo 3e-4 (the GSPO paper scale — "
+                             "the seq ratio is length-normalized, so eps is ~3 orders smaller).")
+    parser.add_argument("--clip-eps-high", type=float, default=None,
+                        help="Upper clip epsilon for grpo/gspo (ratio capped at 1+eps_high). Default "
+                             "resolves per loss: grpo 0.2 (DAPO clip-higher: 0.28), gspo 4e-4.")
+    parser.add_argument("--clip-ratio-c", type=float, default=3.0,
+                        help="Dual-clip PPO constant c (grpo only): for negative advantages the objective "
+                             "is floored at c*A so a large stale-token ratio can't dominate the gradient. "
+                             "Must be > 1. <= 0 disables dual-clip.")
     parser.add_argument("--kl-tau", type=float, default=0.0,
                         help="Optional prime-rl-style mismatch-KL anchor: adds kl_tau * mean(log_ratio**2) "
                              "over valid tokens, aggregated with the SAME per-prompt/per-sample/per-token "
@@ -4154,6 +4238,35 @@ _PIPELINE_MIN_ARGS = (
 )
 
 
+def _resolve_loss_args(args: argparse.Namespace) -> None:
+    """Resolve per-loss clip defaults (the PPO and GSPO epsilons differ by ~3 orders of
+    magnitude, so a shared default would be a footgun) and validate the combination.
+    Mutates args in place so the run-log header records the RESOLVED values."""
+    if args.clip_ratio_c is not None and args.clip_ratio_c <= 0:
+        args.clip_ratio_c = None  # documented disable switch
+    if args.loss_fn == "cispo":
+        if args.cispo_eps is None or args.cispo_eps <= 0:
+            raise ValueError("--cispo-eps must be positive for --loss-fn cispo")
+        return
+    if args.loss_fn == "grpo":
+        if args.clip_eps_low is None:
+            args.clip_eps_low = 0.2
+        if args.clip_eps_high is None:
+            args.clip_eps_high = 0.2
+        if args.clip_ratio_c is not None and args.clip_ratio_c <= 1.0:
+            raise ValueError("--clip-ratio-c must be > 1 (or <= 0 to disable dual-clip)")
+    elif args.loss_fn == "gspo":
+        if args.clip_eps_low is None:
+            args.clip_eps_low = 3e-4
+        if args.clip_eps_high is None:
+            args.clip_eps_high = 4e-4
+        args.clip_ratio_c = None  # dual-clip is a grpo-only mechanism
+    if not (0.0 < args.clip_eps_low < 1.0):
+        raise ValueError("--clip-eps-low must be in (0, 1)")
+    if args.clip_eps_high <= 0.0:
+        raise ValueError("--clip-eps-high must be positive")
+
+
 def _validate_pipeline_args(args: argparse.Namespace) -> None:
     """Bounds checks for a TRAINING launch (the eval-only/verify-only paths skip these)."""
     for attr, minimum, requirement in _PIPELINE_MIN_ARGS:
@@ -4195,6 +4308,7 @@ def main(argv: list[str] | None = None) -> None:
     # passed on the CLI comes AFTER and overrides its recipe value (argparse last-wins).
     args = parser.parse_args([*RECIPE, *cli])
     _validate_sampling_args(args)
+    _resolve_loss_args(args)
 
     if args.eval_only:
         run_standalone_eval(args)
