@@ -10,7 +10,7 @@ Motivation: A lot of LLM RL papers don't reproduce and there are many high-varia
 
 | # | Record time | Description | Date | Log | pass@1 | Contributors |
 | - | - | - | - | - | - | - |
-| 1 | TBD | TBD | TBD | TBD | TBD | TBD |
+| 1 | 1:45:39 | [ScaleRL](https://arxiv.org/abs/2510.13786)-like: CISPO, LR 8e-7 annealed to 1.2e-7 | 2026-06-11 | [records/2026-06-11_01](records/2026-06-11_01_cispo/) | 0.558 (3 seeds, p=0.006 vs 0.50) | @JeanKaddour |
 
 Each record links its full training log (script source, environment attestation, per-step record clock, final-checkpoint stamp); the eval JSON and verification-run logs live in the same [`records/`](records/) directory.
 
