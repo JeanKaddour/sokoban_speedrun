@@ -143,12 +143,14 @@ def _last_bool_flag(args: list[str], enabled_flag: str, disabled_flag: str, defa
 
 def _needs_periodic_volume_commit(speedrun_args: list[str]) -> bool:
     """Only commit every minute when the run is actually writing mid-run artifacts."""
-    # The recipe baseline (now in speedrun.py) writes no mid-run artifacts (--save-every 0,
-    # --no-save-rollouts), so these defaults match it; we only commit periodically if EXTRA_ARGS
-    # overrides them. speedrun_args no longer carries the recipe, just --run/--max-steps/EXTRA_ARGS.
+    # The rollout STREAM is on by default (speedrun.py: --save-rollouts + --rollout-flush-every 10;
+    # batched ~6MB gzip appends, not the old per-group small writes): without periodic commits a
+    # hard container death would discard everything since the last commit, defeating the stream's
+    # keep-logs-on-premature-stop purpose. Defaults here must mirror speedrun.py's argparse defaults.
     save_every = int(_last_arg_value(speedrun_args, "--save-every", "0") or "0")
-    save_rollouts = _last_bool_flag(speedrun_args, "--save-rollouts", "--no-save-rollouts", False)
-    return save_every > 0 or save_rollouts
+    save_rollouts = _last_bool_flag(speedrun_args, "--save-rollouts", "--no-save-rollouts", True)
+    flush_every = int(_last_arg_value(speedrun_args, "--rollout-flush-every", "10") or "0")
+    return save_every > 0 or (save_rollouts and flush_every > 0)
 
 
 @app.function(
@@ -257,7 +259,7 @@ def _parse_seeds(spec: str) -> list[int]:
 
 
 def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: list[int],
-                  target: float = 0.55, eval_max_tokens: int = 32768, eval_max_model_len: int = 36864,
+                  target: float = 0.50, eval_max_tokens: int = 12288, eval_max_model_len: int = 16384,
                   interruption: bool = True, interrupt_answer_tokens: int = 512,
                   eval_gpu_mem_util: float = 0.9, eval_vllm_max_num_batched_tokens: int = 40960,
                   eval_vllm_max_num_seqs: int = 16, eval_concurrency: int = 16) -> list[list[str]]:
@@ -320,7 +322,7 @@ def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds
     secrets=runtime_secrets,
 )
 def evaluate(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: str = "12345",
-             target: float = 0.55, eval_max_tokens: int = 32768, eval_max_model_len: int = 36864,
+             target: float = 0.50, eval_max_tokens: int = 12288, eval_max_model_len: int = 16384,
              interruption: bool = True, eval_gpu_mem_util: float = 0.9,
              eval_vllm_max_num_batched_tokens: int = 40960,
              eval_vllm_max_num_seqs: int = 16, eval_concurrency: int = 16) -> None:
@@ -440,20 +442,20 @@ def main() -> None:
         return
     # Eval mode: EVAL_CHECKPOINT=<vol path or HF id> modal run --detach modal_app.py
     # Record mode: EVAL_CHECKPOINT="ckptA,ckptB,..." (one final checkpoint per training seed) runs
-    # the whole record eval + significance verdict in one call; EVAL_TARGET sets the bar (default = the leaderboard TARGET, 0.55).
+    # the whole record eval + significance verdict in one call; EVAL_TARGET sets the bar (default = the leaderboard TARGET, 0.50).
     eval_ckpt = os.environ.get("EVAL_CHECKPOINT")
     if eval_ckpt:
         k = int(os.environ.get("EVAL_K", "16"))
         eval_limit = int(os.environ.get("EVAL_LIMIT", "0"))  # 0 = full eval set; >0 = first N (cheap dev)
         seeds = ",".join(str(s) for s in _parse_seeds(os.environ.get("EVAL_SEEDS", "12345")))
-        target = float(os.environ.get("EVAL_TARGET", "0.55"))
-        eval_max_tokens = int(os.environ.get("EVAL_MAX_TOKENS", "32768"))
-        eval_max_model_len = int(os.environ.get("EVAL_MAX_MODEL_LEN", "36864"))
+        target = float(os.environ.get("EVAL_TARGET", "0.50"))
+        eval_max_tokens = int(os.environ.get("EVAL_MAX_TOKENS", "12288"))
+        eval_max_model_len = int(os.environ.get("EVAL_MAX_MODEL_LEN", "16384"))
         eval_interruption = os.environ.get("EVAL_INTERRUPTION", "1") not in ("0", "false", "False", "")
         eval_gpu_mem_util = float(os.environ.get("EVAL_GPU_MEM_UTIL", "0.9"))
         eval_vllm_max_num_batched_tokens = int(os.environ.get("EVAL_VLLM_MAX_NUM_BATCHED_TOKENS", "40960"))
-        eval_vllm_max_num_seqs = int(os.environ.get("EVAL_VLLM_MAX_NUM_SEQS", "16"))
-        eval_concurrency = int(os.environ.get("EVAL_CONCURRENCY", "16"))
+        eval_vllm_max_num_seqs = int(os.environ.get("EVAL_VLLM_MAX_NUM_SEQS", "32"))
+        eval_concurrency = int(os.environ.get("EVAL_CONCURRENCY", "32"))
         run_name = os.environ.get("RUN_NAME") or f"sokoban-eval-{datetime.now():%Y%m%d-%H%M%S}"
         print(f"Running eval: ckpt={eval_ckpt}, run={run_name}, k={k}, limit={eval_limit}, "
               f"seeds=[{seeds}], target={target}, max_tokens={eval_max_tokens}, "

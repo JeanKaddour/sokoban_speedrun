@@ -2486,8 +2486,6 @@ class CollectStats:
     samples_length_trunc_unfiltered: int = 0
     samples_interrupted_total: int = 0           # forced-answer marker survived into the scored sequence
     samples_interrupted_answered_total: int = 0  # ... and the sample still produced a parseable answer
-    band_samples_seen: dict[str, int] = field(default_factory=dict)    # per difficulty band (metadata)
-    band_samples_solved: dict[str, int] = field(default_factory=dict)
     groups_any_solved_total: int = 0
     gen_tokens_total: int = 0
     prefill_tokens_total: int = 0
@@ -2840,7 +2838,6 @@ def run_pipeline(
     current_version = 0
     puzzles: dict[int, dict] = {}
     next_puzzle_id = 0
-    train_bands: list[str] = []  # pid % len -> difficulty band (dataset metadata); rank-0, for per-band metrics
     # FIFO reorder state: results arrive in completion order, but training consumes groups in
     # strict dataset-file order (the published ordering IS the curriculum; completion-order
     # consumption biased early steps toward fast-finishing easy groups — the cold-start reward
@@ -2918,7 +2915,7 @@ def run_pipeline(
         next_puzzle_id += 1
 
     def _rank0_setup() -> None:
-        nonlocal train_prompt_cache, train_bands
+        nonlocal train_prompt_cache
         nonlocal child, wsync, prompt_q, result_q, control_q, status_q
         nonlocal wandb_run, model_perf_info, rollout_stream_q, rollout_stream_thread, inloop_eval
         # Rendezvous steps (2)-(4); see the two-NCCL-group invariant above. All of this runs on
@@ -2929,7 +2926,6 @@ def run_pipeline(
         # --- (2) spawn the vLLM child on GPUs T..T+M-1 ---
         layout = pipeline_trainer_layout(ddp_world_size, vllm_dp)
         train_prompt_cache = build_prompt_cache(train_task, tokenizer, args.enable_thinking)
-        train_bands = [ex["metadata"].get("band", "?") for ex in train_task.examples]
         max_train_prompt_len = max(entry.prefix_length for entry in train_prompt_cache)
         print0(
             f"Precomputed train prompt cache: {len(train_prompt_cache)} prompts "
@@ -3160,10 +3156,6 @@ def run_pipeline(
             cs.samples_interrupted_total += sum(interrupted)
             cs.samples_interrupted_answered_total += sum(
                 1 for s, was in zip(processed_samples, interrupted) if was and s.moves is not None)
-            band = train_bands[pid % len(train_bands)] if train_bands else "?"
-            cs.band_samples_seen[band] = cs.band_samples_seen.get(band, 0) + len(rewards)
-            cs.band_samples_solved[band] = (
-                cs.band_samples_solved.get(band, 0) + sum(1 for r in rewards if r == 1.0))
             is_zero_var = args.zero_variance_filter and not group_has_signal(rewards)
             t_log_start = time.monotonic()
             if rollout_stream_q is not None:
@@ -3324,11 +3316,6 @@ def run_pipeline(
             **({"reward/answered_given_interrupted":
                 cs.samples_interrupted_answered_total / cs.samples_interrupted_total}
                if cs.samples_interrupted_total else {}),
-            # Online solve rate split by curriculum band, so curriculum position never reads as
-            # policy regression (a late-run dip in the aggregate is invisible per band).
-            **{f"reward/online_solved_frac_band/{b}":
-               cs.band_samples_solved.get(b, 0) / max(1, n)
-               for b, n in sorted(cs.band_samples_seen.items())},
             "staleness/mean": sum(cs.staleness) / max(1, len(cs.staleness)),
             "staleness/max": (max(cs.staleness) if cs.staleness else 0),
             **{f"time/{name}_s": value for name, value in times.items()},
@@ -4053,7 +4040,7 @@ def build_parser() -> argparse.ArgumentParser:
                              "Pass one final checkpoint per training seed to run the full record eval: "
                              "each is evaluated under the same protocol, then the significance test "
                              "(mean pass@1 > --eval-target at --eval-alpha) prints a PASS/FAIL verdict.")
-    parser.add_argument("--eval-target", type=float, default=0.55,
+    parser.add_argument("--eval-target", type=float, default=0.50,
                         help="Leaderboard TARGET: the pass@1 a record must clear (see README rules).")
     parser.add_argument("--eval-alpha", type=float, default=0.01,
                         help="Significance level for the record t-test (multi-checkpoint eval).")

@@ -1,6 +1,6 @@
 # Sokoban Speedrun
 
-Goal: the fastest recipe to RL [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B) up to a **0.55 pass@1** solve-rate on held-out Sokoban puzzles, using a single 8xH100 node.
+Goal: the fastest recipe to RL [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B) up to a **0.50 pass@1** solve-rate on held-out Sokoban puzzles, using a single 8xH100 node.
 
 Sokoban: If you don't know it, the best way to familiarize yourself with it is [to play it here](https://www.jeankaddour.com/sokoban).
 
@@ -10,14 +10,14 @@ Motivation: A lot of LLM RL papers don't reproduce and there are many high-varia
 
 | # | Record time | Description | Date | Log | pass@1 | Contributors |
 | - | - | - | - | - | - | - |
-| 1 | TBD | [ScaleRL](https://arxiv.org/abs/2510.13786)-like (CISPO, annealed LR) | TBD | TBD | TBD | @JeanKaddour |
+| 1 | TBD | TBD | TBD | TBD | TBD | TBD |
 
 Each record links its full training log (script source, environment attestation, per-step record clock, final-checkpoint stamp); the eval JSON and verification-run logs live in the same [`records/`](records/) directory.
 
 # Rules
 
-- **TARGET**: pass@1 > **0.55** on the held-out eval set [`datasets/sokoban_eval.jsonl`](datasets/sokoban_eval.jsonl) (256 puzzles). The submission must clear it via lower 95% bootstrap CI.
-- **Eval protocol**: sample k=16 completions per puzzle to estimate per-sample pass@1 (pass@16 is reported separately), with a 32,768-token budget, interruption answer-forcing, temperature 0.8 / top-p 0.95, and eval seed 12345.
+- **TARGET**: pass@1 > **0.50** on the held-out eval set [`datasets/sokoban_eval.jsonl`](datasets/sokoban_eval.jsonl) (384 puzzles). The submission must clear it via lower 95% bootstrap CI.
+- **Eval protocol**: sample k=16 completions per puzzle to estimate per-sample pass@1 (pass@16 is reported separately), with a 12,288-token budget, interruption answer-forcing, temperature 0.8 / top-p 0.95, and eval seed 12345.
 - **Record time** = the run log's record clock: it starts at training step 1 and ends when the final checkpoint finishes writing. Startup (model load, engine build) is untimed.
 - **Fixed**: the base model (Qwen3-4B), the training set [`datasets/sokoban_train.jsonl`](datasets/sokoban_train.jsonl) (10,000 puzzles, consumed in file order), the eval set.
 - **Changeable**: RL algorithm, loss function, schedules, training/inference engine, parallelism, dataset-agnostic auxiliary rewards (e.g. entropy or uncertainty proxies), and the prompt, as long as the changes do not add Sokoban-specific solving knowledge (see FAQ).
@@ -25,10 +25,9 @@ Each record links its full training log (script source, environment attestation,
 
 ## Submitting a record
 
-1. Train with your recipe; keep the run log (`outputs/<run>/log_*.txt`) and the final checkpoint.
-2. Run the eval command above on the final checkpoint.
-3. Open a PR adding `records/<date>_<nn>_<name>/` with your training log + eval JSON, plus a row in the table.
-4. Records are verified by an independent rerun of the recipe before merging.
+1. Train with your recipe, then run the eval on the final checkpoint. All artifacts are written automatically: run log, `final_rollouts.jsonl.gz`, eval JSON + eval rollouts.
+2. Run `python make_record_report.py records/<your-dir>` to generate the standard plots and the per-record README (artifact-only; add `--wandb-runs` for richer panels), write its `Idea` section, then open a PR adding the directory plus a row in the table.
+3. The PR must pass `python verify_record.py records/<your-dir>` (offline re-scoring of every eval completion + health checks); records are then verified by an independent rerun before merging.
 
 # How it works
 
@@ -77,7 +76,7 @@ EVAL_CHECKPOINT=/vol/outputs/<run>/step_NNNNNN modal run modal_app.py
 
 ## Why Sokoban?
 
-* The base model pass@1 is 21.8%.
+* The base model pass@1 is 14.0%.
 * Small contamination risk: We generate fresh puzzles, so unlike eg. GSM8k there is less risk the base model has memorized them.
 * Simple enough to yield RL gains in `O(10)` GPU hours.
 * Hard enough for gains to be meaningful: Sokoban is PSPACE-complete and can't be brute-forced; it requires genuine reasoning capabilities.
@@ -86,7 +85,8 @@ EVAL_CHECKPOINT=/vol/outputs/<run>/step_NNNNNN modal run modal_app.py
 
 ## Why is the training set ordered?
 
-- The file ordering is a built-in curriculum: easy 1-box puzzles ignite learning, a probabilistic ramp hands over to 2-box puzzles by row 2,000, and a harder tail (2–3 boxes, 9–14 moves) provides frontier difficulty for longer runs. 
+- The ordering follows a curriculum: difficulty ramps continuously from short 2-box puzzles to longer-solution and 2–3-box ones, paced so a ~100-step run stays in the high-signal regime. 
+- The exact schedule lives in [`datasets/generate_sokoban_datasets.py`](datasets/generate_sokoban_datasets.py).
 - Every recipe should train on the same puzzle sequence, so records differ by algorithm and systems, not data shuffling.
 - Dynamic filtering is part of the algorithm and remains fair game, e.g. the zero-variance filter in DAPO.  
 

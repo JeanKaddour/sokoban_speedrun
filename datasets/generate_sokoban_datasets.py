@@ -190,27 +190,48 @@ def run_verification(train_output: Path, eval_output: Path) -> None:
 # published files must be reproducible exactly, so there are no CLI knobs for the mix.
 #
 #
-# Train layout (TRAIN_SIZE rows):
-#   rows [0, IGNITION):           easy only — high mixed fraction from step 0, short
-#                                 rollouts -> fast steps while LR is at peak
-#   rows [IGNITION, RAMP_END):    seeded interleave, P(stable) ramps RAMP_P0 -> RAMP_P1
-#   rows [RAMP_END, TRAIN_SIZE):  core: stable / stretch (2-3 box, >=9 moves) mix for
-#                                 future longer/faster record attempts
+# Train layout (TRAIN_SIZE rows) — mixture probabilities are piecewise-linear and
+# CONTINUOUS at every phase boundary. The previous layout had a double cliff at row
+# 2,000 (P(stable) 0.80 -> 1.0 and stretch 0 -> 20% in one row); crossing it measurably
+# sagged online solve (~0.62 -> 0.53) and tripled all-fail group waste (rollout-fitted
+# per-band rates: at first contact the 11-14-move stretch half solves at ~0.2-0.3).
+#
+#   rows [0, IGNITION):                 ignite only (2-box 4-6 movers, base solve ~0.29):
+#                                       variance-rich AND on the eval distribution from step 0
+#   rows [IGNITION, HANDOVER_END):      P(stable) ramps RAMP_P0 -> 1.0; ignite is FULLY retired
+#                                       at the boundary
+#   rows [HANDOVER_END, STRETCH_RAMP_END): P(stretch) ramps 0 -> CORE_P_STRETCH and
+#                                       P(stable_long) ramps 0 -> CORE_P_LONG (frontier and the
+#                                       eval's 11+ bucket blend in as skill grows, never as a step)
+#   rows [STRETCH_RAMP_END, LATE_RAMP_START): hold at CORE_P_STRETCH / CORE_P_LONG
+#   rows [LATE_RAMP_START, TRAIN_SIZE): P(stretch) ramps to LATE_P_STRETCH — keeps per-group
+#                                       reward variance alive for long runs that saturate stable
 #
 # Eval layout (EVAL_SIZE rows): 2-box stable-band buckets by reference move count, shares
 # calibrated so base pass@1 ~0.15 and the trained ceiling (ckpt-C pass@16) is ~0.9.
+# (The eval build is independent of the train schedule: changing the constants below
+# cannot move a single eval row.)
 #
 # All seeds are fixed; the output is deterministic. reasoning_gym streams puzzles per-item
 # as ~(seed+index), so band seeds are spaced 1M+ apart and the eval is additionally made
 # disjoint from train by an explicit gamestr exclude filter (shared across all pools).
 
 TRAIN_SIZE = 10_000
-EVAL_SIZE = 256
+EVAL_SIZE = 384
 
-IGNITION = 500       # rows of pure easy at the head of the file
-RAMP_END = 2_000     # interleave ends here; ~the horizon of a 1-hour run
-RAMP_P0, RAMP_P1 = 0.10, 0.80   # P(stable) at the start/end of the ramp
-CORE_P_STRETCH = 0.20           # stretch share in rows [RAMP_END, TRAIN_SIZE)
+# Pacing is calibrated to the ~100-step record horizon (a 100-step run consumes ~2,300 rows
+# at ~23 accepted-groups-and-rejects per step): pure 2-box training must arrive with enough
+# steps left to matter. v6 (handover at 2,200 = step ~95) spent steps 45-65 on ~50% easy rows
+# it already solved at 0.66-0.73 and reached pure stable 5 steps before eval — pass@1 0.570 vs
+# v5's 0.616. This pacing gives ~35 pure-stable steps + ~16% stretch by step 100 (the eval's
+# 9+-move buckets are 30% of puzzles) while keeping every transition continuous.
+IGNITION = 300            # rows of pure easy at the head of the file (~13 steps; LR warmup is 5)
+HANDOVER_END = 1_500      # P(stable) reaches 1.0 here (~step 65 of a record run)
+RAMP_P0 = 0.10            # P(stable) at the start of the handover ramp
+STRETCH_RAMP_END = 2_500  # P(stretch) reaches CORE_P_STRETCH here
+CORE_P_STRETCH = 0.20     # stretch share in the core plateau
+LATE_RAMP_START = 6_000   # late frontier ramp starts here ...
+LATE_P_STRETCH = 0.35     # ... ending at this stretch share by the end of the file
 
 ASSEMBLY_SEED = 0x50C0BA  # rng for the interleave + eval shuffle
 
@@ -233,11 +254,18 @@ class Band:
 # Train bands. Seeds are >=1M apart (reasoning_gym streams ~(seed+index) per item).
 # max_depth bounds the generator's search, NOT the solution length (depth-8 emits some
 # 9-10 move solutions), so the probed band envelopes need explicit max_moves caps.
-EASY = Band("easy", seed=42, min_boxes=1, max_boxes=1, max_depth=8, min_moves=3, max_moves=8)
+# IGNITE replaced the old 1-box easy band: 2-box 4-6-movers solve at ~0.29 base — already in
+# the variance sweet band at cold start — so every ignition gradient is on the eval
+# distribution instead of a 1-box scaffold that gets retired anyway.
+# STABLE_LONG covers the eval's 9-10/11+ buckets in-distribution (2-box, small boards);
+# stretch alone confounded longer solutions with 3-box/8x8 transfer.
+IGNITE = Band("ignite", seed=42, min_boxes=2, max_boxes=2, max_depth=8, min_moves=4, max_moves=6)
 STABLE = Band("stable", seed=1_000_000, min_boxes=2, max_boxes=2, max_depth=10, min_moves=4,
               max_moves=10)
 STRETCH = Band("stretch", seed=2_000_000, min_boxes=2, max_boxes=3, max_depth=12,
                max_w=8, max_h=8, min_moves=9)
+STABLE_LONG = Band("stable_long", seed=3_000_000, min_boxes=2, max_boxes=2, max_depth=16,
+                   min_moves=11, max_moves=16)
 
 # Eval bands (far seeds; additionally excluded from train by construction).
 EVAL_CORE = Band("eval_core", seed=10_000_000, min_boxes=2, max_boxes=2, max_depth=10,
@@ -246,10 +274,12 @@ EVAL_HEADROOM = Band("eval_headroom", seed=11_000_000, min_boxes=2, max_boxes=2,
                      max_depth=12, min_moves=11)
 
 # Eval bucket shares (by reference move count), n=EVAL_SIZE total.
-# Calibration (strict protocol, k=16): base pass@1 / ckpt-C pass@16 per 2-box bucket:
-#   5-6: 0.29 / 0.98   7-8: 0.11 / 0.89   9-10: 0.06 / 0.87   11+: 0.05 / 0.60
-# Measured on the built eval: base pass@1 0.140, trained pass@16 0.906 strict / 0.969 generous.
-EVAL_SHARES = {"5-6": 77, "7-8": 102, "9-10": 64, "11+": 13}
+# Calibration: base pass@1 per 2-box bucket (probed): 5-6: 0.29  7-8: 0.11  9-10: 0.06  11+: 0.05.
+# v6-recipe (100 steps, 2026-06-10) per-bucket pass@1 / pass@16, measured from eval rollouts:
+#   5-6: 0.734/0.961   7-8: 0.567/0.951   9-10: 0.415/0.922   11+: 0.375/0.923
+# These shares weight the hard buckets (where future records differentiate) while projecting
+# base ~0.141 and current-recipe pass@1 ~0.553 — comfortably above the 0.50 TARGET, ceiling ~0.94.
+EVAL_SHARES = {"5-6": 108, "7-8": 132, "9-10": 104, "11+": 40}
 
 
 def bucket_of(moves: int) -> str:
@@ -349,50 +379,71 @@ def build_official_eval(exclude: set[str]) -> list[dict[str, Any]]:
                 need_by_bucket[bucket] -= 1
             offset += chunk
 
-    drain(EVAL_CORE, {"5-6", "7-8", "9-10"}, max_candidates=60_000)
+    drain(EVAL_CORE, {"5-6", "7-8", "9-10"}, max_candidates=120_000)
     if EVAL_SHARES.get("11+", 0) > 0:
-        drain(EVAL_HEADROOM, {"11+"}, max_candidates=60_000)
+        drain(EVAL_HEADROOM, {"11+"}, max_candidates=200_000)  # 11+ movers are rare in-stream
     rng = random.Random(ASSEMBLY_SEED)
     rng.shuffle(picked)  # so --eval-limit subsets stay representative
     return picked
 
 
-def assemble_official_train(easy: list, stable: list, stretch: list) -> list[dict[str, Any]]:
-    rng = random.Random(ASSEMBLY_SEED + 1)
-    easy_it, stable_it, stretch_it = iter(easy), iter(stable), iter(stretch)
-    rows: list[dict[str, Any]] = []
-    for _ in range(IGNITION):
-        rows.append(next(easy_it))
-    ramp_n = RAMP_END - IGNITION
-    for i in range(ramp_n):
-        p_stable = RAMP_P0 + (RAMP_P1 - RAMP_P0) * (i / max(1, ramp_n - 1))
-        rows.append(next(stable_it) if rng.random() < p_stable else next(easy_it))
-    for _ in range(TRAIN_SIZE - RAMP_END):
-        rows.append(next(stretch_it) if rng.random() < CORE_P_STRETCH else next(stable_it))
-    return rows
+CORE_P_LONG = 0.08        # stable_long share: ramps 0 -> this over [HANDOVER_END, STRETCH_RAMP_END),
+                          # then holds — direct in-distribution coverage of the eval's 11+ bucket
+
+TRAIN_BAND_NAMES = ("ignite", "stable", "stretch", "stable_long")
 
 
-def official_pool_needs(seed: int = ASSEMBLY_SEED + 1) -> dict[str, int]:
-    """Dry-run the assembly rng to compute exact per-band counts."""
-    rng = random.Random(seed)
-    counts = {"easy": IGNITION, "stable": 0, "stretch": 0}
-    ramp_n = RAMP_END - IGNITION
-    for i in range(ramp_n):
-        p_stable = RAMP_P0 + (RAMP_P1 - RAMP_P0) * (i / max(1, ramp_n - 1))
-        counts["stable" if rng.random() < p_stable else "easy"] += 1
-    for _ in range(TRAIN_SIZE - RAMP_END):
-        counts["stretch" if rng.random() < CORE_P_STRETCH else "stable"] += 1
-    return counts
+def band_schedule(rng: random.Random) -> list[str]:
+    """One band name per train row — the SINGLE definition of the curriculum ordering.
+
+    Both pool sizing and assembly consume this (same seed => same draws), so the two can
+    never drift apart. Mixture probabilities are piecewise-linear and continuous at every
+    boundary; see the layout comment above for why cliffs are forbidden."""
+    names: list[str] = []
+    for i in range(TRAIN_SIZE):
+        if i < IGNITION:
+            names.append("ignite")
+        elif i < HANDOVER_END:
+            f = (i - IGNITION) / max(1, HANDOVER_END - 1 - IGNITION)
+            p_stable = RAMP_P0 + (1.0 - RAMP_P0) * f
+            names.append("stable" if rng.random() < p_stable else "ignite")
+        else:
+            if i < STRETCH_RAMP_END:
+                g = (i - HANDOVER_END) / max(1, STRETCH_RAMP_END - HANDOVER_END)
+                p_str, p_long = CORE_P_STRETCH * g, CORE_P_LONG * g
+            elif i < LATE_RAMP_START:
+                p_str, p_long = CORE_P_STRETCH, CORE_P_LONG
+            else:
+                p_str = CORE_P_STRETCH + (LATE_P_STRETCH - CORE_P_STRETCH) * (
+                    (i - LATE_RAMP_START) / max(1, TRAIN_SIZE - 1 - LATE_RAMP_START))
+                p_long = CORE_P_LONG
+            u = rng.random()
+            names.append("stretch" if u < p_str
+                         else "stable_long" if u < p_str + p_long
+                         else "stable")
+    return names
+
+
+def assemble_official_train(pools_by_band: dict[str, list]) -> list[dict[str, Any]]:
+    pools = {name: iter(pool) for name, pool in pools_by_band.items()}
+    return [next(pools[name]) for name in band_schedule(random.Random(ASSEMBLY_SEED + 1))]
+
+
+def official_pool_needs() -> dict[str, int]:
+    """Dry-run the schedule rng to compute exact per-band counts."""
+    from collections import Counter
+    counts = Counter(band_schedule(random.Random(ASSEMBLY_SEED + 1)))
+    return {name: counts[name] for name in TRAIN_BAND_NAMES}
 
 
 def summarize_official(name: str, rows: list[dict[str, Any]]) -> None:
     from collections import Counter
     buckets = Counter(bucket_of(reference_move_count(e)) for e in rows)
     bands = Counter(e["metadata"]["band"] for e in rows)
-    head = Counter(e["metadata"]["band"] for e in rows[:RAMP_END]) if name == "train" else None
+    head = Counter(e["metadata"]["band"] for e in rows[:HANDOVER_END]) if name == "train" else None
     print(f"{name}: n={len(rows)} buckets={dict(sorted(buckets.items()))} "
           f"bands={dict(sorted(bands.items()))}"
-          + (f" first{RAMP_END}={dict(sorted(head.items()))}" if head else ""), flush=True)
+          + (f" first{HANDOVER_END}={dict(sorted(head.items()))}" if head else ""), flush=True)
 
 
 def build_official_mix(args: argparse.Namespace) -> None:
@@ -413,10 +464,15 @@ def build_official_mix(args: argparse.Namespace) -> None:
 
     needs = official_pool_needs()
     print(f"train pool needs: {needs}", flush=True)
-    easy = generate_band_pool(EASY, needs["easy"], exclude=seen)
-    stable = generate_band_pool(STABLE, needs["stable"], exclude=seen)
-    stretch = generate_band_pool(STRETCH, needs["stretch"], exclude=seen)
-    train_rows = assemble_official_train(easy, stable, stretch)
+    pools = {
+        "ignite": generate_band_pool(IGNITE, needs["ignite"], exclude=seen),
+        "stable": generate_band_pool(STABLE, needs["stable"], exclude=seen),
+        "stretch": generate_band_pool(STRETCH, needs["stretch"], exclude=seen),
+        # 11-16-move 2-box puzzles are rare in the generator stream; give the drain headroom.
+        "stable_long": generate_band_pool(STABLE_LONG, needs["stable_long"], exclude=seen,
+                                          max_candidates=600_000),
+    }
+    train_rows = assemble_official_train(pools)
     if len(train_rows) != TRAIN_SIZE:
         raise AssertionError(f"assembled {len(train_rows)} train rows, want {TRAIN_SIZE}")
     summarize_official("train", train_rows)
