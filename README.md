@@ -76,11 +76,16 @@ EVAL_CHECKPOINT=/vol/outputs/<run>/step_NNNNNN modal run modal_app.py
 
 ## Why Sokoban?
 
-* The base model pass@1 is 14.0%.
 * Small contamination risk: We generate fresh puzzles, so unlike eg. GSM8k there is less risk the base model has memorized them.
 * Simple enough to yield RL gains in `O(10)` GPU hours.
 * Hard enough for gains to be meaningful: Sokoban is PSPACE-complete and can't be brute-forced; it requires genuine reasoning capabilities.
 * Naturally disincentivizes entropy collapse, as puzzles naturally permit multiple solutions.
+
+## Why Qwen3-4B?
+
+- Its base pass@1 is 14.0%.
+- It got released around the same time as [ReasoningGym](https://arxiv.org/abs/2505.24760) (which includes Sokoban), so it is unlikely to have been trained on it.
+- In my (Jean's) experience, 4B seems just large enough for the model to elicit meaningful CoT traces, which are necessary for RL.  
 
 
 ## Why is the training set ordered?
