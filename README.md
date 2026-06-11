@@ -1,6 +1,6 @@
 # Sokoban Speedrun
 
-Goal: the fastest recipe to RL [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B) up to a **0.50 pass@1** solve-rate on held-out Sokoban puzzles, using a single 8xH100 node.
+Goal: the fastest recipe to RL [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B) from 14% to 50% pass@1 solve-rate on Sokoban puzzles, using a single 8xH100 node.
 
 Sokoban: If you don't know it, the best way to familiarize yourself with it is [to play it here](https://www.jeankaddour.com/sokoban).
 
