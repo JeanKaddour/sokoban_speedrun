@@ -34,11 +34,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 IGNORE_INDEX = -100
-# One node; trainers + vLLM generators must fit within it. Default is the benchmark's 8xH100;
-# the env override supports smaller boxes (e.g. NODE_GPUS=4 with a smaller model). modal_app.py
-# bakes the launch-time GPU allocation into the container env so this always matches the GPUs
-# actually present.
-NODE_GPUS = int(os.environ.get("NODE_GPUS", "8"))
+# One node; trainers + vLLM generators must fit within it. Default is the benchmark's 4xH100;
+# the env override supports other box sizes (e.g. NODE_GPUS=8). modal_app.py bakes the launch-time
+# GPU allocation into the container env so this always matches the GPUs actually present.
+NODE_GPUS = int(os.environ.get("NODE_GPUS", "4"))
 # Interruption-based length control (ScaleRL A.10): appended to a still-thinking rollout that hit the
 # generation cap, to force it to stop reasoning and emit a final answer instead of hard-truncating to 0.
 # Ends with the OPEN <answer> tag: without it, models spend the whole forced-answer budget on a prose
@@ -81,10 +80,10 @@ EVAL_PID_BASE = 1_000_000_000
 # the recipe and therefore OVERRIDES the recipe value (argparse last-wins). --run and --max-steps are
 # deliberately NOT here (they vary per launch). Eval-only invocations also get the recipe prepended,
 # so --eval-data below is also the eval set --eval-only scores against unless overridden.
-# TRAINER COUNT: the canonical sprint runs NTRAINERS=3 (3 trainer ranks + 5 vLLM) — the trainer-bound
-# sweet spot (measured at inflight 96; still trainer-bound at the FIFO ticket budget of 64, which only
-# shrinks finished-inventory, not generation concurrency), ~30% faster per step than 2 trainers. That is a torchrun launch param,
-# NOT a speedrun CLI arg, so it is pinned as the default in modal_app.py (NTRAINERS=3), not in this list.
+# TRAINER COUNT: the 1.7B/4xH100 setup runs NTRAINERS=1 (1 trainer rank + 3 vLLM generators) —
+# the trainer is token-compute-bound here and a 2nd trainer starves generation (measured: collect
+# time blows up). That is a torchrun launch param, NOT a speedrun CLI arg, so modal_app.py defaults
+# it from the GPU count (1 on <8-GPU boxes, 3 on the legacy 8-GPU node), not in this list.
 RECIPE = [
     "--dtype", "float32",       # load trainer params/head fp32; train autocast runs body bf16, head/logits fp32
     "--train-data", "datasets/sokoban_train.jsonl",
@@ -95,12 +94,12 @@ RECIPE = [
     "--top-p", "0.95",
     "--max-new-tokens", "5632",
     "--max-model-len", "7168",
-    "--device-batch-size", "2",
+    "--device-batch-size", "4",
     "--logits-chunk-size", "2048",
     "--gradient-checkpointing",
     "--interruption",
     "--interrupt-answer-tokens", "512",
-    "--learning-rate", "8e-7",
+    "--learning-rate", "1.6e-6",
     "--init-lr-frac", "0.05",
     "--warmup-steps", "5",
     "--lr-schedule", "linear",
@@ -285,6 +284,45 @@ def score_sokoban_moves(moves: str | None, entry: dict[str, Any]) -> float:
     return float(_sokoban_scorer().score_answer(answer=moves, entry=entry))
 
 
+def score_sokoban_progress(moves: str | None, entry: dict[str, Any]) -> float:
+    """Dense TRAINING reward in [0, 1] measuring PROGRESS from the puzzle's initial state: the
+    fraction of the initially-uncovered goals that `moves` ends up covering (RG's own game engine
+    replays the moves). Progress, not absolute coverage, because some puzzles start with a box
+    already on a goal — absolute coverage would hand the model free reward for doing nothing and
+    give no gradient. Returns exactly 1.0 iff fully solved (gated on is_solved first), identical to
+    score_sokoban_moves on solves, so every `reward == 1.0` solved-check downstream stays correct;
+    doing nothing or regressing scores 0.0. EVAL is unaffected: held-out scoring goes through
+    FixedSokobanDataset.evaluate(), which stays binary pass@1.
+
+    Board symbols (RG): '$' box-on-goal, '@' box-off-goal, 'X' empty goal, '%' player-on-goal.
+    is_solved == ('@' not in state); total goal cells are invariant under moves."""
+    if not isinstance(moves, str):
+        return 0.0
+    import numpy as np
+    scorer = _sokoban_scorer()
+    try:
+        grid = [list(line) for line in entry["metadata"]["gamestr"].replace(" ", "").strip().split("\n")]
+        matrix = np.array(grid)
+        h, w = matrix.shape
+        game = scorer._Game(height=h, width=w)
+        game.load_puzzle_matrix(matrix)
+        init_state = game.get_curr_state()
+        for move in moves:
+            game.player.update(key=move)
+        state = game.get_curr_state()
+    except Exception:
+        return 0.0
+    if "@" not in state:          # fully solved — matches the binary scorer exactly
+        return 1.0
+    init_covered = init_state.count("$")
+    total_goals = state.count("$") + state.count("X") + state.count("%")
+    remaining = total_goals - init_covered     # goals not already covered at the start
+    if remaining <= 0:
+        return 0.0
+    progress = (state.count("$") - init_covered) / remaining
+    return max(0.0, progress)     # < 1.0 here (not solved); clamp regressions to 0
+
+
 def _validate_sokoban_record(record: Any, *, path: Path, line_no: int) -> dict[str, Any]:
     prefix = f"{path}:{line_no}"
     if not isinstance(record, dict):
@@ -457,24 +495,36 @@ def extract_sampled_logprobs(completion_output) -> list[float]:
 
 
 async def _vllm_generate(engine, prompt_token_ids, n, *, temperature, top_p, top_k, max_tokens, logprobs, seed):
+    """n samples as n CONCURRENT n=1 requests, NOT one n=n request. vLLM 0.22's parallel-sampling
+    output aggregation (RequestOutput.add over child completions) has a load-dependent race that
+    kills the AsyncLLM output_handler (`AttributeError: 'NoneType'.index`, then EngineDeadError for
+    every later request) — observed 3x on 2026-06-12 with Qwen3-1.7B on 4 GPUs, whose ~2x decode
+    rate makes it ~hourly; never observed on the slower 4B/8-GPU runs. The split is semantics-
+    preserving: V1 already fans n>1 into one child request per sample (engine load identical) and
+    derives child seeds as seed+index (parallel_sampling.py), which is replicated here exactly."""
     from vllm import SamplingParams
     from vllm.inputs import TokensPrompt
     from vllm.sampling_params import RequestOutputKind
 
-    sp = SamplingParams(
-        n=n, temperature=temperature, top_p=top_p, top_k=top_k, max_tokens=max_tokens,
-        logprobs=logprobs, seed=seed, output_kind=RequestOutputKind.FINAL_ONLY,
-    )
-    final = None
-    async for out in engine.generate(TokensPrompt(prompt_token_ids=list(prompt_token_ids)), sp, str(uuid.uuid4())):
-        final = out
-    assert final is not None and final.finished
-    # vLLM 0.22 can occasionally surface a None/empty completion in final.outputs (e.g. an aborted
-    # sample); drop them so one bad sample can't crash the whole run.
-    outputs = [co for co in final.outputs if co is not None and co.token_ids is not None]
-    dropped = len(final.outputs) - len(outputs)
+    async def _one(i: int):
+        sp = SamplingParams(
+            n=1, temperature=temperature, top_p=top_p, top_k=top_k, max_tokens=max_tokens,
+            logprobs=logprobs, seed=(None if seed is None else seed + i),
+            output_kind=RequestOutputKind.FINAL_ONLY,
+        )
+        final = None
+        async for out in engine.generate(TokensPrompt(prompt_token_ids=list(prompt_token_ids)), sp, str(uuid.uuid4())):
+            final = out
+        assert final is not None and final.finished
+        return final.outputs[0] if final.outputs else None
+
+    outs = await asyncio.gather(*[_one(i) for i in range(n)])
+    # vLLM 0.22 can occasionally surface a None/empty completion (e.g. an aborted sample); drop
+    # them so one bad sample can't crash the whole run.
+    outputs = [co for co in outs if co is not None and co.token_ids is not None]
+    dropped = len(outs) - len(outputs)
     if dropped:
-        print(f"[generate_group] dropped {dropped}/{len(final.outputs)} None/empty vLLM completion(s)", flush=True)
+        print(f"[generate_group] dropped {dropped}/{len(outs)} None/empty vLLM completion(s)", flush=True)
     return outputs
 
 
@@ -1355,7 +1405,11 @@ def process_rollout_sample(
     *,
     trim_after_answer: bool,
 ) -> ProcessedRolloutSample:
-    """Convert one vLLM sample into trainable fields, extracting the Sokoban answer once."""
+    """Convert one vLLM sample into trainable fields, extracting the Sokoban answer once.
+
+    The training reward is the dense progress reward (score_sokoban_progress) — the benchmark's
+    fixed reward function. It is 1.0 iff fully solved, so the solved-based metrics (which key off
+    reward == 1.0) are exact. EVAL is graded separately on binary pass@1 (FixedSokobanDataset.evaluate)."""
     behavior_logprobs = list(sample["logprobs"])
     loss_mask = sample.get("loss_mask")
     if loss_mask is not None:
@@ -1372,7 +1426,7 @@ def process_rollout_sample(
     else:
         completion = decode_completion(tokenizer, sequence, prefix_length)
         moves = extract_sokoban_answer(completion)
-    reward = score_sokoban_moves(moves, conversation)
+    reward = score_sokoban_progress(moves, conversation)
     return ProcessedRolloutSample(
         sequence=sequence,
         behavior_logprobs=behavior_logprobs,
@@ -2797,6 +2851,11 @@ def run_pipeline(
         train_task = load_sokoban_jsonl_dataset(args.train_data, split_name="train")
     if eval_task is None:
         eval_task = load_sokoban_jsonl_dataset(args.eval_data, split_name="eval")
+    # File-order band labels for the per-band reward curves (puzzle_id maps to file index mod
+    # dataset size on epoch wrap). Datasets without metadata.band just skip the per-band metrics.
+    train_band_by_index = [
+        ((ex.get("metadata") or {}).get("band") or "") for ex in train_task.examples
+    ]
 
     if args.dtype != "float32":
         # Non-fp32 triggers the FP32LMHead wrapper, which unties lm_head from embed_tokens on
@@ -3237,14 +3296,16 @@ def run_pipeline(
             times["rollout_logging"] += time.monotonic() - t_log_start
             if is_zero_var:
                 cs.groups_zero_variance += 1
-                if max(rewards) > 0.5:
+                # "solved" == reward 1.0 (binary or shaped); a shaped partial (e.g. 0.5) is NOT a
+                # solve, so classify by full-solve, not the old binary-era `> 0.5` shorthand.
+                if max(rewards) >= 1.0 - 1e-9:
                     cs.groups_zv_allpass += 1
                 else:
                     cs.groups_zv_allfail += 1
                 cs.register_reject(step, reject_limit)
                 continue
             cs.consecutive_rejected = 0
-            cs.group_solved.append(1.0 if max(rewards) > 0.5 else 0.0)
+            cs.group_solved.append(1.0 if max(rewards) >= 1.0 - 1e-9 else 0.0)
             cs.prefill_tokens_total += meta["prefix_length"]
             for sample, a in zip(processed_samples, adv_values):
                 cs.step_examples.append(RolloutExample(
@@ -3319,7 +3380,21 @@ def run_pipeline(
             solve_given_answer_ewma = ewma_update(
                 solve_given_answer_ewma if solve_given_answer_ewma is not None else 0.0,
                 solve_given_answer, 0.1, seed=solve_given_answer_ewma is None)
+        # Per-band train reward: the aggregate reward/mean is intentionally homeostatic — the
+        # difficulty ramp hardens the data at ~the rate the model improves, and the zero-variance
+        # filter selects mid-range-reward groups by construction — so it looks flat on a healthy
+        # run. Within a FIXED band the climb is visible; these are the human-facing progress curves.
+        band_vals: dict[str, list[float]] = {}
+        if train_band_by_index:
+            n_band_rows = len(train_band_by_index)
+            for e, r in zip(cs.step_examples, rewards_all.tolist()):
+                band = train_band_by_index[e.puzzle_id % n_band_rows]
+                if band:
+                    band_vals.setdefault(band, []).append(r)
+        band_metrics = {f"reward/band_{b}": sum(v) / len(v) for b, v in band_vals.items()}
+        band_metrics.update({f"reward/band_{b}_n": float(len(v)) for b, v in band_vals.items()})
         metrics = {
+            **band_metrics,
             "step": step, "lr": lr, "weight_version": current_version,
             "groups/used": cs.puzzles_used,
             "groups/zero_variance_dropped": cs.groups_zero_variance,
@@ -3336,7 +3411,7 @@ def run_pipeline(
             "seqs": n_seqs,
             "reward/mean": float(rewards_all.mean()),
             "reward/std": float(rewards_all.std(unbiased=False)),
-            "reward/solved_frac": float((rewards_all > 0.5).float().mean()),
+            "reward/solved_frac": float((rewards_all >= 1.0 - 1e-9).float().mean()),
             "reward/group_pass_at_k": float(sum(cs.group_solved) / max(1, len(cs.group_solved))),
             # Unbiased proxies over all fresh generated groups (pre-filter). Use these,
             # not solved_frac/group_pass_at_k, to gauge live progress; see run_held_out_eval.
@@ -3819,6 +3894,14 @@ def run_pipeline(
                 child.join(timeout=30)
                 if child.is_alive():
                     child.terminate()
+                    child.join(timeout=15)
+                if child.is_alive():
+                    # SIGTERM can be ignored by a child wedged in vLLM engine teardown; without the
+                    # SIGKILL, multiprocessing's atexit join blocks interpreter exit FOREVER (the
+                    # container then idle-bills until externally cancelled — hit 2/4 runs 2026-06-12,
+                    # both with clean W&B finish + committed checkpoint).
+                    child.kill()
+                    child.join(timeout=5)
         if master_process and wandb_rollouts_enabled and wandb_rollout_rows:
             import wandb
             wandb_run.log({"rollouts": wandb.Table(columns=wandb_rollout_columns, data=wandb_rollout_rows)})
@@ -3846,6 +3929,15 @@ def run_pipeline(
         run_logger.close()
         if world_size > 1:
             compute_cleanup()
+        # Last-ditch wedge guard: every durable artifact (checkpoint, rollouts, logs, wandb) is
+        # already flushed above, so if the interpreter is still alive 120s past this point it is
+        # stuck in exit handlers (e.g. a non-daemon thread or an unreaped grandchild) and only
+        # burning GPU-node time. Daemon thread: a clean exit is unaffected.
+        def _exit_guard():
+            time.sleep(120)
+            print("[teardown] process still alive 120s after teardown completed - forcing exit", flush=True)
+            os._exit(0)
+        threading.Thread(target=_exit_guard, daemon=True, name="teardown-exit-guard").start()
 
 
 # ============================ CLI ============================
@@ -3887,7 +3979,7 @@ def _add_vllm_tuning_args(parser: argparse.ArgumentParser, *, prefix: str, ctx: 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Full fine-tuning RL on fixed Reasoning Gym Sokoban JSONL data with a Hugging Face causal LM")
-    parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B", help="HF model id or local path")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B", help="HF model id or local path")
     parser.add_argument("--trust-remote-code", action="store_true", help="Pass trust_remote_code=True to HF loaders")
     parser.add_argument("--device", type=str, default="", help="cuda|cpu|mps, empty means autodetect")
     parser.add_argument("--train-data", type=Path, default=Path("datasets/sokoban_train.jsonl"), help="Train JSONL file with question, answer, and metadata.gamestr")
@@ -3913,7 +4005,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--examples-per-step", type=int, default=48, help="Sokoban puzzles per optimizer step")
     parser.add_argument("--num-samples", type=int, default=16, help="Samples per Sokoban puzzle")
     parser.add_argument("--max-new-tokens", type=int, default=6144,
-                        help="Rollout generation budget per puzzle (README spec). Qwen3-4B runs with "
+                        help="Rollout generation budget per puzzle (README spec). Qwen3 runs with "
                              "thinking enabled, so it needs room to finish reasoning AND emit the answer; "
                              "too small => 100%% length-truncation => 0 reward => no training signal. With "
                              "--interruption this is the thinking budget before the forced-answer continuation.")
@@ -4124,7 +4216,7 @@ def build_parser() -> argparse.ArgumentParser:
                              "Pass one final checkpoint per training seed to run the full record eval: "
                              "each is evaluated under the same protocol, then the significance test "
                              "(mean pass@1 > --eval-target at --eval-alpha) prints a PASS/FAIL verdict.")
-    parser.add_argument("--eval-target", type=float, default=0.50,
+    parser.add_argument("--eval-target", type=float, default=0.35,
                         help="Leaderboard TARGET: the pass@1 a record must clear (see README rules).")
     parser.add_argument("--eval-alpha", type=float, default=0.01,
                         help="Significance level for the record t-test (multi-checkpoint eval).")
