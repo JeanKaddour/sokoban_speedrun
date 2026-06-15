@@ -977,8 +977,8 @@ def build_optimizer(parameters: Iterator[torch.nn.Parameter], args: argparse.Nam
     if args.optimizer != "adamw":
         raise ValueError(f"Unsupported optimizer {args.optimizer!r}; only 'adamw' is implemented")
     params = list(parameters)
-    # fused=True single-kernels the update over the ~64GB of fp32 param/grad/state traffic
-    # (~0.5-1s/step at 4B params) instead of the multi-kernel foreach path. Same update math
+    # fused=True single-kernels the update over the ~27GB of fp32 param/grad/state traffic
+    # (1.7B params × 16 B) instead of the multi-kernel foreach path. Same update math
     # (not bitwise). CUDA-only, so fall back to the default path on CPU (tests / --device cpu).
     use_fused = bool(params) and all(p.is_cuda for p in params)
     return torch.optim.AdamW(
