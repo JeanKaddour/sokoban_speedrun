@@ -6,6 +6,7 @@ import shlex
 import subprocess
 import sys
 import threading
+from contextlib import contextmanager
 from datetime import datetime
 
 import modal
@@ -22,15 +23,25 @@ PERSISTENT_VLLM_CACHE = f"{PERSISTENT_CACHE_DIR}/vllm"
 # 2026-06-08) vs the expected 2-5 min on local NVMe. Cold compile per run is the cheaper trade;
 # revisit cross-run warm starts with a tar-to-volume scheme if --compile sticks.
 LOCAL_INDUCTOR_CACHE = "/tmp/torchinductor"
+# Container-LOCAL for the same reason: triton JITs hundreds of small files during vLLM's cold
+# torch.compile. The durable cross-run artifact is vLLM's PACKED compile cache under
+# VLLM_CACHE_ROOT, which lives on the volume — a warm start loads that and skips inductor/triton
+# entirely, so persisting their scratch caches would only buy FUSE risk.
+LOCAL_TRITON_CACHE = "/tmp/triton"
 
 # rank-0 runs the decode/trim/score pipeline (thread pool) plus 6-7 vLLM engine processes share
 # the container; without an explicit reservation Modal's default CPU allocation can starve them.
 CPU_REQUEST = float(os.environ.get("CPU_REQUEST", "16"))
 
-# speedrun.py fills one node: it runs the trainer on GPU 0 and spawns vLLM generators on the
-# rest (vllm_dp = NODE_GPUS - world_size), so the allocation must match speedrun.NODE_GPUS (8).
+# speedrun.py fills one node: it runs trainer ranks on the first GPUs and spawns vLLM generators
+# on the rest (vllm_dp = NODE_GPUS - world_size), so the allocation must match speedrun.NODE_GPUS.
+# NUM_GPUS is resolved from the launch shell, then baked into the image env as NODE_GPUS (see
+# `image` below): the container re-imports this module with no launch env, so without the bake the
+# remote eval_commands/--eval-vllm-dp and speedrun's trainer/generator split would silently
+# mismatch the box. Default 4 (the benchmark node; NTRAINERS then defaults to 1); a larger
+# NUM_GPUS (e.g. 8) just changes the split (NTRAINERS defaults to 3 on 8 GPUs).
 GPU_TYPE = os.environ.get("GPU_TYPE", "H100")
-NUM_GPUS = int(os.environ.get("NUM_GPUS", "8"))
+NUM_GPUS = int(os.environ.get("NUM_GPUS", os.environ.get("NODE_GPUS", "4")))
 
 # One-hour target recipe. Keep the ScaleRL-ish optimizer hparams, but use a benchmark-defined
 # non-trivial 1-box train/eval split and avoid debug/measurement I/O that slows the sprint.
@@ -75,6 +86,10 @@ image = (
     .env({
         "OMP_NUM_THREADS": "1",
         "TOKENIZERS_PARALLELISM": "false",
+        # Launch-time GPU count, baked in so the container agrees with the gpu= allocation:
+        # speedrun reads NODE_GPUS for its trainer/generator split, and this module's remote
+        # re-import resolves NUM_GPUS from it (the launch shell's NUM_GPUS never reaches Modal).
+        "NODE_GPUS": str(NUM_GPUS),
     })
     .add_local_python_source("speedrun")
 )
@@ -102,8 +117,14 @@ def _persistent_cache_env() -> dict[str, str]:
         "HF_XET_CACHE": f"{PERSISTENT_HF_HOME}/xet",
         "TORCH_HOME": f"{PERSISTENT_CACHE_DIR}/torch",
         "VLLM_CACHE_ROOT": PERSISTENT_VLLM_CACHE,
-        # Local NVMe, NOT the volume — see LOCAL_INDUCTOR_CACHE for the measured FUSE pathology.
+        # flashinfer JIT-compiled ops persist under <base>/.cache/flashinfer/<version>/<arch>/
+        # (cubins ship in the flashinfer-cubin wheel; this only holds the JIT'd ops). Default base
+        # is $HOME, i.e. container-local — without this, every container re-JITs them.
+        "FLASHINFER_WORKSPACE_BASE": PERSISTENT_CACHE_DIR,
+        # Local NVMe, NOT the volume — see LOCAL_INDUCTOR_CACHE / LOCAL_TRITON_CACHE for the
+        # measured FUSE pathology; vLLM's packed compile cache (on the volume) is the durable copy.
         "TORCHINDUCTOR_CACHE_DIR": LOCAL_INDUCTOR_CACHE,
+        "TRITON_CACHE_DIR": LOCAL_TRITON_CACHE,
         "XDG_CACHE_HOME": PERSISTENT_CACHE_DIR,
     }
 
@@ -119,6 +140,7 @@ def _ensure_persistent_cache_dirs() -> None:
         f"{PERSISTENT_CACHE_DIR}/torch",
         PERSISTENT_VLLM_CACHE,
         LOCAL_INDUCTOR_CACHE,
+        LOCAL_TRITON_CACHE,
     }:
         os.makedirs(path, exist_ok=True)
 
@@ -142,7 +164,7 @@ def _last_bool_flag(args: list[str], enabled_flag: str, disabled_flag: str, defa
 
 
 def _needs_periodic_volume_commit(speedrun_args: list[str]) -> bool:
-    """Only commit every minute when the run is actually writing mid-run artifacts."""
+    """True when the run streams mid-run artifacts and wants the tight 60s commit cadence."""
     # The rollout STREAM is on by default (speedrun.py: --save-rollouts + --rollout-flush-every 10;
     # batched ~6MB gzip appends, not the old per-group small writes): without periodic commits a
     # hard container death would discard everything since the last commit, defeating the stream's
@@ -151,6 +173,32 @@ def _needs_periodic_volume_commit(speedrun_args: list[str]) -> bool:
     save_rollouts = _last_bool_flag(speedrun_args, "--save-rollouts", "--no-save-rollouts", True)
     flush_every = int(_last_arg_value(speedrun_args, "--rollout-flush-every", "10") or "0")
     return save_every > 0 or (save_rollouts and flush_every > 0)
+
+
+@contextmanager
+def _periodic_volume_commits(interval_s: float):
+    """Commit the volume every `interval_s` while the body runs, plus once on exit. Cache writes
+    (HF model download, vLLM packed compile cache, flashinfer JIT ops) land on the volume as plain
+    file writes and are LOST on a hard container death unless committed — a crash on the first run
+    with a new model would re-pay the whole download+compile tax on the next launch. Commits are
+    cheap; the interval only bounds contention with training/generation I/O on the FUSE mount."""
+    stop = threading.Event()
+
+    def _loop():
+        while not stop.wait(interval_s):
+            try:
+                volume.commit()
+            except Exception:
+                pass
+
+    committer = threading.Thread(target=_loop, daemon=True)
+    committer.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        committer.join(timeout=5)
+        volume.commit()
 
 
 @app.function(
@@ -172,9 +220,9 @@ def train(
 ) -> None:
     """Launch the speedrun sprint recipe from the volume (relative data/output paths resolve under
     /vol). `run_name` (non-"dummy") turns on W&B logging; `max_steps` bounds the run. `num_trainers`
-    is the data-parallel trainer count: 1 => single process (1 trainer + 7 vLLM); N>1 => torchrun
-    with N trainer ranks (+ NODE_GPUS-N vLLM generators). speedrun derives the vLLM split from
-    WORLD_SIZE, so no GPU-split args are passed."""
+    is the data-parallel trainer count: 1 => single process (1 trainer + NUM_GPUS-1 vLLM); N>1 =>
+    torchrun with N trainer ranks (+ NUM_GPUS-N vLLM generators). speedrun derives the vLLM split
+    from WORLD_SIZE and the baked-in NODE_GPUS, so no GPU-split args are passed."""
     env = dict(os.environ)
     # speedrun maps each trainer rank to a physical GPU itself, so CUDA_VISIBLE_DEVICES must be unset.
     env.pop("CUDA_VISIBLE_DEVICES", None)
@@ -202,25 +250,11 @@ def train(
         command = [sys.executable, "-m", "speedrun", *speedrun_args]
     print(f"Launching ({num_trainers} trainer(s)): {' '.join(command)} (cwd={VOLUME_MOUNT_PATH})", flush=True)
 
-    # Commit the volume every 60s only when checkpoints/rollouts are being written mid-run. The
-    # default benchmark recipe writes no mid-run artifacts and keeps the model cache on this volume,
-    # so repeatedly committing can contend with training without making anything useful downloadable.
-    stop_commit = threading.Event()
-
-    def _periodic_commit():
-        while not stop_commit.wait(60):
-            try:
-                volume.commit()
-            except Exception:
-                pass
-
-    committer = None
-    if _needs_periodic_volume_commit(speedrun_args):
-        committer = threading.Thread(target=_periodic_commit, daemon=True)
-        committer.start()
-    else:
-        print("Skipping periodic volume commits: no mid-run checkpoints/rollouts enabled", flush=True)
-    try:
+    # Tight 60s commits when checkpoints/rollouts stream mid-run (a hard container death should
+    # keep the logs); otherwise a relaxed 300s cadence that exists purely to checkpoint cache
+    # writes (model download, vLLM compile cache) without contending with training I/O.
+    commit_interval = 60 if _needs_periodic_volume_commit(speedrun_args) else 300
+    with _periodic_volume_commits(commit_interval):
         subprocess.run(command, check=True, env=env, cwd=VOLUME_MOUNT_PATH)
         if final_eval_k > 0:
             checkpoint = f"outputs/{run_name}/step_{max_steps - 1:06d}"
@@ -235,11 +269,6 @@ def train(
                 print(f"Final checkpoint eval: {' '.join(eval_command)} (cwd={VOLUME_MOUNT_PATH})", flush=True)
                 subprocess.run(eval_command, check=True, env=env, cwd=VOLUME_MOUNT_PATH)
                 volume.commit()
-    finally:
-        stop_commit.set()
-        if committer is not None:
-            committer.join(timeout=5)
-        volume.commit()
 
 
 def _parse_seeds(spec: str) -> list[int]:
@@ -259,10 +288,11 @@ def _parse_seeds(spec: str) -> list[int]:
 
 
 def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: list[int],
-                  target: float = 0.50, eval_max_tokens: int = 12288, eval_max_model_len: int = 16384,
+                  target: float = 0.35, eval_max_tokens: int = 12288, eval_max_model_len: int = 16384,
                   interruption: bool = True, interrupt_answer_tokens: int = 512,
                   eval_gpu_mem_util: float = 0.9, eval_vllm_max_num_batched_tokens: int = 40960,
-                  eval_vllm_max_num_seqs: int = 16, eval_concurrency: int = 16) -> list[list[str]]:
+                  eval_vllm_max_num_seqs: int = 16, eval_concurrency: int = 16,
+                  eval_data: str | None = None) -> list[list[str]]:
     """speedrun --eval-only command(s). `checkpoint` may be a comma-separated list of final
     checkpoints (one per training seed): that emits ONE record-eval command that evaluates all
     of them under the same protocol at a single eval seed and ends with the built-in
@@ -293,6 +323,12 @@ def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds
               "--eval-vllm-max-num-batched-tokens", str(eval_vllm_max_num_batched_tokens),
               "--eval-vllm-max-num-seqs", str(eval_vllm_max_num_seqs),
               "--eval-concurrency", str(eval_concurrency)]
+    if eval_data:
+        # Appended AFTER the prepended RECIPE, so this overrides its --eval-data (argparse
+        # last-wins). Leave it unset for the official eval set (the RECIPE's
+        # datasets/sokoban_eval.jsonl); set it only to evaluate on a different set
+        # (e.g. the harder transfer slice for ablations).
+        common += ["--eval-data", eval_data]
     if interruption:
         common += ["--eval-interruption", "--eval-interrupt-answer-tokens", str(interrupt_answer_tokens)]
     if eval_limit > 0:
@@ -322,12 +358,13 @@ def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds
     secrets=runtime_secrets,
 )
 def evaluate(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: str = "12345",
-             target: float = 0.50, eval_max_tokens: int = 12288, eval_max_model_len: int = 16384,
+             target: float = 0.35, eval_max_tokens: int = 12288, eval_max_model_len: int = 16384,
              interruption: bool = True, eval_gpu_mem_util: float = 0.9,
              eval_vllm_max_num_batched_tokens: int = 40960,
-             eval_vllm_max_num_seqs: int = 16, eval_concurrency: int = 16) -> None:
+             eval_vllm_max_num_seqs: int = 16, eval_concurrency: int = 16,
+             eval_data: str | None = None) -> None:
     """Authoritative held-out eval (speedrun.py --eval-only): own vLLM engine over all GPUs at the
-    full 32768-token leaderboard budget. `checkpoint` is a /vol path or an HF id (e.g. Qwen/Qwen3-4B
+    full 32768-token leaderboard budget. `checkpoint` is a /vol path or an HF id (e.g. Qwen/Qwen3-1.7B
     for the base) — or a COMMA-SEPARATED list of final checkpoints (one per training seed), which
     runs the whole record eval end-to-end in one call: every checkpoint evaluated under the same
     protocol, one JSON each, then the significance verdict (mean pass@1 > `target`, p<0.01).
@@ -346,23 +383,27 @@ def evaluate(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: str
     env["LD_LIBRARY_PATH"] = _nvidia_ld_library_path()
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     record_mode = "," in checkpoint
-    for command in eval_commands(checkpoint, run_name, k, eval_limit, _parse_seeds(seeds), target,
-                                 eval_max_tokens, eval_max_model_len, interruption,
-                                 eval_gpu_mem_util=eval_gpu_mem_util,
-                                 eval_vllm_max_num_batched_tokens=eval_vllm_max_num_batched_tokens,
-                                 eval_vllm_max_num_seqs=eval_vllm_max_num_seqs,
-                                 eval_concurrency=eval_concurrency):
-        print(f"Eval: {' '.join(command)} (cwd={VOLUME_MOUNT_PATH})", flush=True)
-        try:
-            if record_mode:
-                # speedrun exits 0/1 on the PASS/FAIL verdict; don't crash the container on FAIL.
-                rc = subprocess.run(command, check=False, env=env, cwd=VOLUME_MOUNT_PATH).returncode
-                print(f"Record eval finished with exit code {rc} "
-                      f"({'PASS' if rc == 0 else 'FAIL or error — see verdict above'})", flush=True)
-            else:
-                subprocess.run(command, check=True, env=env, cwd=VOLUME_MOUNT_PATH)
-        finally:
-            volume.commit()  # commit per eval so partial results survive a crash
+    # 300s cadence so a mid-eval crash keeps a fresh model download / vLLM compile cache (the
+    # per-command commit below only fires AFTER a full eval, ~30-60 min after those cache writes).
+    with _periodic_volume_commits(300):
+        for command in eval_commands(checkpoint, run_name, k, eval_limit, _parse_seeds(seeds), target,
+                                     eval_max_tokens, eval_max_model_len, interruption,
+                                     eval_gpu_mem_util=eval_gpu_mem_util,
+                                     eval_vllm_max_num_batched_tokens=eval_vllm_max_num_batched_tokens,
+                                     eval_vllm_max_num_seqs=eval_vllm_max_num_seqs,
+                                     eval_concurrency=eval_concurrency,
+                                     eval_data=eval_data):
+            print(f"Eval: {' '.join(command)} (cwd={VOLUME_MOUNT_PATH})", flush=True)
+            try:
+                if record_mode:
+                    # speedrun exits 0/1 on the PASS/FAIL verdict; don't crash the container on FAIL.
+                    rc = subprocess.run(command, check=False, env=env, cwd=VOLUME_MOUNT_PATH).returncode
+                    print(f"Record eval finished with exit code {rc} "
+                          f"({'PASS' if rc == 0 else 'FAIL or error — see verdict above'})", flush=True)
+                else:
+                    subprocess.run(command, check=True, env=env, cwd=VOLUME_MOUNT_PATH)
+            finally:
+                volume.commit()  # commit per eval so partial results survive a crash
 
 
 @app.function(
@@ -375,7 +416,7 @@ def evaluate(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: str
 )
 def probe_datasets(eval_datasets: list[str], run_name: str, k: int, eval_limit: int,
                    max_tokens: int, max_model_len: int, interruption: bool,
-                   model: str = "Qwen/Qwen3-4B") -> None:
+                   model: str = "Qwen/Qwen3-1.7B") -> None:
     """Base-model pass@k probe (P0) across a difficulty ladder. Runs speedrun --eval-only against
     the BASE model on each eval dataset (relative /vol path) and writes one JSON per set to
     outputs/<run>/probe_<stem>.json. Used to locate the productive (0,1) reward-variance band from
@@ -394,28 +435,29 @@ def probe_datasets(eval_datasets: list[str], run_name: str, k: int, eval_limit: 
     )
     env["LD_LIBRARY_PATH"] = _nvidia_ld_library_path()
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-    for ds in eval_datasets:
-        stem = osp.splitext(osp.basename(ds))[0]
-        out = f"outputs/{run_name}/probe_{stem}.json"
-        command = [sys.executable, "-m", "speedrun", "--eval-only",
-                   "--run", run_name,
-                   "--eval-checkpoint", model,
-                   "--eval-data", ds,
-                   "--eval-k", str(k),
-                   "--eval-temperature", "0.8", "--eval-top-p", "0.95", "--eval-seed", "12345",
-                   "--eval-max-tokens", str(max_tokens),
-                   "--eval-max-model-len", str(max_model_len),
-                   "--eval-vllm-dp", str(NUM_GPUS),
-                   "--eval-output", out]
-        if eval_limit > 0:
-            command += ["--eval-limit", str(eval_limit)]
-        if interruption:
-            command += ["--eval-interruption", "--eval-interrupt-answer-tokens", "512"]
-        print(f"Probe: {' '.join(command)} (cwd={VOLUME_MOUNT_PATH})", flush=True)
-        try:
-            subprocess.run(command, check=True, env=env, cwd=VOLUME_MOUNT_PATH)
-        finally:
-            volume.commit()  # commit per dataset so partial results survive a crash
+    with _periodic_volume_commits(300):  # keep cache writes through a mid-probe crash
+        for ds in eval_datasets:
+            stem = osp.splitext(osp.basename(ds))[0]
+            out = f"outputs/{run_name}/probe_{stem}.json"
+            command = [sys.executable, "-m", "speedrun", "--eval-only",
+                       "--run", run_name,
+                       "--eval-checkpoint", model,
+                       "--eval-data", ds,
+                       "--eval-k", str(k),
+                       "--eval-temperature", "0.8", "--eval-top-p", "0.95", "--eval-seed", "12345",
+                       "--eval-max-tokens", str(max_tokens),
+                       "--eval-max-model-len", str(max_model_len),
+                       "--eval-vllm-dp", str(NUM_GPUS),
+                       "--eval-output", out]
+            if eval_limit > 0:
+                command += ["--eval-limit", str(eval_limit)]
+            if interruption:
+                command += ["--eval-interruption", "--eval-interrupt-answer-tokens", "512"]
+            print(f"Probe: {' '.join(command)} (cwd={VOLUME_MOUNT_PATH})", flush=True)
+            try:
+                subprocess.run(command, check=True, env=env, cwd=VOLUME_MOUNT_PATH)
+            finally:
+                volume.commit()  # commit per dataset so partial results survive a crash
 
 
 @app.local_entrypoint()
@@ -431,7 +473,7 @@ def main() -> None:
         max_tokens = int(os.environ.get("PROBE_MAX_TOKENS", "5632"))
         max_model_len = int(os.environ.get("PROBE_MAX_MODEL_LEN", "7168"))
         interruption = os.environ.get("PROBE_INTERRUPTION", "1") not in ("0", "false", "False", "")
-        model = os.environ.get("PROBE_MODEL", "Qwen/Qwen3-4B")
+        model = os.environ.get("PROBE_MODEL", "Qwen/Qwen3-1.7B")
         run_name = os.environ.get("RUN_NAME") or f"sokoban-probe-{datetime.now():%Y%m%d-%H%M%S}"
         print(f"Running base-model probe: sets={eval_datasets} run={run_name} k={k} "
               f"limit={eval_limit} max_tokens={max_tokens} interruption={interruption}", flush=True)
@@ -442,13 +484,17 @@ def main() -> None:
         return
     # Eval mode: EVAL_CHECKPOINT=<vol path or HF id> modal run --detach modal_app.py
     # Record mode: EVAL_CHECKPOINT="ckptA,ckptB,..." (one final checkpoint per training seed) runs
-    # the whole record eval + significance verdict in one call; EVAL_TARGET sets the bar (default = the leaderboard TARGET, 0.50).
+    # the whole record eval + significance verdict in one call; EVAL_TARGET sets the bar (default = the leaderboard TARGET, 0.35).
     eval_ckpt = os.environ.get("EVAL_CHECKPOINT")
     if eval_ckpt:
-        k = int(os.environ.get("EVAL_K", "16"))
+        # Leaderboard eval protocol: k=8 on the fixed 128-puzzle eval set
+        # (speedrun.py RECIPE's --eval-data), 12,288-token budget + interruption, seed 12345,
+        # target 0.35. EVAL_K / EVAL_DATA / EVAL_TARGET / EVAL_LIMIT override for ablations.
+        k = int(os.environ.get("EVAL_K", "8"))
+        eval_data = os.environ.get("EVAL_DATA")  # None => speedrun RECIPE's --eval-data (the 128 set)
         eval_limit = int(os.environ.get("EVAL_LIMIT", "0"))  # 0 = full eval set; >0 = first N (cheap dev)
         seeds = ",".join(str(s) for s in _parse_seeds(os.environ.get("EVAL_SEEDS", "12345")))
-        target = float(os.environ.get("EVAL_TARGET", "0.50"))
+        target = float(os.environ.get("EVAL_TARGET", "0.35"))
         eval_max_tokens = int(os.environ.get("EVAL_MAX_TOKENS", "12288"))
         eval_max_model_len = int(os.environ.get("EVAL_MAX_MODEL_LEN", "16384"))
         eval_interruption = os.environ.get("EVAL_INTERRUPTION", "1") not in ("0", "false", "False", "")
@@ -458,23 +504,32 @@ def main() -> None:
         eval_concurrency = int(os.environ.get("EVAL_CONCURRENCY", "32"))
         run_name = os.environ.get("RUN_NAME") or f"sokoban-eval-{datetime.now():%Y%m%d-%H%M%S}"
         print(f"Running eval: ckpt={eval_ckpt}, run={run_name}, k={k}, limit={eval_limit}, "
-              f"seeds=[{seeds}], target={target}, max_tokens={eval_max_tokens}, "
-              f"max_model_len={eval_max_model_len}, interruption={eval_interruption}, "
-              f"gpu_mem_util={eval_gpu_mem_util}, batched_tokens={eval_vllm_max_num_batched_tokens}, "
+              f"data={eval_data or 'official (RECIPE)'}, seeds=[{seeds}], target={target}, "
+              f"max_tokens={eval_max_tokens}, max_model_len={eval_max_model_len}, "
+              f"interruption={eval_interruption}, gpu_mem_util={eval_gpu_mem_util}, "
+              f"batched_tokens={eval_vllm_max_num_batched_tokens}, "
               f"max_num_seqs={eval_vllm_max_num_seqs}, concurrency={eval_concurrency}", flush=True)
         evaluate.remote(eval_ckpt, run_name, k, eval_limit, seeds, target,
                         eval_max_tokens, eval_max_model_len, eval_interruption,
                         eval_gpu_mem_util, eval_vllm_max_num_batched_tokens,
-                        eval_vllm_max_num_seqs, eval_concurrency)
+                        eval_vllm_max_num_seqs, eval_concurrency, eval_data)
         return
-    # NTRAINERS=1 => single trainer + 7 vLLM; NTRAINERS=2 => 2 trainers + 6 vLLM (torchrun), etc.
-    # Default NTRAINERS=3: the node is trainer-bound at inflight 96, so 3 trainers is the sweet
-    # spot (~30% faster per step than 2 — fewer microbatches per rank). Trainer count is a torchrun
-    # launch param (not a speedrun CLI arg), so it lives here; the rest of the recipe is speedrun.py RECIPE.
+    # NTRAINERS=1 => single trainer + NUM_GPUS-1 vLLM; NTRAINERS=2 => 2 trainers + the rest (torchrun), etc.
+    # Default NTRAINERS=3 on the 8-GPU benchmark node: it is trainer-bound at inflight 96, so 3
+    # trainers is the sweet spot (~30% faster per step than 2 — fewer microbatches per rank). On
+    # smaller boxes default to 1 trainer (3 trainers + 1 generator would starve generation).
+    # Trainer count is a torchrun launch param (not a speedrun CLI arg), so it lives here; the rest
+    # of the recipe is speedrun.py RECIPE.
     # Full sprint e.g.: MAX_STEPS=150 modal run --detach modal_app.py
+    # Small node e.g.: NUM_GPUS=4 MODEL=Qwen/Qwen3-1.7B MAX_STEPS=100 modal run --detach modal_app.py
     max_steps = int(os.environ.get("MAX_STEPS", "4"))
-    num_trainers = int(os.environ.get("NTRAINERS", "3"))
+    num_trainers = int(os.environ.get("NTRAINERS", "3" if NUM_GPUS >= 8 else "1"))
     extra_args = shlex.split(os.environ.get("EXTRA_ARGS", ""))
+    # MODEL overrides the RECIPE/argparse base model (default Qwen/Qwen3-1.7B). Prepended so an
+    # explicit --model in EXTRA_ARGS still wins (argparse last-wins).
+    model = os.environ.get("MODEL")
+    if model:
+        extra_args = ["--model", model, *extra_args]
     final_eval_k = int(os.environ.get("FINAL_EVAL_K", "0"))
     final_eval_limit = int(os.environ.get("FINAL_EVAL_LIMIT", "0"))
     final_eval_seeds = ",".join(str(s) for s in _parse_seeds(os.environ.get("FINAL_EVAL_SEEDS", "12345")))
