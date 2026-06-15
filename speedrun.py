@@ -1529,14 +1529,40 @@ def token_logprobs_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> to
     return token_logprobs.masked_fill(~valid, 0.0)
 
 
-def chunked_token_logprobs(lm_head, hidden_states, labels, chunk_size=1024):
+def entropy_from_logits(logits: torch.Tensor) -> torch.Tensor:
+    """Per-token Shannon entropy H(pi) = logsumexp(logits) - E_pi[logits] of the policy's
+    next-token distribution (verl's `entropy_from_logits` formulation). Computed from the SAME
+    fp32 logits the policy loss already materializes, so it adds only an O(vocab) reduction —
+    no second LM-head matmul, no extra forward over tokens. The single (chunk, vocab) softmax
+    temp is allocated after the cross-entropy temp is freed, so it does not raise the
+    chunked-head memory peak."""
+    logz = torch.logsumexp(logits, dim=-1)
+    return logz - (torch.softmax(logits, dim=-1) * logits).sum(dim=-1)
+
+
+def chunked_token_logprobs(lm_head, hidden_states, labels, chunk_size=1024, entropy_accum=None,
+                           return_entropy_grad=False):
     """Per-token logprobs computed by applying `lm_head` to `hidden_states` in
     sequence-chunks under gradient checkpointing, so the full (T, vocab) logits are
     never materialized at once (backward recomputes one chunk's logits at a time).
-    Equivalent to token_logprobs_from_logits(lm_head(hidden_states).float(), labels)."""
+    Equivalent to token_logprobs_from_logits(lm_head(hidden_states).float(), labels).
+
+    If `entropy_accum` (a dict) is given, also accumulate Sigma H(pi) over valid (non-IGNORE)
+    positions into entropy_accum['sum'] and the valid-token count into entropy_accum['count'],
+    reusing each chunk's already-computed logits (diagnostic only; detached). The entropy is
+    returned THROUGH the checkpoint so it is counted once from the forward pass — accumulating
+    via a closure side effect would double-count, since the checkpoint re-runs `_f` in
+    backward. The count is computed outside the checkpoint (labels-only; no logits needed).
+
+    With `return_entropy_grad=True` instead returns (token_logprobs, entropy_tokens), where
+    entropy_tokens is the per-token H(pi) (B, T) carried WITH gradient through the checkpoint —
+    the entropy-bonus path (masking/aggregation are deferred to the loss). Mutually exclusive
+    with entropy_accum (the cheap detached diagnostic path)."""
     import torch.utils.checkpoint as _ckpt
+    want_entropy = entropy_accum is not None
     T = hidden_states.size(1)
     parts = []
+    ent_parts = [] if return_entropy_grad else None
     for i in range(0, T, chunk_size):
         h = hidden_states[:, i:i + chunk_size, :]
         lab = labels[:, i:i + chunk_size]
@@ -1547,12 +1573,33 @@ def chunked_token_logprobs(lm_head, hidden_states, labels, chunk_size=1024):
             # .float() also normalizes the output for a bf16-weight head; keep both.
             with torch.autocast(device_type=h_chunk.device.type, enabled=False):
                 logits = lm_head(h_chunk.float()).float()
-            return token_logprobs_from_logits(logits, lab_chunk)
+            tlp = token_logprobs_from_logits(logits, lab_chunk)
+            if return_entropy_grad:
+                # Per-token H(pi) carried THROUGH the checkpoint WITH gradient (entropy bonus);
+                # masking to valid tokens is deferred to the loss aggregation.
+                return tlp, entropy_from_logits(logits)
+            if want_entropy:
+                ent = entropy_from_logits(logits)
+                return tlp, (ent * (lab_chunk != IGNORE_INDEX)).sum().detach()
+            return tlp
 
         if torch.is_grad_enabled() and hidden_states.requires_grad:
-            parts.append(_ckpt.checkpoint(_f, h, lab, use_reentrant=False))
+            out = _ckpt.checkpoint(_f, h, lab, use_reentrant=False)
         else:
-            parts.append(_f(h, lab))
+            out = _f(h, lab)
+        if return_entropy_grad:
+            tlp, ent = out
+            parts.append(tlp)
+            ent_parts.append(ent)
+        elif want_entropy:
+            tlp, ent_sum = out
+            parts.append(tlp)
+            entropy_accum["sum"] = entropy_accum.get("sum", 0.0) + ent_sum
+            entropy_accum["count"] = entropy_accum.get("count", 0.0) + (lab != IGNORE_INDEX).sum()
+        else:
+            parts.append(out)
+    if return_entropy_grad:
+        return torch.cat(parts, dim=1), torch.cat(ent_parts, dim=1)
     return torch.cat(parts, dim=1)
 
 
@@ -1573,6 +1620,8 @@ def policy_gradient_loss_from_token_logprobs(
     stats: dict | None = None,
     prompt_lengths: torch.Tensor | None = None,
     kl_tau: float = 0.0,
+    entropy_tokens: torch.Tensor | None = None,
+    entropy_coef: float = 0.0,
 ) -> torch.Tensor:
     """Each loss variant builds a per-token OBJECTIVE tensor J (to be maximized); the
     token/sequence/prompt aggregation below is shared and identical across variants.
@@ -1582,6 +1631,13 @@ def policy_gradient_loss_from_token_logprobs(
     behavior holds 0.0 placeholders), so they MUST be explicitly masked."""
     advantage_weight = advantages.to(token_logprobs.dtype).unsqueeze(-1)  # (B, 1)
     kl_per_token = None  # set below when the optional KL anchor is active (behavior-logprob branch only)
+    # Optional entropy bonus: maximize mean H(pi) over valid tokens, aggregated with the SAME
+    # denominator as the policy objective (so entropy_coef means the same across token/sequence/
+    # prompt modes). Grad flows through entropy_tokens (the policy logits); masked to valid tokens.
+    entropy_per_token = None
+    if entropy_tokens is not None and entropy_coef != 0.0:
+        entropy_per_token = entropy_tokens.to(token_logprobs.dtype).masked_fill(
+            labels == IGNORE_INDEX, 0.0)
     if behavior_logprobs is not None:
         log_ratio = token_logprobs - behavior_logprobs.to(token_logprobs.dtype)
         valid = labels != IGNORE_INDEX
@@ -1669,6 +1725,9 @@ def policy_gradient_loss_from_token_logprobs(
         if kl_per_token is not None:
             kl_objective = (kl_per_token.sum(dim=-1) / denom).sum() / (prompt_normalizer * normalizer)
             loss = loss + kl_tau * kl_objective
+        if entropy_per_token is not None:
+            entropy_objective = (entropy_per_token.sum(dim=-1) / denom).sum() / (prompt_normalizer * normalizer)
+            loss = loss - entropy_coef * entropy_objective
         return loss
     if sequence_normalize:
         valid_mask = labels != IGNORE_INDEX
@@ -1679,6 +1738,9 @@ def policy_gradient_loss_from_token_logprobs(
         if kl_per_token is not None:
             kl_objective = (kl_per_token.sum(dim=-1) / sample_lengths).sum() / (sample_normalizer * normalizer)
             loss = loss + kl_tau * kl_objective
+        if entropy_per_token is not None:
+            entropy_objective = (entropy_per_token.sum(dim=-1) / sample_lengths).sum() / (sample_normalizer * normalizer)
+            loss = loss - entropy_coef * entropy_objective
         return loss
     valid_count = (labels != IGNORE_INDEX).sum().clamp(min=1)
     token_normalizer = valid_count if valid_token_normalizer is None else valid_token_normalizer
@@ -1687,6 +1749,9 @@ def policy_gradient_loss_from_token_logprobs(
     if kl_per_token is not None:
         kl_objective = kl_per_token.sum() / (token_normalizer * normalizer)
         loss = loss + kl_tau * kl_objective
+    if entropy_per_token is not None:
+        entropy_objective = entropy_per_token.sum() / (token_normalizer * normalizer)
+        loss = loss - entropy_coef * entropy_objective
     return loss
 
 
@@ -1696,7 +1761,8 @@ def chunked_policy_loss(model, input_ids, attention_mask, labels, advantages, *,
                         chunk_size=1024,
                         valid_token_normalizer=None, valid_sample_normalizer=None,
                         normalizer=1.0, sequence_normalize=False, stats=None,
-                        autocast_dtype=None, prompt_lengths=None, kl_tau=0.0):
+                        autocast_dtype=None, prompt_lengths=None, kl_tau=0.0,
+                        compute_entropy=False, entropy_coef=0.0):
     """Memory-efficient policy loss (cispo/grpo/gspo): run the base model to hidden states
     (small: B,T,H), then apply the LM head + cross-entropy in checkpointed sequence chunks to
     avoid materializing the full (T, vocab) fp32 logits. The head always runs in fp32; with
@@ -1711,7 +1777,25 @@ def chunked_policy_loss(model, input_ids, attention_mask, labels, advantages, *,
                         enabled=autocast_dtype is not None):
         outputs = base(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
     hidden = outputs.last_hidden_state  # (B, T, H); bf16 when autocast_dtype is set
-    token_logprobs = chunked_token_logprobs(lm_head, hidden, labels, chunk_size=chunk_size)
+    # entropy_coef != 0 needs per-token H(pi) WITH gradient (the bonus); else use the cheap
+    # detached accumulator when only logging entropy. The two paths are mutually exclusive.
+    entropy_tokens = None
+    if entropy_coef != 0.0:
+        token_logprobs, entropy_tokens = chunked_token_logprobs(
+            lm_head, hidden, labels, chunk_size=chunk_size, return_entropy_grad=True)
+        if stats is not None:
+            with torch.no_grad():
+                valid = labels != IGNORE_INDEX
+                stats["entropy_sum"] = (entropy_tokens.detach() * valid).sum()
+                stats["entropy_count"] = valid.sum()
+    else:
+        entropy_accum = {} if compute_entropy else None
+        token_logprobs = chunked_token_logprobs(lm_head, hidden, labels, chunk_size=chunk_size,
+                                                entropy_accum=entropy_accum)
+        if compute_entropy and stats is not None:
+            zero = token_logprobs.new_zeros(())
+            stats["entropy_sum"] = entropy_accum.get("sum", zero)
+            stats["entropy_count"] = entropy_accum.get("count", zero)
     return policy_gradient_loss_from_token_logprobs(
         token_logprobs, labels, advantages,
         valid_token_normalizer=valid_token_normalizer,
@@ -1719,7 +1803,8 @@ def chunked_policy_loss(model, input_ids, attention_mask, labels, advantages, *,
         normalizer=normalizer, sequence_normalize=sequence_normalize,
         behavior_logprobs=behavior_logprobs, loss_fn=loss_fn, cispo_eps=cispo_eps,
         clip_eps_low=clip_eps_low, clip_eps_high=clip_eps_high, clip_ratio_c=clip_ratio_c,
-        stats=stats, prompt_lengths=prompt_lengths, kl_tau=kl_tau)
+        stats=stats, prompt_lengths=prompt_lengths, kl_tau=kl_tau,
+        entropy_tokens=entropy_tokens, entropy_coef=entropy_coef)
 
 
 def batch_normalize_advantages(advantages: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -1727,6 +1812,30 @@ def batch_normalize_advantages(advantages: torch.Tensor, eps: float = 1e-6) -> t
     advantages by the batch std. Safe when std == 0 (returns ~zeros)."""
     std = advantages.std(unbiased=False)
     return advantages / (std + eps)
+
+
+def compute_group_advantages(rewards: torch.Tensor, mode: str = "centered") -> torch.Tensor:
+    """Per-group advantages from one puzzle group's rewards.
+
+    'centered' (default, the historical behavior): r - mean(r) — an RLOO/Dr.GRPO-style group
+    baseline with NO per-group std division (so the question-level difficulty bias Dr.GRPO and
+    GRPO-done-right warn about is already avoided; the only std rescale is the global batch one).
+
+    'maxrl' (arXiv MaxRL, Alg. 1): (r - r_hat) / (N * r_hat) when r_hat > 0, else all-zero — the
+    success-conditioned maximum-likelihood gradient estimator. Its population weight
+    (1-(1-p)^T)/p up-weights low-pass-rate (hard) prompts and down-weights easy ones, vs
+    centered/GRPO which over-weight easy prompts. All-fail groups (r_hat == 0) get zero advantage
+    (no gradient), matching the zero-variance filter. The global batch-std rescale that follows is
+    a single scalar, so it preserves the relative inter-group weighting while keeping the LR scale
+    comparable to the centered baseline."""
+    r_hat = rewards.mean()
+    if mode == "maxrl":
+        if float(r_hat) > 0.0:
+            return (rewards - r_hat) / (rewards.numel() * r_hat)
+        return torch.zeros_like(rewards)
+    if mode == "centered":
+        return rewards - r_hat
+    raise ValueError(f"unknown advantage mode: {mode!r}")
 
 
 def group_has_signal(rewards, eps: float = 1e-8) -> bool:
@@ -3260,7 +3369,7 @@ def run_pipeline(
             rewards = [sample.reward for sample in processed_samples]
             fins = [sample.finish_reason for sample in processed_samples]
             rewards_t = torch.tensor(rewards, dtype=torch.float32)
-            adv = rewards_t - rewards_t.mean()
+            adv = compute_group_advantages(rewards_t, args.advantage_mode)
             adv_values = adv.tolist()
             # Unbiased online proxy (before any filter): solved == reward 1.0, matching evaluate().
             cs.groups_seen_total += 1
@@ -3363,7 +3472,8 @@ def run_pipeline(
                            adv_all: torch.Tensor, loss_sum: float, grad_norm: float,
                            is_ratio_acc: float, is_clip_acc: float, is_tok_acc: int,
                            log_ratio_acc: float, is_ratio_sq_acc: float,
-                           global_token_count: int, num_microbatches: int) -> None:
+                           global_token_count: int, num_microbatches: int,
+                           entropy_sum_acc: float = 0.0, entropy_tok_acc: float = 0.0) -> None:
         """RANK 0 end-of-step bookkeeping: metric assembly, wandb/console/record-log lines, the
         EWMA canaries, the live rollout table, checkpoint saving, and the warn/abort guards.
         Raises (e.g. the non-finite grad_norm abort) propagate to the caller's poison handler."""
@@ -3438,6 +3548,11 @@ def run_pipeline(
             ),
             # Mean log(pi_theta / pi_behavior) over valid tokens (signed drift; ~0 = matched).
             "mismatch/mean_log_ratio": (log_ratio_acc / is_tok_acc) if is_tok_acc else 0.0,
+            # Mean per-token policy entropy H(pi) over generated tokens (nats). Falls as the
+            # policy sharpens; a hard floor near 0 flags premature collapse, a sustained rise
+            # flags destabilization. Sparse: omitted when --no-log-entropy. ~free (reuses the
+            # policy-loss forward's fp32 logits — no extra LM-head matmul; see entropy_from_logits).
+            **({"policy/entropy": entropy_sum_acc / entropy_tok_acc} if entropy_tok_acc > 0 else {}),
             "gen/mean_tokens": float(gen_lens.mean()),
             "gen/max_tokens": float(gen_lens.max()),
             "gen/total_tokens": int(cs.gen_tokens_total),
@@ -3495,10 +3610,11 @@ def run_pipeline(
                                      seed=step <= args.warmup_steps)
         metrics["grad_norm_ewma"] = gnorm_ewma
 
+        ent_frag = f" ent {metrics['policy/entropy']:.3f}" if "policy/entropy" in metrics else ""
         print0(
             f"step {step:3d} | rew {metrics['reward/mean']:.3f} pass@k {metrics['reward/group_pass_at_k']:.2f} "
             f"solved {metrics['reward/solved_frac']:.2f} ans {metrics['reward/answer_rate']:.2f} "
-            f"s|a {metrics['reward/solve_given_answer']:.2f} | loss {loss_sum:.4f} gnorm {grad_norm:.2f} "
+            f"s|a {metrics['reward/solve_given_answer']:.2f} | loss {loss_sum:.4f} gnorm {grad_norm:.2f}{ent_frag} "
             f"| IS {metrics['is_ratio/mean']:.2f} clip {metrics['is_ratio/clipped_frac']:.2f} "
             f"| genlen {metrics['gen/mean_tokens']:.0f} trunc {metrics['gen/length_trunc_frac']:.2f} "
             f"| gen {metrics['throughput/gen_tokens_per_s']:.0f} tok/s tr {metrics['throughput/train_tokens_per_s']:.0f} tok/s "
@@ -3731,6 +3847,10 @@ def run_pipeline(
             # Σ log_ratio for mean drift, Σ w² for ESS. All-reduced with the IS accumulators below.
             log_ratio_acc_t = torch.zeros((), dtype=torch.float32, device=device)
             is_ratio_sq_acc_t = torch.zeros((), dtype=torch.float32, device=device)
+            # Policy entropy diagnostic (Sigma H(pi) over valid tokens / valid-token count);
+            # populated only when --log-entropy is on. Reduced with the IS accumulators below.
+            entropy_sum_acc_t = torch.zeros((), dtype=torch.float32, device=device)
+            entropy_tok_acc_t = torch.zeros((), dtype=torch.float32, device=device)
             num_microbatches = 0
             # ---- Phase E (ALL RANKS): backward over THIS rank's shard with normalizer=1.0 and
             # the GLOBAL counts (identical loss-call args to the single-GPU path). The microbatch
@@ -3782,6 +3902,8 @@ def run_pipeline(
                     autocast_dtype=train_autocast_dtype,
                     prompt_lengths=prompt_lengths,
                     kl_tau=args.kl_tau,
+                    compute_entropy=args.log_entropy,
+                    entropy_coef=args.entropy_coef,
                 )
                 loss.backward()
                 loss_sum_t = loss_sum_t + loss.detach()
@@ -3792,6 +3914,10 @@ def run_pipeline(
                     is_tok_acc_t = is_tok_acc_t + tok.to(torch.long)
                     log_ratio_acc_t = log_ratio_acc_t + mb_stats["log_ratio_sum"].to(torch.float32)
                     is_ratio_sq_acc_t = is_ratio_sq_acc_t + mb_stats["is_ratio_sq_sum"].to(torch.float32)
+                ent_sum = mb_stats.get("entropy_sum")
+                if ent_sum is not None:
+                    entropy_sum_acc_t = entropy_sum_acc_t + ent_sum.to(torch.float32)
+                    entropy_tok_acc_t = entropy_tok_acc_t + mb_stats["entropy_count"].to(torch.float32)
                 num_microbatches += 1
             # ---- Phase E (end): manual DP grad reduction — all_reduce(SUM) every param grad so
             # each rank holds the full-batch gradient Σ_r grad(per-shard loss), exactly the
@@ -3809,12 +3935,14 @@ def run_pipeline(
                 diag_t = torch.stack([
                     is_ratio_acc_t, is_clip_acc_t, is_tok_acc_t.to(torch.float32),
                     log_ratio_acc_t, is_ratio_sq_acc_t, loss_sum_t,
+                    entropy_sum_acc_t, entropy_tok_acc_t,
                 ])
                 dist.all_reduce(diag_t, op=dist.ReduceOp.SUM)
                 is_ratio_acc_t, is_clip_acc_t = diag_t[0], diag_t[1]
                 is_tok_acc_t = diag_t[2].to(torch.long)
                 log_ratio_acc_t, is_ratio_sq_acc_t = diag_t[3], diag_t[4]
                 loss_sum_t = diag_t[5]
+                entropy_sum_acc_t, entropy_tok_acc_t = diag_t[6], diag_t[7]
             # ---- Phase F (ALL RANKS): clip + step on the global gradient; identical grads +
             # identical AdamW state keep every rank's params byte-identical afterward. ----
             t_optimizer_start = time.monotonic()
@@ -3828,6 +3956,8 @@ def run_pipeline(
             is_tok_acc = int(is_tok_acc_t.detach())
             log_ratio_acc = float(log_ratio_acc_t.detach())
             is_ratio_sq_acc = float(is_ratio_sq_acc_t.detach())
+            entropy_sum_acc = float(entropy_sum_acc_t.detach())
+            entropy_tok_acc = float(entropy_tok_acc_t.detach())
             grad_norm = float(grad_norm_t.detach())
             times["train"] = time.monotonic() - t_train_start
 
@@ -3874,6 +4004,7 @@ def run_pipeline(
                         step, lr, cs, times, adv_all, loss_sum, grad_norm,
                         is_ratio_acc, is_clip_acc, is_tok_acc, log_ratio_acc, is_ratio_sq_acc,
                         global_token_count, num_microbatches,
+                        entropy_sum_acc, entropy_tok_acc,
                     )
                 except BaseException:
                     if has_next_step:
@@ -4127,6 +4258,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Sequence chunk size for the memory-efficient chunked LM-head policy loss. "
                              "Larger values reduce LM-head loop overhead but increase fp32 logits memory; "
                              "the Modal recipe uses 2048 with --device-batch-size 2.")
+    parser.add_argument("--log-entropy", action=argparse.BooleanOptionalAction, default=True,
+                        help="Log policy/entropy: mean per-token Shannon entropy H(pi) of the policy "
+                             "over generated tokens (nats), each step. Reuses the policy-loss forward's "
+                             "fp32 logits (no extra LM-head matmul, only an O(vocab) reduction per "
+                             "chunk), so the cost is ~negligible. --no-log-entropy disables it.")
     parser.add_argument("--train-autocast-dtype", choices=["none", "bfloat16"], default="bfloat16",
                         help="Autocast dtype for the trainer's transformer-body forward; the LM head "
                              "stays fp32. 'none' runs the body in fp32 (more activation memory). bf16 "
@@ -4144,6 +4280,22 @@ def build_parser() -> argparse.ArgumentParser:
                              "All ratios are vs the vLLM behavior logprobs (async off-policy, up to "
                              "--max-staleness versions stale; there is no second 'old policy' forward), so "
                              "the clip also absorbs the bf16-generator/fp32-trainer mismatch.")
+    parser.add_argument("--advantage-mode", choices=["centered", "maxrl"], default="centered",
+                        help="Per-group advantage estimator (independent of --loss-fn). 'centered' "
+                             "(default): r - mean(r), an RLOO/Dr.GRPO-style group baseline with no "
+                             "per-group std. 'maxrl' (arXiv MaxRL): (r - r_hat)/(N * r_hat), up-"
+                             "weighting low-pass-rate (hard) prompts toward the maximum-likelihood "
+                             "gradient and zeroing all-fail groups. The global batch-std rescale "
+                             "still applies (preserves relative weighting, keeps LR comparable).")
+    parser.add_argument("--entropy-coef", type=float, default=0.0,
+                        help="Entropy-bonus coefficient: adds +entropy_coef * mean H(pi) over valid "
+                             "tokens to the objective (aggregated with the SAME denominator as the "
+                             "policy loss, so it means the same across token/sequence/prompt modes). "
+                             "Rules-legal domain-agnostic auxiliary reward; counters the entropy-"
+                             "collapse/sharpening that drives grad-norm creep and keeps per-group "
+                             "reward variance alive (fewer zero-variance rejects). 0.0 (default) "
+                             "disables it (byte-identical; the cheap detached --log-entropy "
+                             "diagnostic path is used instead). Try 1e-3 to ~1e-2.")
     parser.add_argument("--cispo-eps", type=float, default=4.0,
                         help="CISPO upper clip epsilon_max for the importance weight")
     parser.add_argument("--clip-eps-low", type=float, default=None,
@@ -4370,6 +4522,8 @@ def _validate_pipeline_args(args: argparse.Namespace) -> None:
         raise ValueError("--init-lr-frac must be in (0, 1]")
     if args.adam_eps <= 0:
         raise ValueError("--adam-eps must be positive")
+    if args.entropy_coef < 0:
+        raise ValueError("--entropy-coef must be >= 0")
     if args.interrupt_min_tokens is not None or args.interrupt_max_tokens is not None:
         if not args.interruption:
             raise ValueError("--interrupt-min-tokens/--interrupt-max-tokens require --interruption")
