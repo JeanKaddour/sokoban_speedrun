@@ -165,7 +165,7 @@ State rules:
 
 The puzzle is solved only if, after executing the entire move string, there are no @ boxes left. Do not append extra legal moves after solving, because they can make the final state unsolved.
 
-Think through the board, simulate your move string, then give exactly one final line that wraps your move string in answer tags, like `<answer>...</answer>`. Put only your U/D/L/R moves between the tags.
+Think through the board, simulate your move string, then finish with a single final line that wraps your move string in `<answer>` and `</answer>` tags, with only your U/D/L/R moves between them.
 
 Here is your puzzle:
 {board}
@@ -241,15 +241,21 @@ def normalize_sokoban_moves(candidate: str) -> str | None:
 def find_sokoban_answer_end_and_moves(text: str) -> tuple[int | None, str | None]:
     """Locate the answer that scoring uses, as (answer_end, moves).
 
-    SINGLE SOURCE OF TRUTH for answer extraction. Precedence: the FIRST <answer> tag wins;
-    only when no tag exists anywhere does the first '####' marker's first non-blank
-    line count. `moves` is what gets scored; `answer_end` is the
-    char offset just past the scored answer, for --trim-after-answer. answer_end is non-None
-    only when the answer parsed (an unparseable answer leaves the sequence untrimmed)."""
-    tag = SOKOBAN_ANSWER_TAG_RE.search(text)
-    if tag is not None:
+    SINGLE SOURCE OF TRUTH for answer extraction. Precedence: the FIRST PARSEABLE <answer>
+    tag wins. Unparseable tags are SKIPPED rather than treated as the answer — the model
+    routinely echoes the prompt's literal `<answer>...</answer>` placeholder (or writes a
+    prose tag) in its reasoning before emitting the real answer in a later tag, and a
+    first-tag-wins-unconditionally rule would score that echo (== reward 0) instead of the
+    real, often-correct, final answer. Only when no parseable tag exists anywhere does the
+    first '####' marker's first non-blank line count. `moves` is what gets scored;
+    `answer_end` is the char offset just past the scored answer, for --trim-after-answer.
+    answer_end is non-None only when the answer parsed (an unparseable answer leaves the
+    sequence untrimmed). NOTE: when the first tag already parses this is identical to the old
+    behavior, so the change is recovery-only and can never lower an existing score."""
+    for tag in SOKOBAN_ANSWER_TAG_RE.finditer(text):
         moves = normalize_sokoban_moves(tag.group(1))
-        return (tag.end() if moves is not None else None), moves
+        if moves is not None:
+            return tag.end(), moves
     marker = SOKOBAN_MARKER_RE.search(text)
     if marker is None:
         return None, None
