@@ -220,3 +220,5 @@ __marimo__/
 # Training artifacts
 outputs/
 wandb/
+third_party/verl/
+reports/runs/
