@@ -19,8 +19,8 @@ PERSISTENT_CACHE_DIR = f"{VOLUME_MOUNT_PATH}/.cache"
 PERSISTENT_HF_HOME = f"{PERSISTENT_CACHE_DIR}/huggingface"
 PERSISTENT_VLLM_CACHE = f"{PERSISTENT_CACHE_DIR}/vllm"
 # Container-LOCAL on purpose: inductor writes thousands of small artifact files during codegen,
-# and on the FUSE-mounted volume that made a 3-rank --compile cold start take >25 min (measured
-# 2026-06-08) vs the expected 2-5 min on local NVMe. Cold compile per run is the cheaper trade;
+# and on the FUSE-mounted volume that made a 3-rank --compile cold start take >25 min vs the
+# expected 2-5 min on local NVMe. Cold compile per run is the cheaper trade;
 # revisit cross-run warm starts with a tar-to-volume scheme if --compile sticks.
 LOCAL_INDUCTOR_CACHE = "/tmp/torchinductor"
 # Container-LOCAL for the same reason: triton JITs hundreds of small files during vLLM's cold
@@ -38,10 +38,12 @@ CPU_REQUEST = float(os.environ.get("CPU_REQUEST", "16"))
 # NUM_GPUS is resolved from the launch shell, then baked into the image env as NODE_GPUS (see
 # `image` below): the container re-imports this module with no launch env, so without the bake the
 # remote eval_commands/--eval-vllm-dp and speedrun's trainer/generator split would silently
-# mismatch the box. Default 4 (the benchmark node; NTRAINERS then defaults to 1); a larger
-# NUM_GPUS (e.g. 8) just changes the split (NTRAINERS defaults to 3 on 8 GPUs).
+# mismatch the box. Default 8 = the 4B node: NTRAINERS defaults to 3 (3 trainers + 5 vLLM
+# generators) — the confirmed sweet spot (generation keeps the async buffer full at gen-wait ~3s
+# while the trainer is compute-bound at ~35s/step; nt4 drops to 4 generators and goes gen-bound).
+# A smaller NUM_GPUS (e.g. 4) just changes the split and defaults NTRAINERS to 1.
 GPU_TYPE = os.environ.get("GPU_TYPE", "H100")
-NUM_GPUS = int(os.environ.get("NUM_GPUS", os.environ.get("NODE_GPUS", "4")))
+NUM_GPUS = int(os.environ.get("NUM_GPUS", os.environ.get("NODE_GPUS", "8")))
 
 # One-hour target recipe. Keep the ScaleRL-ish optimizer hparams, but use a benchmark-defined
 # non-trivial 1-box train/eval split and avoid debug/measurement I/O that slows the sprint.
@@ -236,8 +238,8 @@ def train(
     env["LD_LIBRARY_PATH"] = _nvidia_ld_library_path()
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     # wandb's run dir must NOT live on the FUSE volume (cwd): wandb-core's many small appends to
-    # the .wandb transaction log wedge on FUSE and the run uploads nothing (observed n2rn8it1,
-    # 7-byte .wandb after 35 min). Container-local disk keeps the sender fed; the server +
+    # the .wandb transaction log wedge on FUSE and the run uploads nothing (a 7-byte .wandb even
+    # after tens of minutes). Container-local disk keeps the sender fed; the server +
     # RunLogger hold the durable record, so losing the local dir with the container is fine.
     env.setdefault("WANDB_DIR", "/tmp/wandb")
     os.makedirs("/tmp/wandb", exist_ok=True)
@@ -288,7 +290,7 @@ def _parse_seeds(spec: str) -> list[int]:
 
 
 def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: list[int],
-                  target: float = 0.35, eval_max_tokens: int = 12288, eval_max_model_len: int = 16384,
+                  target: float = 0.80, eval_max_tokens: int = 12288, eval_max_model_len: int = 16384,
                   interruption: bool = True, interrupt_answer_tokens: int = 512,
                   eval_gpu_mem_util: float = 0.9, eval_vllm_max_num_batched_tokens: int = 40960,
                   eval_vllm_max_num_seqs: int = 16, eval_concurrency: int = 16,
@@ -297,7 +299,7 @@ def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds
     checkpoints (one per training seed): that emits ONE record-eval command that evaluates all
     of them under the same protocol at a single eval seed and ends with the built-in
     significance verdict (mean pass@1 > `target` at p<0.01). A single checkpoint keeps the
-    legacy behavior: one command per eval seed, each with an EXPLICIT --eval-seed and a
+    per-seed behavior: one command per eval seed, each with an EXPLICIT --eval-seed and a
     seed-distinct --eval-output. (Without these, every run silently sampled at speedrun.py's
     default seed 12345 and successive runs overwrote one seed-agnostic JSON — a 5-seed record
     claim would have had ~zero seed-to-seed variance and a meaningless p-value.)"""
@@ -308,7 +310,7 @@ def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds
         raise ValueError(f"EVAL_CHECKPOINT must name at least one checkpoint, got {checkpoint!r}")
     # --eval-data and --eval-top-p come from speedrun's RECIPE (prepended by speedrun.main());
     # --eval-only reads them and ignores the training-side flags. Only the standalone eval-engine
-    # specifics are set here. Defaults are the leaderboard protocol: a generous 32768-token
+    # specifics are set here. Defaults are the leaderboard protocol: a generous 12288-token
     # budget + interruption answer-forcing, which eliminates the budget-truncation confound and
     # measures solving. A strict 6144/no-interruption protocol remains available via
     # EVAL_MAX_TOKENS/EVAL_MAX_MODEL_LEN/EVAL_INTERRUPTION for diagnostics; --eval-max-model-len
@@ -325,9 +327,9 @@ def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds
               "--eval-concurrency", str(eval_concurrency)]
     if eval_data:
         # Appended AFTER the prepended RECIPE, so this overrides its --eval-data (argparse
-        # last-wins). Leave it unset for the official eval set (the RECIPE's
+        # last-wins). Leave it unset for the default eval set (the RECIPE's
         # datasets/sokoban_eval.jsonl); set it only to evaluate on a different set
-        # (e.g. the harder transfer slice for ablations).
+        # (e.g. a harder transfer slice for ablations).
         common += ["--eval-data", eval_data]
     if interruption:
         common += ["--eval-interruption", "--eval-interrupt-answer-tokens", str(interrupt_answer_tokens)]
@@ -358,14 +360,14 @@ def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds
     secrets=runtime_secrets,
 )
 def evaluate(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: str = "12345",
-             target: float = 0.35, eval_max_tokens: int = 12288, eval_max_model_len: int = 16384,
+             target: float = 0.80, eval_max_tokens: int = 12288, eval_max_model_len: int = 16384,
              interruption: bool = True, eval_gpu_mem_util: float = 0.9,
              eval_vllm_max_num_batched_tokens: int = 40960,
              eval_vllm_max_num_seqs: int = 16, eval_concurrency: int = 16,
              eval_data: str | None = None) -> None:
     """Authoritative held-out eval (speedrun.py --eval-only): own vLLM engine over all GPUs at the
-    full 32768-token leaderboard budget. `checkpoint` is a /vol path or an HF id (e.g. Qwen/Qwen3-1.7B
-    for the base) — or a COMMA-SEPARATED list of final checkpoints (one per training seed), which
+    full 12288-token leaderboard budget. `checkpoint` is a /vol path or an HF id (e.g. the base
+    model) — or a COMMA-SEPARATED list of final checkpoints (one per training seed), which
     runs the whole record eval end-to-end in one call: every checkpoint evaluated under the same
     protocol, one JSON each, then the significance verdict (mean pass@1 > `target`, p<0.01).
     For a single checkpoint, `seeds` (comma-separated) runs one eval/JSON per eval seed
@@ -416,7 +418,7 @@ def evaluate(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: str
 )
 def probe_datasets(eval_datasets: list[str], run_name: str, k: int, eval_limit: int,
                    max_tokens: int, max_model_len: int, interruption: bool,
-                   model: str = "Qwen/Qwen3-1.7B") -> None:
+                   model: str = "Qwen/Qwen3-4B-Instruct-2507") -> None:
     """Base-model pass@k probe (P0) across a difficulty ladder. Runs speedrun --eval-only against
     the BASE model on each eval dataset (relative /vol path) and writes one JSON per set to
     outputs/<run>/probe_<stem>.json. Used to locate the productive (0,1) reward-variance band from
@@ -473,7 +475,7 @@ def main() -> None:
         max_tokens = int(os.environ.get("PROBE_MAX_TOKENS", "5632"))
         max_model_len = int(os.environ.get("PROBE_MAX_MODEL_LEN", "7168"))
         interruption = os.environ.get("PROBE_INTERRUPTION", "1") not in ("0", "false", "False", "")
-        model = os.environ.get("PROBE_MODEL", "Qwen/Qwen3-1.7B")
+        model = os.environ.get("PROBE_MODEL", "Qwen/Qwen3-4B-Instruct-2507")
         run_name = os.environ.get("RUN_NAME") or f"sokoban-probe-{datetime.now():%Y%m%d-%H%M%S}"
         print(f"Running base-model probe: sets={eval_datasets} run={run_name} k={k} "
               f"limit={eval_limit} max_tokens={max_tokens} interruption={interruption}", flush=True)
@@ -484,17 +486,17 @@ def main() -> None:
         return
     # Eval mode: EVAL_CHECKPOINT=<vol path or HF id> modal run --detach modal_app.py
     # Record mode: EVAL_CHECKPOINT="ckptA,ckptB,..." (one final checkpoint per training seed) runs
-    # the whole record eval + significance verdict in one call; EVAL_TARGET sets the bar (default = the leaderboard TARGET, 0.35).
+    # the whole record eval + significance verdict in one call; EVAL_TARGET sets the bar (default = the 4B leaderboard TARGET, 0.80).
     eval_ckpt = os.environ.get("EVAL_CHECKPOINT")
     if eval_ckpt:
-        # Leaderboard eval protocol: k=8 on the fixed 128-puzzle eval set
+        # Leaderboard eval protocol: k=8 on the fixed 100-puzzle d12 eval set
         # (speedrun.py RECIPE's --eval-data), 12,288-token budget + interruption, seed 12345,
-        # target 0.35. EVAL_K / EVAL_DATA / EVAL_TARGET / EVAL_LIMIT override for ablations.
+        # target 0.80. EVAL_K / EVAL_DATA / EVAL_TARGET / EVAL_LIMIT override for ablations.
         k = int(os.environ.get("EVAL_K", "8"))
         eval_data = os.environ.get("EVAL_DATA")  # None => speedrun RECIPE's --eval-data (the 128 set)
         eval_limit = int(os.environ.get("EVAL_LIMIT", "0"))  # 0 = full eval set; >0 = first N (cheap dev)
         seeds = ",".join(str(s) for s in _parse_seeds(os.environ.get("EVAL_SEEDS", "12345")))
-        target = float(os.environ.get("EVAL_TARGET", "0.35"))
+        target = float(os.environ.get("EVAL_TARGET", "0.80"))
         eval_max_tokens = int(os.environ.get("EVAL_MAX_TOKENS", "12288"))
         eval_max_model_len = int(os.environ.get("EVAL_MAX_MODEL_LEN", "16384"))
         eval_interruption = os.environ.get("EVAL_INTERRUPTION", "1") not in ("0", "false", "False", "")
@@ -504,7 +506,7 @@ def main() -> None:
         eval_concurrency = int(os.environ.get("EVAL_CONCURRENCY", "32"))
         run_name = os.environ.get("RUN_NAME") or f"sokoban-eval-{datetime.now():%Y%m%d-%H%M%S}"
         print(f"Running eval: ckpt={eval_ckpt}, run={run_name}, k={k}, limit={eval_limit}, "
-              f"data={eval_data or 'official (RECIPE)'}, seeds=[{seeds}], target={target}, "
+              f"data={eval_data or 'default (RECIPE)'}, seeds=[{seeds}], target={target}, "
               f"max_tokens={eval_max_tokens}, max_model_len={eval_max_model_len}, "
               f"interruption={eval_interruption}, gpu_mem_util={eval_gpu_mem_util}, "
               f"batched_tokens={eval_vllm_max_num_batched_tokens}, "
@@ -520,13 +522,12 @@ def main() -> None:
     # smaller boxes default to 1 trainer (3 trainers + 1 generator would starve generation).
     # Trainer count is a torchrun launch param (not a speedrun CLI arg), so it lives here; the rest
     # of the recipe is speedrun.py RECIPE.
-    # Full sprint e.g.: MAX_STEPS=150 modal run --detach modal_app.py
-    # Small node e.g.: NUM_GPUS=4 MODEL=Qwen/Qwen3-1.7B MAX_STEPS=100 modal run --detach modal_app.py
+    # Full sprint e.g.: MAX_STEPS=50 modal run --detach modal_app.py  (default 8 GPUs, 4B-Instruct-2507)
     max_steps = int(os.environ.get("MAX_STEPS", "4"))
     num_trainers = int(os.environ.get("NTRAINERS", "3" if NUM_GPUS >= 8 else "1"))
     extra_args = shlex.split(os.environ.get("EXTRA_ARGS", ""))
-    # MODEL overrides the RECIPE/argparse base model (default Qwen/Qwen3-1.7B). Prepended so an
-    # explicit --model in EXTRA_ARGS still wins (argparse last-wins).
+    # MODEL overrides the RECIPE/argparse base model (default Qwen/Qwen3-4B-Instruct-2507). Prepended
+    # so an explicit --model in EXTRA_ARGS still wins (argparse last-wins).
     model = os.environ.get("MODEL")
     if model:
         extra_args = ["--model", model, *extra_args]
