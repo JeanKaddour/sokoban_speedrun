@@ -221,4 +221,5 @@ __marimo__/
 outputs/
 wandb/
 third_party/verl/
-reports/runs/
+reports/
+modal_verl_app.py
