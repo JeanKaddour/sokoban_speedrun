@@ -45,6 +45,10 @@ NODE_GPUS = int(os.environ.get("NODE_GPUS", "4"))
 # output-format guidance (rules-legal), sits in the injected marker (loss-masked, no gradient), and the
 # first-tag-wins extractor scores it exactly like a model-emitted tag.
 INTERRUPTION_TEXT = " Okay, time is up. Let me stop thinking and formulate a final answer now.\n</think>\n\n<answer>"
+# Non-thinking bases (e.g. Qwen3-*-Instruct-2507) never open a <think> block, so the </think>
+# close-tag and "stop thinking" framing are out-of-distribution; use a clean marker that only forces
+# the final <answer>. Selected by --enable-thinking at the (train/eval) tokenization sites below.
+INTERRUPTION_TEXT_NO_THINK = " Okay, time is up. Let me give my final answer now.\n\n<answer>"
 TRUNC_EWMA_ALPHA = 0.3        # weight on the current step (0.7 on history): smooths to a *sustained* climb, not a transient
 TRUNC_WARN_EWMA = 0.05        # ScaleRL's "keep <5%" line — log a warning at/above it
 GNORM_EWMA_ALPHA = 0.3
@@ -94,9 +98,10 @@ RECIPE = [
     "--top-p", "0.95",
     "--max-new-tokens", "5632",
     "--max-model-len", "7168",
-    "--device-batch-size", "4",
+    "--device-batch-size", "2",
     "--logits-chunk-size", "2048",
     "--gradient-checkpointing",
+    "--no-log-entropy",
     "--interruption",
     "--interrupt-answer-tokens", "512",
     "--learning-rate", "1.6e-6",
@@ -500,21 +505,17 @@ def extract_sampled_logprobs(completion_output) -> list[float]:
     return [co.logprobs[i][tok_id].logprob for i, tok_id in enumerate(co.token_ids)]
 
 
-async def _vllm_generate(engine, prompt_token_ids, n, *, temperature, top_p, top_k, max_tokens, logprobs, seed):
+async def _vllm_generate(engine, prompt_token_ids, n, *, temperature, top_p, top_k, max_tokens, logprobs, seed, min_p=0.0):
     """n samples as n CONCURRENT n=1 requests, NOT one n=n request. vLLM 0.22's parallel-sampling
     output aggregation (RequestOutput.add over child completions) has a load-dependent race that
-    kills the AsyncLLM output_handler (`AttributeError: 'NoneType'.index`, then EngineDeadError for
-    every later request) — observed 3x on 2026-06-12 with Qwen3-1.7B on 4 GPUs, whose ~2x decode
-    rate makes it ~hourly; never observed on the slower 4B/8-GPU runs. The split is semantics-
-    preserving: V1 already fans n>1 into one child request per sample (engine load identical) and
-    derives child seeds as seed+index (parallel_sampling.py), which is replicated here exactly."""
+    kills the AsyncLLM output_handler."""
     from vllm import SamplingParams
     from vllm.inputs import TokensPrompt
     from vllm.sampling_params import RequestOutputKind
 
     async def _one(i: int):
         sp = SamplingParams(
-            n=1, temperature=temperature, top_p=top_p, top_k=top_k, max_tokens=max_tokens,
+            n=1, temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p, max_tokens=max_tokens,
             logprobs=logprobs, seed=(None if seed is None else seed + i),
             output_kind=RequestOutputKind.FINAL_ONLY,
         )
@@ -542,9 +543,11 @@ def make_interrupt_config(
     base_temperature: float,
     base_top_p: float,
     base_top_k: int,
+    base_min_p: float = 0.0,
     temperature: float | None = None,
     top_p: float | None = None,
     top_k: int | None = None,
+    min_p: float | None = None,
     phase1_min_tokens: int | None = None,
     phase1_max_tokens: int | None = None,
 ) -> dict[str, Any]:
@@ -561,6 +564,7 @@ def make_interrupt_config(
         "temperature": base_temperature if temperature is None else temperature,
         "top_p": base_top_p if top_p is None else top_p,
         "top_k": base_top_k if top_k is None else top_k,
+        "min_p": base_min_p if min_p is None else min_p,
     }
 
 
@@ -575,6 +579,7 @@ async def generate_group(engine, prompt_token_ids: list[int], num_samples: int, 
     temperature = sampling.get("temperature", 0.8)
     top_p = sampling.get("top_p", 1.0)
     top_k = sampling.get("top_k", 0)
+    min_p = sampling.get("min_p", 0.0)
     logprobs = sampling.get("logprobs", 0)
     seed = sampling.get("seed")
     max_tokens = int(sampling.get("max_tokens", 1024))
@@ -588,7 +593,7 @@ async def generate_group(engine, prompt_token_ids: list[int], num_samples: int, 
             max_tokens = random.randint(lo, hi) if hi > lo else lo
     outputs = await _vllm_generate(
         engine, prompt_token_ids, num_samples,
-        temperature=temperature, top_p=top_p, top_k=top_k,
+        temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p,
         max_tokens=max_tokens, logprobs=logprobs, seed=seed,
     )
 
@@ -616,6 +621,7 @@ async def generate_group(engine, prompt_token_ids: list[int], num_samples: int, 
         answer_temperature = float(interrupt.get("temperature", temperature))
         answer_top_p = float(interrupt.get("top_p", top_p))
         answer_top_k = int(interrupt.get("top_k", top_k))
+        answer_min_p = float(interrupt.get("min_p", min_p))
 
         async def _continue(idx: int, phase1: list[int], phase1_lps: list[float]):
             # Clamp the forced-answer budget so the phase-2 prompt never exceeds max_model_len
@@ -630,7 +636,7 @@ async def generate_group(engine, prompt_token_ids: list[int], num_samples: int, 
                 return
             cont = await _vllm_generate(
                 engine, list(prompt_token_ids) + phase1 + marker, 1,
-                temperature=answer_temperature, top_p=answer_top_p, top_k=answer_top_k,
+                temperature=answer_temperature, top_p=answer_top_p, top_k=answer_top_k, min_p=answer_min_p,
                 max_tokens=budget, logprobs=logprobs, seed=seed,
             )
             ans_toks = list(cont[0].token_ids) if cont else []
@@ -1814,8 +1820,11 @@ def chunked_policy_loss(model, input_ids, attention_mask, labels, advantages, *,
 
 
 def batch_normalize_advantages(advantages: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """ScaleRL batch-level advantage normalization: scale (already per-puzzle centered)
-    advantages by the batch std. Safe when std == 0 (returns ~zeros)."""
+    """Batch-level advantage normalization for estimators that intentionally use it.
+
+    GRPO's reference estimator already normalizes rewards inside each prompt group; the
+    caller skips this extra batch rescale for that mode.
+    """
     std = advantages.std(unbiased=False)
     return advantages / (std + eps)
 
@@ -1823,18 +1832,29 @@ def batch_normalize_advantages(advantages: torch.Tensor, eps: float = 1e-6) -> t
 def compute_group_advantages(rewards: torch.Tensor, mode: str = "centered") -> torch.Tensor:
     """Per-group advantages from one puzzle group's rewards.
 
-    'centered' (default, the historical behavior): r - mean(r) — an RLOO/Dr.GRPO-style group
+    'grpo': (r - mean(r)) / std(r), matching the reference GRPO outcome advantage used by
+    verl/slime. Groups with fewer than two samples or near-zero std return zeros; with the
+    zero-variance filter enabled they are rejected anyway.
+
+    'centered': r - mean(r) — an RLOO/Dr.GRPO-style group
     baseline with NO per-group std division (so the question-level difficulty bias Dr.GRPO and
     GRPO-done-right warn about is already avoided; the only std rescale is the global batch one).
 
     'maxrl' (arXiv MaxRL, Alg. 1): (r - r_hat) / (N * r_hat) when r_hat > 0, else all-zero — the
     success-conditioned maximum-likelihood gradient estimator. Its population weight
     (1-(1-p)^T)/p up-weights low-pass-rate (hard) prompts and down-weights easy ones, vs
-    centered/GRPO which over-weight easy prompts. All-fail groups (r_hat == 0) get zero advantage
+    centered estimators which over-weight easy prompts. All-fail groups (r_hat == 0) get zero advantage
     (no gradient), matching the zero-variance filter. The global batch-std rescale that follows is
     a single scalar, so it preserves the relative inter-group weighting while keeping the LR scale
     comparable to the centered baseline."""
     r_hat = rewards.mean()
+    if mode == "grpo":
+        if rewards.numel() < 2:
+            return torch.zeros_like(rewards)
+        std = rewards.std()
+        if not torch.isfinite(std) or float(std) <= 1e-6:
+            return torch.zeros_like(rewards)
+        return (rewards - r_hat) / (std + 1e-6)
     if mode == "maxrl":
         if float(r_hat) > 0.0:
             return (rewards - r_hat) / (rewards.numel() * r_hat)
@@ -2168,25 +2188,29 @@ def _eval_one_checkpoint(args: argparse.Namespace, model_path: str, multi: bool)
         temperature=args.eval_temperature,
         top_p=args.eval_top_p,
         top_k=args.eval_top_k,
+        min_p=args.eval_min_p,
         max_tokens=args.eval_max_tokens,
         seed=args.eval_seed,
         logprobs=0,
     )
     if args.eval_interruption:
-        marker_ids = tokenizer(INTERRUPTION_TEXT, add_special_tokens=False)["input_ids"]
+        marker_ids = tokenizer(
+            INTERRUPTION_TEXT if args.enable_thinking else INTERRUPTION_TEXT_NO_THINK,
+            add_special_tokens=False)["input_ids"]
         sampling["interrupt"] = make_interrupt_config(
             marker_ids, args.eval_interrupt_answer_tokens, args.eval_max_model_len,
             base_temperature=args.eval_temperature, base_top_p=args.eval_top_p,
-            base_top_k=args.eval_top_k,
+            base_top_k=args.eval_top_k, base_min_p=args.eval_min_p,
             temperature=args.eval_interrupt_temperature,
             top_p=args.eval_interrupt_top_p, top_k=args.eval_interrupt_top_k,
+            min_p=args.eval_interrupt_min_p,
         )
 
     print(
         f"[eval] model={model_path} eval_data={args.eval_data} "
         f"n={len(indices) if indices is not None else len(eval_task)} k={args.eval_k} "
         f"max_tokens={args.eval_max_tokens} sampling=temp{args.eval_temperature}/top_p{args.eval_top_p}/"
-        f"top_k{args.eval_top_k}/seed{args.eval_seed} "
+        f"top_k{args.eval_top_k}/min_p{args.eval_min_p}/seed{args.eval_seed} "
         f"interruption={args.eval_interruption}",
         flush=True,
     )
@@ -3084,7 +3108,9 @@ def run_pipeline(
     train_prompt_cache: list[PromptCacheEntry] = []
     interrupt_marker_ids: list[int] | None = None
     if args.interruption or args.inloop_eval_interruption:
-        interrupt_marker_ids = tokenizer(INTERRUPTION_TEXT, add_special_tokens=False)["input_ids"]
+        interrupt_marker_ids = tokenizer(
+            INTERRUPTION_TEXT if args.enable_thinking else INTERRUPTION_TEXT_NO_THINK,
+            add_special_tokens=False)["input_ids"]
     sampling = dict(temperature=args.temperature, top_p=args.top_p, top_k=args.top_k,
                     max_tokens=args.max_new_tokens)
     if args.interruption:
@@ -3762,10 +3788,14 @@ def run_pipeline(
                     # empty batch never reaches sort_and_shard_for_microbatching -> build_rl_batch_varprefix_cpu.
                     assert cs.step_examples, "Phase A produced an empty step batch (would break scatter)"
 
-                    # ---- Phase B (RANK 0 ONLY): batch-normalize advantages over the FULL step batch,
-                    # BEFORE scattering. Per-shard std would be wrong, so this must precede the split.
-                    adv_all = batch_normalize_advantages(
-                        torch.tensor([e.advantage for e in cs.step_examples], dtype=torch.float32, device=device))
+                    # ---- Phase B (RANK 0 ONLY): finalize advantages over the FULL step batch,
+                    # BEFORE scattering. Per-shard normalization would be wrong, so this must
+                    # precede the split. Reference GRPO already normalized inside each prompt group;
+                    # centered/maxrl keep the historical batch-level rescale.
+                    adv_all = torch.tensor(
+                        [e.advantage for e in cs.step_examples], dtype=torch.float32, device=device)
+                    if args.advantage_mode != "grpo":
+                        adv_all = batch_normalize_advantages(adv_all)
                     adv_all_list = adv_all.detach().cpu().tolist()
                     training_step_examples = strip_rollout_completions(cs.step_examples)
                     # ScaleRL prompt-level loss aggregation: tag every sample with its prompt group's
@@ -4116,7 +4146,10 @@ def _add_vllm_tuning_args(parser: argparse.ArgumentParser, *, prefix: str, ctx: 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Full fine-tuning RL on fixed Reasoning Gym Sokoban JSONL data with a Hugging Face causal LM")
-    parser.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B", help="HF model id or local path")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B-Instruct-2507",
+                        help="HF model id or local path. Default is the non-thinking Instruct-2507 base "
+                             "(pairs with --no-enable-thinking, the default). For a hybrid thinking base "
+                             "(e.g. Qwen/Qwen3-1.7B) pass --enable-thinking as well.")
     parser.add_argument("--trust-remote-code", action="store_true", help="Pass trust_remote_code=True to HF loaders")
     parser.add_argument("--device", type=str, default="", help="cuda|cpu|mps, empty means autodetect")
     parser.add_argument("--train-data", type=Path, default=Path("datasets/sokoban_train.jsonl"), help="Train JSONL file with question, answer, and metadata.gamestr")
@@ -4232,7 +4265,12 @@ def build_parser() -> argparse.ArgumentParser:
                              "download). If the kernel can't load it falls back to 'sdpa' with a warning. "
                              "fp32 head/tie is unaffected (FA2 runs only the bf16 body). Pass 'sdpa' to "
                              "force it instead.")
-    parser.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=False,
+                        help="Pass enable_thinking to the chat template AND select the interruption marker. "
+                             "Default False matches the Instruct-2507 base (no <think> blocks; the marker "
+                             "drops </think>). Set --enable-thinking for hybrid thinking bases (e.g. Qwen3-1.7B), "
+                             "which need the <think>-aware marker. (For Instruct-2507 the template arg itself "
+                             "is a no-op, but this flag still drives the marker choice.)")
     parser.add_argument("--save-every", type=int, default=60, help="Save every N steps; 0 disables periodic saves")
     parser.add_argument("--save-final", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
@@ -4286,13 +4324,15 @@ def build_parser() -> argparse.ArgumentParser:
                              "All ratios are vs the vLLM behavior logprobs (async off-policy, up to "
                              "--max-staleness versions stale; there is no second 'old policy' forward), so "
                              "the clip also absorbs the bf16-generator/fp32-trainer mismatch.")
-    parser.add_argument("--advantage-mode", choices=["centered", "maxrl"], default="centered",
-                        help="Per-group advantage estimator (independent of --loss-fn). 'centered' "
-                             "(default): r - mean(r), an RLOO/Dr.GRPO-style group baseline with no "
-                             "per-group std. 'maxrl' (arXiv MaxRL): (r - r_hat)/(N * r_hat), up-"
-                             "weighting low-pass-rate (hard) prompts toward the maximum-likelihood "
-                             "gradient and zeroing all-fail groups. The global batch-std rescale "
-                             "still applies (preserves relative weighting, keeps LR comparable).")
+    parser.add_argument("--advantage-mode", choices=["auto", "grpo", "centered", "maxrl"], default="auto",
+                        help="Per-group advantage estimator. 'auto' uses 'grpo' for --loss-fn grpo "
+                             "and 'centered' otherwise. 'grpo': (r - group_mean) / group_std, matching "
+                             "verl/slime GRPO. 'centered': r - group_mean, an RLOO/Dr.GRPO-style "
+                             "baseline with no per-group std. 'maxrl' (arXiv MaxRL): "
+                             "(r - r_hat)/(N * r_hat), up-weighting low-pass-rate (hard) prompts "
+                             "toward the maximum-likelihood gradient and zeroing all-fail groups. "
+                             "The global batch-std rescale still applies to centered/maxrl "
+                             "(preserves relative weighting, keeps LR comparable).")
     parser.add_argument("--entropy-coef", type=float, default=0.0,
                         help="Entropy-bonus coefficient: adds +entropy_coef * mean H(pi) over valid "
                              "tokens to the objective (aggregated with the SAME denominator as the "
@@ -4397,9 +4437,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-interrupt-top-k", type=int, default=None,
                         help="Top-k sampling for forced final-answer continuations during eval; "
                              "default inherits --eval-top-k.")
+    parser.add_argument("--eval-interrupt-min-p", type=float, default=None,
+                        help="Min-p sampling for forced final-answer continuations during eval; "
+                             "default inherits --eval-min-p.")
     parser.add_argument("--eval-temperature", type=float, default=0.8, help="--eval-only sampling temperature.")
     parser.add_argument("--eval-top-p", type=float, default=0.95, help="--eval-only nucleus sampling threshold.")
     parser.add_argument("--eval-top-k", type=int, default=0, help="--eval-only top-k (0 disables).")
+    parser.add_argument("--eval-min-p", type=float, default=0.0,
+                        help="--eval-only min-p (0 disables). Keeps tokens with prob >= min_p * max_prob; "
+                             "a temperature-robust tail cutoff. Combine with --eval-top-p 1.0 to isolate it.")
     parser.add_argument("--eval-seed", type=int, default=12345,
                         help="Sampling/bootstrap seed for --eval-only (vary per leaderboard seed; keep eval DATA fixed).")
     parser.add_argument("--eval-output", type=Path, default=None,
@@ -4432,7 +4478,8 @@ def _validate_sampling_args(args: argparse.Namespace) -> None:
         value = getattr(args, name)
         if value is not None and value < 0.0:
             raise ValueError(f"--{name.replace('_', '-')} must be non-negative")
-    for name in ("top_p", "interrupt_top_p", "eval_top_p", "eval_interrupt_top_p"):
+    for name in ("top_p", "interrupt_top_p", "eval_top_p", "eval_interrupt_top_p",
+                 "eval_min_p", "eval_interrupt_min_p"):
         value = getattr(args, name)
         if value is not None and not (0.0 <= value <= 1.0):
             raise ValueError(f"--{name.replace('_', '-')} must be in [0, 1]")
@@ -4492,6 +4539,8 @@ def _resolve_loss_args(args: argparse.Namespace) -> None:
     """Resolve per-loss clip defaults (the PPO and GSPO epsilons differ by ~3 orders of
     magnitude, so a shared default would be a footgun) and validate the combination.
     Mutates args in place so the run-log header records the RESOLVED values."""
+    if args.advantage_mode == "auto":
+        args.advantage_mode = "grpo" if args.loss_fn == "grpo" else "centered"
     if args.clip_ratio_c is not None and args.clip_ratio_c <= 0:
         args.clip_ratio_c = None  # documented disable switch
     if args.loss_fn == "cispo":
