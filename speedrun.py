@@ -84,10 +84,10 @@ EVAL_PID_BASE = 1_000_000_000
 # the recipe and therefore OVERRIDES the recipe value (argparse last-wins). --run and --max-steps are
 # deliberately NOT here (they vary per launch). Eval-only invocations also get the recipe prepended,
 # so --eval-data below is also the eval set --eval-only scores against unless overridden.
-# TRAINER COUNT: the 1.7B/4xH100 setup runs NTRAINERS=1 (1 trainer rank + 3 vLLM generators) —
-# the trainer is token-compute-bound here and a 2nd trainer starves generation (measured: collect
-# time blows up). That is a torchrun launch param, NOT a speedrun CLI arg, so modal_app.py defaults
-# it from the GPU count (1 on <8-GPU boxes, 3 on the legacy 8-GPU node), not in this list.
+# TRAINER COUNT: the 8-GPU node runs NTRAINERS=3 (3 trainer ranks + 5 vLLM generators) — the sweet
+# spot: generation keeps the async buffer full while the trainer is compute-bound, and a 4th trainer
+# starves generation. That is a torchrun launch param, NOT a speedrun CLI arg, so modal_app.py
+# defaults it from the GPU count (3 on 8-GPU nodes, 1 on smaller boxes), not in this list.
 RECIPE = [
     "--dtype", "float32",       # load trainer params/head fp32; train autocast runs body bf16, head/logits fp32
     "--train-data", "datasets/sokoban_train.jsonl",
@@ -98,10 +98,10 @@ RECIPE = [
     "--top-p", "0.95",
     "--max-new-tokens", "5632",
     "--max-model-len", "7168",
-    "--device-batch-size", "2",
+    "--device-batch-size", "2",   # 4B fp32 params+grads+optimizer fit one 80GB H100 at db=2 (microbatch only, grad-identical)
     "--logits-chunk-size", "2048",
     "--gradient-checkpointing",
-    "--no-log-entropy",
+    "--no-log-entropy",           # the entropy softmax temp would OOM 4B at the memory ceiling
     "--interruption",
     "--interrupt-answer-tokens", "512",
     "--learning-rate", "1.6e-6",
@@ -989,8 +989,8 @@ def build_optimizer(parameters: Iterator[torch.nn.Parameter], args: argparse.Nam
     if args.optimizer != "adamw":
         raise ValueError(f"Unsupported optimizer {args.optimizer!r}; only 'adamw' is implemented")
     params = list(parameters)
-    # fused=True single-kernels the update over the ~27GB of fp32 param/grad/state traffic
-    # (1.7B params × 16 B) instead of the multi-kernel foreach path. Same update math
+    # fused=True single-kernels the update over the ~64GB of fp32 param/grad/state traffic
+    # (4B params × 16 B) instead of the multi-kernel foreach path. Same update math
     # (not bitwise). CUDA-only, so fall back to the default path on CPU (tests / --device cpu).
     use_fused = bool(params) and all(p.is_cuda for p in params)
     return torch.optim.AdamW(
@@ -3689,7 +3689,7 @@ def run_pipeline(
             checkpoint_dir = save_hf_checkpoint(model, tokenizer, run_dir, step)
             print0(f"Saved checkpoint to {checkpoint_dir}")
             if step == num_steps - 1 and args.save_final:
-                # Official record clock stops here: the final checkpoint has finished writing.
+                # The record clock stops here: the final checkpoint has finished writing.
                 run_logger.log_final_checkpoint(checkpoint_dir)
         if trunc_ewma >= TRUNC_WARN_EWMA:
             print0(f"WARNING step {step}: gen/length_trunc_ewma={trunc_ewma:.3f} "
@@ -4065,8 +4065,8 @@ def run_pipeline(
                 if child.is_alive():
                     # SIGTERM can be ignored by a child wedged in vLLM engine teardown; without the
                     # SIGKILL, multiprocessing's atexit join blocks interpreter exit FOREVER (the
-                    # container then idle-bills until externally cancelled — hit 2/4 runs 2026-06-12,
-                    # both with clean W&B finish + committed checkpoint).
+                    # container then idle-bills until externally cancelled, even after a clean W&B
+                    # finish + committed checkpoint).
                     child.kill()
                     child.join(timeout=5)
         if master_process and wandb_rollouts_enabled and wandb_rollout_rows:
@@ -4148,8 +4148,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Full fine-tuning RL on fixed Reasoning Gym Sokoban JSONL data with a Hugging Face causal LM")
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B-Instruct-2507",
                         help="HF model id or local path. Default is the non-thinking Instruct-2507 base "
-                             "(pairs with --no-enable-thinking, the default). For a hybrid thinking base "
-                             "(e.g. Qwen/Qwen3-1.7B) pass --enable-thinking as well.")
+                             "(pairs with --no-enable-thinking, the default). For a hybrid thinking base, "
+                             "pass --enable-thinking as well.")
     parser.add_argument("--trust-remote-code", action="store_true", help="Pass trust_remote_code=True to HF loaders")
     parser.add_argument("--device", type=str, default="", help="cuda|cpu|mps, empty means autodetect")
     parser.add_argument("--train-data", type=Path, default=Path("datasets/sokoban_train.jsonl"), help="Train JSONL file with question, answer, and metadata.gamestr")
@@ -4268,8 +4268,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=False,
                         help="Pass enable_thinking to the chat template AND select the interruption marker. "
                              "Default False matches the Instruct-2507 base (no <think> blocks; the marker "
-                             "drops </think>). Set --enable-thinking for hybrid thinking bases (e.g. Qwen3-1.7B), "
-                             "which need the <think>-aware marker. (For Instruct-2507 the template arg itself "
+                             "drops </think>). Set --enable-thinking for a hybrid thinking base, which "
+                             "needs the <think>-aware marker. (For Instruct-2507 the template arg itself "
                              "is a no-op, but this flag still drives the marker choice.)")
     parser.add_argument("--save-every", type=int, default=60, help="Save every N steps; 0 disables periodic saves")
     parser.add_argument("--save-final", action=argparse.BooleanOptionalAction, default=True)
@@ -4414,8 +4414,11 @@ def build_parser() -> argparse.ArgumentParser:
                              "Pass one final checkpoint per training seed to run the full record eval: "
                              "each is evaluated under the same protocol, then the significance test "
                              "(mean pass@1 > --eval-target at --eval-alpha) prints a PASS/FAIL verdict.")
-    parser.add_argument("--eval-target", type=float, default=0.35,
-                        help="Leaderboard TARGET: the pass@1 a record must clear (see README rules).")
+    parser.add_argument("--eval-target", type=float, default=0.80,
+                        help="Leaderboard TARGET: the pass@1 lower-CI a record must clear. 0.80 is the "
+                             "gate (Qwen3-4B-Instruct-2507 on the eval set: base ~0.53, a trained run ~0.84 — "
+                             "a deliberate stretch the current best barely clears, so record claims should "
+                             "seed-replicate).")
     parser.add_argument("--eval-alpha", type=float, default=0.01,
                         help="Significance level for the record t-test (multi-checkpoint eval).")
     parser.add_argument("--eval-k", type=int, default=16,
