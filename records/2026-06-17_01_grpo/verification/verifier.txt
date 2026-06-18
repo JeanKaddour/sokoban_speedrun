@@ -1,0 +1,4 @@
+Self-verified by @JeanKaddour
+Recipe re-run from scratch at seed 42 on an independent 8xH100 Modal node (W&B run vklffm0d),
+then offline re-scored by verify_record.py. Both submission (seed 43) and this rerun clear the
+0.80 target by their lower 95% bootstrap CI.
