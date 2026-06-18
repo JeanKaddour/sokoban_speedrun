@@ -7,7 +7,8 @@ Usage:
         python records/plot_hero_animation.py
 
     # or pin a specific record dir:
-    uv run ... python records/plot_hero_animation.py records/2026-06-17_01_grpo
+    uv run ... python records/plot_hero_animation.py records/2026-06-17_01_grpo \
+        --wandb-runs entity/project/run_id
 
     # dump a single still (for eyeballing the composition) instead of the GIF:
     uv run ... python records/plot_hero_animation.py records/<dir> --still records/hero_still.png
@@ -48,8 +49,8 @@ from make_record_report import (  # noqa: E402
     SEED_COLORS,
     TARGET_C,
     aligned_training_series,
+    fetch_wandb_history,
     glow,
-    load_online_metric_artifacts,
     parse_train_log,
     set_house_style,
     smooth,
@@ -116,15 +117,12 @@ def select_current_record(root: Path, target: float) -> Path:
     return min(candidates)[1]
 
 
-def load_record(record_dir: Path) -> tuple[dict, dict, object | None]:
+def load_record(record_dir: Path) -> tuple[dict, dict]:
     paths = record_primary_paths(record_dir)
     if paths is None:
         raise SystemExit(f"{record_dir}: need train_log_seed*.txt and eval_seed*.json")
     log_path, eval_path = paths
-    seed = log_path.stem.replace("train_log_", "")
-    online_frames = load_online_metric_artifacts(record_dir, [seed])
-    online_frame = online_frames[0] if online_frames is not None else None
-    return parse_train_log(log_path), json.loads(eval_path.read_text()), online_frame
+    return parse_train_log(log_path), json.loads(eval_path.read_text())
 
 
 def frame_state(frac: float, log: dict, eval_result: dict, base_pass: float,
@@ -215,6 +213,8 @@ def main() -> None:
                         help="where to look for the current record when record_dir is omitted")
     parser.add_argument("--out", type=Path, default=RECORDS_DIR / "hero.gif")
     parser.add_argument("--target", type=float, default=0.80)
+    parser.add_argument("--wandb-runs", default=None,
+                        help="optional W&B run path/URL for the train solve-rate curve")
     parser.add_argument("--base-pass", type=float, default=0.57,
                         help="base-model pass@1 the scorecard counts up from")
     parser.add_argument("--frames", type=int, default=66, help="animated frames before the end-hold")
@@ -229,7 +229,8 @@ def main() -> None:
     record_dir = args.record_dir or select_current_record(args.records_root, args.target)
     if args.record_dir is None:
         print(f"current record: {record_dir}")
-    log, eval_result, online_frame = load_record(record_dir)
+    log, eval_result = load_record(record_dir)
+    online_frame = fetch_wandb_history([args.wandb_runs])[0] if args.wandb_runs else None
     args.out.parent.mkdir(parents=True, exist_ok=True)
 
     if args.still is not None:

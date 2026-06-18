@@ -11,8 +11,8 @@ norm + loss), and eval (pass@k vs the target line).
 Artifact-only mode needs nothing beyond the committed record directory
 (train_log_seed*.txt + eval_seed*.json): it parses the per-step record-clock lines and
 the args attestation straight from the run logs, so any reviewer can regenerate the
-plots from the PR alone. --wandb-runs swaps the training panel to the unbiased online
-solve-rate metric from W&B history; if your metrics live elsewhere, anything that yields
+plots from the PR alone. --wandb-runs fetches the train solve-rate metric from W&B;
+if your metrics live elsewhere, anything that yields
 (step, online_solved_frac) can be adapted — see fetch_wandb_history for the expected shape.
 
 The record README is written with the human-authored sections preserved: everything
@@ -30,6 +30,7 @@ import json
 import math
 import re
 from pathlib import Path
+from urllib.parse import urlparse
 
 import matplotlib
 
@@ -67,6 +68,10 @@ TARGET_C = "#ff7b72"  # target / threshold lines (warm coral)
 SEED_COLORS = ["#22d3ee", "#fbbf24", "#a78bfa"]  # cyan / amber / violet — pop on dark
 DASH = (0, (5, 4))    # shared dashed style for reference lines
 SMOOTH = 8            # rolling window for the bold trend line
+ONLINE_METRIC = "reward/online_solved_frac_unfiltered"
+ONLINE_METRIC_ALIASES = (ONLINE_METRIC, "online_solved_frac", "online_solve_rate")
+ONLINE_TRAIN_LABEL = "train solve rate"
+FILTERED_TRAIN_LABEL = "filtered accepted-train diagnostic"
 
 
 def set_house_style() -> None:
@@ -120,6 +125,77 @@ def pct_axis(ax) -> None:
 def smooth(s):
     """Rolling-mean trend line; min_periods=1 so the early steps still render."""
     return s.rolling(SMOOTH, min_periods=1).mean()
+
+
+def normalize_wandb_run(run_path: str) -> str:
+    """Accept either entity/project/run_id or a wandb.ai run URL."""
+    run_path = run_path.strip()
+    if not run_path.startswith(("http://", "https://")):
+        return run_path.strip("/")
+    parsed = urlparse(run_path)
+    parts = [p for p in parsed.path.split("/") if p]
+    if len(parts) >= 4 and parts[2] == "runs":
+        return f"{parts[0]}/{parts[1]}/{parts[3]}"
+    raise SystemExit(f"could not parse W&B run URL: {run_path}")
+
+
+def online_metric_col(df: pd.DataFrame) -> str:
+    for col in ONLINE_METRIC_ALIASES:
+        if col in df.columns:
+            return col
+    raise SystemExit(
+        f"online metric history needs one of {', '.join(ONLINE_METRIC_ALIASES)}"
+    )
+
+
+def normalize_online_frame(df: pd.DataFrame) -> pd.DataFrame:
+    if "step" not in df.columns:
+        raise SystemExit("online metric history needs a step column")
+    col = online_metric_col(df)
+    out = df[["step", col]].dropna().rename(columns={col: ONLINE_METRIC}).copy()
+    out["step"] = out["step"].astype(int)
+    out[ONLINE_METRIC] = out[ONLINE_METRIC].astype(float)
+    return out.sort_values("step").drop_duplicates("step", keep="last").reset_index(drop=True)
+
+
+def aligned_training_series(log: dict, online_frame: pd.DataFrame | None = None) -> dict:
+    """Return x/y vectors for the training plot and a precise metric label."""
+    df = log["df"]
+    if online_frame is None:
+        return {
+            "raw": df.solved_frac.reset_index(drop=True),
+            "xstep": df.step.reset_index(drop=True),
+            "xclock": (df.record_time_s / 60.0).reset_index(drop=True),
+            "label": FILTERED_TRAIN_LABEL,
+            "source": "filtered",
+        }
+
+    w = normalize_online_frame(online_frame)
+    log_by_step = df.set_index("step")["record_time_s"]
+    step_values = w["step"].astype(int)
+    if step_values.add(1).isin(log_by_step.index).all():
+        # W&B logs the loop's zero-based step; RunLogger prints one-based step:N/total.
+        plot_step = step_values + 1
+    elif step_values.isin(log_by_step.index).all():
+        plot_step = step_values
+    else:
+        n = min(len(w), len(df))
+        w = w.iloc[:n].reset_index(drop=True)
+        return {
+            "raw": w[ONLINE_METRIC],
+            "xstep": df.step.iloc[:n].reset_index(drop=True),
+            "xclock": (df.record_time_s.iloc[:n] / 60.0).reset_index(drop=True),
+            "label": ONLINE_TRAIN_LABEL,
+            "source": "online",
+        }
+
+    return {
+        "raw": w[ONLINE_METRIC].reset_index(drop=True),
+        "xstep": plot_step.reset_index(drop=True),
+        "xclock": (plot_step.map(log_by_step) / 60.0).reset_index(drop=True),
+        "label": ONLINE_TRAIN_LABEL,
+        "source": "online",
+    }
 
 
 def target_line(ax, value: float, label: str, color: str = TARGET_C) -> None:
@@ -209,65 +285,45 @@ def load_record(record_dir: Path) -> dict:
 
 
 def fetch_wandb_history(run_paths: list[str]) -> list[pd.DataFrame]:
-    """One DataFrame per run with step + online-solve columns."""
+    """One normalized DataFrame per run with step + train solve rate."""
     import wandb
     api = wandb.Api()
     frames = []
     for rp in run_paths:
+        rp = normalize_wandb_run(rp)
         # Full history rather than scan_history(keys=...): keyed scans drop rows missing
         # any requested key, which silently empties the result for sparse metrics.
         df = api.run(rp).history(samples=100_000, pandas=True)
-        if "step" not in df.columns:
-            raise SystemExit(f"{rp}: no 'step' metric in W&B history")
-        frames.append(df[df["step"].notna()].sort_values("step"))
+        frames.append(normalize_online_frame(df))
     return frames
 
 
-def plot_training(record: dict, wandb_frames: list[pd.DataFrame] | None, out: Path,
+def plot_training(record: dict, online_frames: list[pd.DataFrame] | None, out: Path,
                   target: float = 0.80) -> None:
-    """Solve rate vs step and vs record-clock minutes; W&B's unbiased online metric
-    when available. Raw ghost + bold rolling mean, gradient fill, and the moment
-    the curve crosses the target."""
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4.8))
+    """Solve rate vs record-clock minutes.
+
+    Prefer the train metric from W&B/history artifacts. The leaderboard
+    target is intentionally omitted here: the target gate is held-out eval CI, not a
+    train-curve threshold.
+    """
+    fig, ax = plt.subplots(figsize=(9.2, 5.0))
     multi = len(record["logs"]) > 1
-    src = "online solve rate" if wandb_frames is not None else "trained-batch solve rate"
-    ymax, clock_crossings = 0.0, []
+    src, ymax = ONLINE_TRAIN_LABEL if online_frames is not None else FILTERED_TRAIN_LABEL, 0.0
     for i, (seed, log) in enumerate(record["logs"].items()):
-        df, c = log["df"], SEED_COLORS[i % len(SEED_COLORS)]
-        if wandb_frames is not None:
-            w = wandb_frames[i]
-            n = min(len(w), len(df))
-            raw = w["reward/online_solved_frac_unfiltered"].iloc[:n].reset_index(drop=True)
-            xstep = w["step"].iloc[:n].reset_index(drop=True)
-            xclock = (df.record_time_s.iloc[:n] / 60.0).reset_index(drop=True)
-        else:
-            raw, xstep, xclock = df.solved_frac, df.step, df.record_time_s / 60.0
+        c = SEED_COLORS[i % len(SEED_COLORS)]
+        series = aligned_training_series(log, online_frames[i] if online_frames is not None else None)
+        raw, xclock = series["raw"], series["xclock"]
         sm = smooth(raw)
         ymax = max(ymax, float(sm.max()))
-        for ax, x, is_clock in ((axes[0], xstep, False), (axes[1], xclock, True)):
-            ax.plot(x, raw, color=c, alpha=0.10, lw=1.0)
-            glow(ax.plot(x, sm, color=c, alpha=0.96, label=seed)[0], lw=8, alpha=0.28)
-            ax.fill_between(x, sm, color=c, alpha=0.11)
-            xc = first_cross(x, sm, target)
-            if xc is not None:
-                ax.scatter([xc], [target], s=64, color=c, zorder=7, edgecolor=BG, linewidth=1.6)
-                if is_clock:
-                    clock_crossings.append(xc)
-    for ax in axes:
-        target_line(ax, target, f"TARGET {target:g}")
-        ax.set_ylim(0, max(ymax, target) * 1.12); pct_axis(ax)
-        ax.set_ylabel(src)
-        if multi:
-            ax.legend(loc="lower right")
-    axes[0].set_xlabel("training step")
-    axes[0].set_title(f"Training curve  ·  {SMOOTH}-step rolling mean")
-    axes[1].set_xlabel("record clock (minutes)")
-    axes[1].set_title("The speedrun view  ·  solve rate vs wall clock")
-    if clock_crossings:
-        xc = min(clock_crossings)
-        axes[1].annotate(f"target reached @ {xc:.0f} min", xy=(xc, target),
-                         xytext=(-10, 16), textcoords="offset points", ha="right",
-                         color=INK, fontsize=12, fontweight="bold")
+        ax.plot(xclock, raw, color=c, alpha=0.10, lw=1.0)
+        glow(ax.plot(xclock, sm, color=c, alpha=0.96, label=seed)[0], lw=8, alpha=0.28)
+        ax.fill_between(xclock, sm, color=c, alpha=0.11)
+    ax.set_ylim(0, max(ymax, target) * 1.12); pct_axis(ax)
+    ax.set_xlabel("record clock (minutes)")
+    ax.set_ylabel(src)
+    ax.set_title(f"Train solve rate vs record clock  ·  {SMOOTH}-step rolling mean")
+    if multi:
+        ax.legend(loc="lower right")
     fig.savefig(out); plt.close(fig)
 
 
@@ -324,7 +380,8 @@ def plot_eval(record: dict, target: float, out: Path) -> None:
     fig.savefig(out); plt.close(fig)
 
 
-def plot_hero_card(record: dict, target: float, out: Path) -> None:
+def plot_hero_card(record: dict, target: float, out: Path,
+                   online_frames: list[pd.DataFrame] | None = None) -> None:
     """Clean 16:9 record card: training climb, record time, pass@1, target."""
     logs, evals = record["logs"], record["evals"]
     fig = plt.figure(figsize=(12.8, 7.2), constrained_layout=False)
@@ -336,19 +393,23 @@ def plot_hero_card(record: dict, target: float, out: Path) -> None:
     fig.text(0.065, 0.925, "Sokoban Speedrun", fontsize=36, fontweight="bold",
              color=INK, ha="left", va="center")
 
+    smax = 0.0
+    source = "filtered"
     for i, log in enumerate(logs.values()):
-        df = log["df"]
-        x = df.record_time_s / 60.0
-        y = smooth(df.solved_frac)
+        series = aligned_training_series(log, online_frames[i] if online_frames is not None else None)
+        x, raw_y = series["xclock"], series["raw"]
+        y = smooth(raw_y)
+        smax = max(smax, float(y.max()))
+        source = series["source"]
         color = SEED_COLORS[i % len(SEED_COLORS)]
-        ax_main.plot(x, df.solved_frac, color=color, alpha=0.10, lw=1.0)
+        ax_main.plot(x, raw_y, color=color, alpha=0.10, lw=1.0)
         glow(ax_main.plot(x, y, color=color, alpha=0.97)[0], lw=9, alpha=0.28)
         ax_main.fill_between(x, y, color=color, alpha=0.12)
         ax_main.scatter([x.iloc[-1]], [y.iloc[-1]], s=72, color=color, zorder=7,
                         edgecolor=BG, linewidth=1.8)
-    smax = max(float(smooth(l["df"].solved_frac).max()) for l in logs.values())
     ax_main.set_ylim(0.32, max(0.78, smax * 1.08)); pct_axis(ax_main)
-    ax_main.set_xlabel("minutes"); ax_main.set_ylabel("train solve rate")
+    ax_main.set_xlabel("minutes")
+    ax_main.set_ylabel(ONLINE_TRAIN_LABEL if source == "online" else FILTERED_TRAIN_LABEL)
     ax_main.set_title("")
 
     final_time = logs[sorted(logs)[0]]["final_time_s"]
@@ -359,11 +420,11 @@ def plot_hero_card(record: dict, target: float, out: Path) -> None:
                  fontweight="bold", va="top")
     ax_card.text(0.0, 0.72, fmt_clock(final_time), color=INK, fontsize=52,
                  fontweight="bold", va="top")
-    ax_card.text(0.0, 0.45, "PASS@1", color=MUTED, fontsize=17,
+    ax_card.text(0.0, 0.45, "HELD-OUT PASS@1", color=MUTED, fontsize=17,
                  fontweight="bold", va="top")
     ax_card.text(0.0, 0.36, f"{p1:.1%}", color=SEED_COLORS[0], fontsize=78,
                  fontweight="bold", va="top")
-    ax_card.text(0.0, 0.12, f"target > {target:.0%}", color=TARGET_C, fontsize=22,
+    ax_card.text(0.0, 0.12, f"lower CI > {target:.0%}", color=TARGET_C, fontsize=22,
                  fontweight="bold", va="top")
     fig.savefig(out); plt.close(fig)
 
@@ -402,7 +463,7 @@ def auto_block(record: dict, record_dir: Path, target: float, prev_dir: Path | N
     evals, logs = record["evals"], record["logs"]
     clocks = {s: logs[s]["final_time_s"] for s in sorted(logs)}
     flops = {s: logs[s].get("final_flops") for s in sorted(logs)}
-    lines = ["## Results", "", "| seed | pass@1 | 95% CI | record clock | FLOPs |",
+    lines = ["## Results", "", "| seed | held-out eval pass@1 | 95% CI | record clock | FLOPs |",
              "|---|---|---|---|---|"]
     for s in sorted(evals):
         ev, clock, fl = evals[s], clocks.get(s), flops.get(s)
@@ -415,8 +476,8 @@ def auto_block(record: dict, record_dir: Path, target: float, prev_dir: Path | N
     if len(evals) == 1:
         only = evals[sorted(evals)[0]]
         verdict = "CLEARS" if only["ci_low"] > target else "DOES NOT CLEAR"
-        summary = (f"**pass@1 {only['pass_at_1']:.4f}, lower 95% CI {only['ci_low']:.4f} vs "
-                   f"TARGET {target}: {verdict}.**")
+        summary = (f"**Held-out eval pass@1 {only['pass_at_1']:.4f}, lower 95% CI "
+                   f"{only['ci_low']:.4f} vs TARGET {target}: {verdict}.**")
     else:
         all_clear = all(ev["ci_low"] > target for ev in evals.values())
         summary = (f"**Each of {len(evals)} runs vs TARGET {target} by its lower 95% CI: "
@@ -487,13 +548,17 @@ def main() -> None:
     plots = args.record_dir / "plots"
     plots.mkdir(exist_ok=True)
 
-    wandb_frames = None
+    seeds = sorted(record["logs"])
+    online_frames = None
     if args.wandb_runs:
-        wandb_frames = fetch_wandb_history([r.strip() for r in args.wandb_runs.split(",")])
-    plot_training(record, wandb_frames, plots / "training.png", args.target)
+        online_frames = fetch_wandb_history([r.strip() for r in args.wandb_runs.split(",")])
+        if len(online_frames) != len(seeds):
+            raise SystemExit(f"got {len(online_frames)} W&B runs for {len(seeds)} seed logs")
+
+    plot_training(record, online_frames, plots / "training.png", args.target)
     plot_stability(record, plots / "stability.png")
     plot_eval(record, args.target, plots / "eval.png")
-    plot_hero_card(record, args.target, plots / "hero.png")
+    plot_hero_card(record, args.target, plots / "hero.png", online_frames)
 
     write_readme(args.record_dir,
                  auto_block(record, args.record_dir, args.target, args.prev))
