@@ -14,12 +14,12 @@ Usage:
     uv run ... python records/plot_hero_animation.py records/<dir> --still records/hero_still.png
 
 The GIF is intentionally not a leaderboard. It is a quick visual hook: the train solve
-rate climbs on the left while a stopwatch ticks up the record clock on the right
-— same clock as the x-axis — and the held-out pass@1 scorecard counts up
-from the base model to the final record, the actual benchmark verdict.
+rate climbs while a stopwatch ticks up the record clock in the top bar — same clock
+as the x-axis. The README, rules, and leaderboard carry the held-out eligibility
+details; the hero stays focused on time.
 
 The README already carries the "Sokoban Speedrun" H1, so the animation deliberately
-omits a title and stays focused on the curve, clock, and scorecard.
+omits a title and stays focused on the curve and clock.
 """
 
 from __future__ import annotations
@@ -47,7 +47,6 @@ from make_record_report import (  # noqa: E402
     INK,
     MUTED,
     SEED_COLORS,
-    TARGET_C,
     aligned_training_series,
     fetch_wandb_history,
     glow,
@@ -58,20 +57,13 @@ from make_record_report import (  # noqa: E402
 
 DPI = 125
 # Animation pacing, as fractions of the animated (pre-hold) timeline.
-DRAW_DONE = 0.85   # curve + stopwatch finish here; the tail is dwell on the verdict
-PASS_START = 0.50  # pass@1 begins counting up here, overlapping the climb
+DRAW_DONE = 0.85  # curve + stopwatch finish here; the tail is dwell on the verdict
 
 
 def hms(seconds: float) -> str:
     s = int(seconds)
     h, m, sec = s // 3600, s % 3600 // 60, s % 60
     return f"{h}:{m:02d}:{sec:02d}"
-
-
-def ease_out(t: float) -> float:
-    """Cubic ease-out: fast then settling — reads as deceleration into the final value."""
-    t = min(1.0, max(0.0, t))
-    return 1.0 - (1.0 - t) ** 3
 
 
 def ease_in_out(t: float) -> float:
@@ -125,26 +117,18 @@ def load_record(record_dir: Path) -> tuple[dict, dict]:
     return parse_train_log(log_path), json.loads(eval_path.read_text())
 
 
-def frame_state(frac: float, log: dict, eval_result: dict, base_pass: float,
-                online_frame: object | None = None) -> dict:
+def frame_state(frac: float, log: dict, online_frame: object | None = None) -> dict:
     """Map an animated-timeline fraction in [0, 1] to what the frame should show."""
     series = aligned_training_series(log, online_frame)
     final_time = log["final_time_s"]
-    final_pass = eval_result["pass_at_1"]
 
     draw_p = ease_in_out(frac / DRAW_DONE) if frac < DRAW_DONE else 1.0
     n = max(2, round(draw_p * len(series["raw"])))
     record_time = final_time if draw_p >= 1.0 else float(series["xclock"].iloc[n - 1] * 60.0)
-
-    if frac >= PASS_START:
-        rp = ease_out((frac - PASS_START) / (1.0 - PASS_START))
-        pass_val = base_pass + (final_pass - base_pass) * rp
-    else:
-        pass_val = None
-    return {"n": n, "record_time_s": record_time, "pass_val": pass_val}
+    return {"n": n, "record_time_s": record_time}
 
 
-def draw_frame(state: dict, log: dict, target: float, out_png: Path | None = None,
+def draw_frame(state: dict, log: dict, out_png: Path | None = None,
                online_frame: object | None = None):
     series = aligned_training_series(log, online_frame)
     x = series["xclock"]
@@ -154,11 +138,15 @@ def draw_frame(state: dict, log: dict, target: float, out_png: Path | None = Non
     color = SEED_COLORS[0]
 
     fig = plt.figure(figsize=(11.0, 5.7), constrained_layout=False)
-    gs = fig.add_gridspec(1, 2, width_ratios=[1.52, 1.0], left=0.075, right=0.965,
-                          top=0.865, bottom=0.135, wspace=0.10)
+    gs = fig.add_gridspec(1, 1, left=0.075, right=0.965, top=0.785, bottom=0.135)
     ax = fig.add_subplot(gs[0, 0])
-    card = fig.add_subplot(gs[0, 1])
-    card.axis("off")
+
+    fig.text(0.075, 0.915, "RUN CLOCK", color=MUTED, fontsize=15,
+             fontweight="bold", va="top")
+    fig.text(0.965, 0.925, hms(state["record_time_s"]), color=INK, fontsize=44,
+             fontweight="bold", ha="right", va="top")
+    fig.add_artist(plt.Line2D([0.075, 0.965], [0.81, 0.81], transform=fig.transFigure,
+                              color=GRID, alpha=0.55, lw=1.0))
 
     ax.plot(x.iloc[:n], raw_y.iloc[:n], color=color, alpha=0.13, lw=1.2)
     line = ax.plot(x.iloc[:n], y.iloc[:n], color=color, lw=3.0)[0]
@@ -172,31 +160,17 @@ def draw_frame(state: dict, log: dict, target: float, out_png: Path | None = Non
     # between frames and the faint ghost spikes don't clip the top edge.
     ax.set_ylim(0.32, max(0.80, float(raw_y.max()) * 1.04))
     ax.yaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=0))
-    ax.set_xlabel("record clock (minutes)")
-    ax.set_ylabel(series["label"])
+    ax.set_xlabel("elapsed minutes")
+    ax.set_ylabel("train solve rate")
     ax.grid(True, axis="y", color=GRID, alpha=0.55)
-
-    card.text(0.0, 0.86, "RECORD", color=MUTED, fontsize=15,
-              fontweight="bold", va="top")
-    card.text(0.0, 0.755, hms(state["record_time_s"]), color=INK, fontsize=44,
-              fontweight="bold", va="top")
-
-    if state["pass_val"] is not None:
-        card.text(0.0, 0.45, "HELD-OUT PASS@1", color=MUTED, fontsize=15,
-                  fontweight="bold", va="top")
-        card.text(0.0, 0.345, f"{state['pass_val']:.1%}", color=color, fontsize=66,
-                  fontweight="bold", va="top")
-        card.text(0.0, 0.10, f"lower CI > {target:.0%}", color=TARGET_C, fontsize=19,
-                  fontweight="bold", va="top")
 
     if out_png is not None:
         fig.savefig(out_png, dpi=DPI)
     return fig
 
 
-def render_rgb(state: dict, log: dict, target: float,
-               online_frame: object | None = None) -> Image.Image:
-    fig = draw_frame(state, log, target, online_frame=online_frame)
+def render_rgb(state: dict, log: dict, online_frame: object | None = None) -> Image.Image:
+    fig = draw_frame(state, log, online_frame=online_frame)
     buf = BytesIO()
     fig.savefig(buf, format="png", dpi=DPI)
     plt.close(fig)
@@ -215,8 +189,6 @@ def main() -> None:
     parser.add_argument("--target", type=float, default=0.80)
     parser.add_argument("--wandb-runs", default=None,
                         help="optional W&B run path/URL for the train solve-rate curve")
-    parser.add_argument("--base-pass", type=float, default=0.57,
-                        help="base-model pass@1 the scorecard counts up from")
     parser.add_argument("--frames", type=int, default=66, help="animated frames before the end-hold")
     parser.add_argument("--hold", type=int, default=16, help="duplicate final frames (the dwell before looping)")
     parser.add_argument("--fps", type=int, default=18)
@@ -229,13 +201,13 @@ def main() -> None:
     record_dir = args.record_dir or select_current_record(args.records_root, args.target)
     if args.record_dir is None:
         print(f"current record: {record_dir}")
-    log, eval_result = load_record(record_dir)
+    log, _eval_result = load_record(record_dir)
     online_frame = fetch_wandb_history([args.wandb_runs])[0] if args.wandb_runs else None
     args.out.parent.mkdir(parents=True, exist_ok=True)
 
     if args.still is not None:
-        state = frame_state(args.still_frac, log, eval_result, args.base_pass, online_frame)
-        draw_frame(state, log, args.target, out_png=args.still, online_frame=online_frame)
+        state = frame_state(args.still_frac, log, online_frame)
+        draw_frame(state, log, out_png=args.still, online_frame=online_frame)
         plt.close("all")
         print(f"wrote {args.still}")
         return
@@ -243,8 +215,8 @@ def main() -> None:
     rgb_frames: list[Image.Image] = []
     for frame in range(args.frames):
         frac = (frame + 1) / args.frames
-        state = frame_state(frac, log, eval_result, args.base_pass, online_frame)
-        rgb_frames.append(render_rgb(state, log, args.target, online_frame))
+        state = frame_state(frac, log, online_frame)
+        rgb_frames.append(render_rgb(state, log, online_frame))
     rgb_frames += [rgb_frames[-1]] * args.hold  # dwell on the verdict before the loop restarts
 
     # Quantize every frame against ONE palette built from the final (richest) frame.

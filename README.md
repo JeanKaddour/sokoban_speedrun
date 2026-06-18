@@ -6,7 +6,7 @@ Fastest recipe for RL fine-tuning [Qwen3-4B-Instruct-2507](https://huggingface.c
 
 <p align="center">
   <img src="records/hero.gif" width="840"
-       alt="Train solve rate climbs over 1:27:31 on an 8×H100 node while a stopwatch ticks up; the separate held-out eval pass@1 scorecard counts up to 89.1%, clearing the 80% target.">
+       alt="Full-width training solve-rate curve over an 8×H100 run while the run clock ticks up to the 1:27:31 record.">
 </p>
 
 ## World Record History
