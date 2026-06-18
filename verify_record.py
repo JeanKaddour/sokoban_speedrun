@@ -1,12 +1,14 @@
 """Offline verifier for leaderboard record submissions.
 
 Usage:
-    python verify_record.py records/<dir> [--eval-data datasets/sokoban_eval.jsonl]
-                            [--target 0.50] [--alpha 0.01] [--allow-missing-rollouts]
+    python verify_record.py records/<dir>
+    (defaults: --eval-data datasets/sokoban_eval.jsonl, --target 0.80;
+     --allow-missing-rollouts skips re-scoring for records predating rollout artifacts.)
 
-For every eval_*.json in the record directory this re-derives the submission's claims
-without a GPU, importing the extractor/scorer FROM speedrun.py so verification cannot
-drift from what training and eval actually scored:
+For every primary eval (eval_seed<TRAINSEED>.json) in the record directory this re-derives the
+submission's claims without a GPU, importing the extractor/scorer FROM speedrun.py so verification
+cannot drift from what training and eval actually scored. Mid-run curve checkpoints
+(eval_step<NNNNNN>_seed*.json) are aggregate-verified only and excluded from the verdict.
 
  1. AGGREGATES  — pass@1 / pass@k / answer_rate / CI re-derived from the JSON's own
     per-puzzle arrays (always possible, even for records predating rollout artifacts).
@@ -29,8 +31,6 @@ import argparse
 import glob
 import gzip
 import json
-import math
-import statistics
 import sys
 import zlib
 from pathlib import Path
@@ -43,7 +43,6 @@ from speedrun import (  # noqa: E402  (single source of truth for scoring)
     _wilson_ci,
     extract_sokoban_answer,
     load_sokoban_jsonl_dataset,
-    student_t_sf,
 )
 
 DEGENERATE_TAIL_RATIO = 0.15   # zlib(tail)/len(tail) below this == repetition loop
@@ -166,28 +165,33 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("record_dir", type=Path, help="records/<date>_<nn>_<name>/ directory to verify")
     ap.add_argument("--eval-data", type=Path, default=Path("datasets/sokoban_eval.jsonl"))
-    ap.add_argument("--target", type=float, default=0.50, help="leaderboard pass@1 bar")
-    ap.add_argument("--alpha", type=float, default=0.01, help="one-sided significance level")
+    ap.add_argument("--target", type=float, default=0.80, help="leaderboard pass@1 bar")
     ap.add_argument("--allow-missing-rollouts", action="store_true",
                     help="Verify JSON-level claims only for records predating rollout artifacts.")
     args = ap.parse_args()
 
-    eval_jsons = sorted(glob.glob(str(args.record_dir / "eval_*.json")))
-    if not eval_jsons:
-        print(f"no eval_*.json found in {args.record_dir}")
+    # PRIMARY evals (eval_seed<TRAINSEED>.json) carry the record claim and are fully re-scored.
+    # CURVE checkpoints (eval_step<NNNNNN>_seed<TRAINSEED>.json) are illustrative documentation of
+    # the training trajectory: their aggregates are verified, but they are NOT the claim, so they
+    # neither require rollout artifacts nor count toward the significance verdict.
+    primary_jsons = sorted(p for p in glob.glob(str(args.record_dir / "eval_seed*.json")))
+    curve_jsons = sorted(glob.glob(str(args.record_dir / "eval_step*_seed*.json")))
+    if not primary_jsons:
+        print(f"no eval_seed*.json found in {args.record_dir}")
         return 1
     eval_task = load_sokoban_jsonl_dataset(args.eval_data, split_name="eval")
 
     fails = Failures()
-    records = []
-    for path in eval_jsons:
+
+    def rescore(path: str, tag: str) -> dict:
         record = json.loads(Path(path).read_text())
-        tag = Path(path).name
-        records.append(record)
         print(f"== {tag} (seed {record.get('seed')}, ckpt {record.get('checkpoint')}) ==")
         verify_aggregates(record, fails, tag)
-        rollouts_name = record.get("rollouts_file") or (Path(path).stem + ".rollouts.jsonl.gz")
-        rollouts_path = Path(path).with_name(rollouts_name)
+        # Records are assembled with the rollouts artifact renamed to match the eval JSON's stem
+        # (<stem>.rollouts.jsonl.gz); fall back to the JSON's internal rollouts_file basename.
+        rollouts_path = Path(path).with_name(Path(path).stem + ".rollouts.jsonl.gz")
+        if not rollouts_path.exists() and record.get("rollouts_file"):
+            rollouts_path = Path(path).with_name(Path(record["rollouts_file"]).name)
         if rollouts_path.exists():
             verify_rollouts(record, rollouts_path, eval_task, args.eval_data, fails, tag)
         else:
@@ -196,26 +200,51 @@ def main() -> int:
                 print(f"  WARN  {msg}")
             else:
                 fails.check(False, msg)
+        return record
 
-    # Multi-seed significance verdict — same math as speedrun.run_standalone_eval.
-    values = [float(r["pass_at_1"]) for r in records]
-    K = len(values)
-    print(f"\n=== Significance: mean(pass@1) > {args.target} over {K} seed(s) ===")
-    if K >= 2:
-        mean, sd = statistics.mean(values), statistics.stdev(values)
-        se = sd / math.sqrt(K)
-        t = ((mean - args.target) / se if se > 0 else
-             (math.inf if mean > args.target else -math.inf))
-        p = student_t_sf(t, K - 1) if se > 0 else (0.0 if mean > args.target else 1.0)
-        significant = p < args.alpha and mean > args.target
-        print(f"  values {[round(v, 4) for v in values]} | mean {mean:.4f} +/- {sd:.4f} | "
-              f"t={t:.3f} p={p:.5f} (alpha={args.alpha})")
-        fails.check(significant, f"significance test failed (mean {mean:.4f}, p={p:.5f})")
+    def seed_label(path: str) -> str:
+        return Path(path).stem.replace("eval_", "").split(".")[0]
+
+    submission = [(seed_label(p), rescore(p, Path(p).name)) for p in primary_jsons]
+
+    for path in curve_jsons:
+        record = json.loads(Path(path).read_text())
+        print(f"== {Path(path).name} (curve checkpoint, step {record.get('step')}; aggregates only) ==")
+        verify_aggregates(record, fails, Path(path).name)
+
+    # VERIFICATION (optional): records/<dir>/verification/ is a nested mini-record with an
+    # independent rerun. Re-score it identically; it must clear the bar too.
+    verif_jsons = sorted(glob.glob(str(args.record_dir / "verification" / "eval_seed*.json")))
+    verification = [(seed_label(p), rescore(p, f"verification/{Path(p).name}")) for p in verif_jsons]
+
+    # Gate: every run — submission AND verification — independently clears the target via its
+    # lower 95% bootstrap CI (single-seed protocol; no cross-seed averaging).
+    print(f"\n=== Gate: each run's lower 95% CI > {args.target} ===")
+
+    def flops_to_target(label: str, sl: str) -> str:
+        # FLOPs-to-target is a node-invariant co-record (ranked, not a pass/fail gate); print it
+        # for the record, parsing the run log if present. Older logs predate cum_flops -> "—".
+        base = args.record_dir / "verification" if label == "verification" else args.record_dir
+        logs = sorted(base.glob(f"train_log_{sl}.txt")) or sorted(base.glob("train_log_seed*.txt"))
+        try:
+            from make_record_report import fmt_flops, parse_train_log
+            return fmt_flops(parse_train_log(logs[0]).get("final_flops")) if logs else "—"
+        except Exception:
+            return "—"
+
+    def gate(label: str, runs: list) -> None:
+        for sl, r in runs:
+            ok = r["ci_low"] > args.target
+            print(f"  {label} {sl}: pass@1 {r['pass_at_1']:.4f}, ci_low {r['ci_low']:.4f} "
+                  f"(target {args.target}) — {'CLEARS' if ok else 'DOES NOT CLEAR'} "
+                  f"| FLOPs {flops_to_target(label, sl)}")
+            fails.check(ok, f"{label} {sl} ci_low {r['ci_low']:.4f} does not clear {args.target}")
+
+    gate("submission", submission)
+    if verification:
+        gate("verification", verification)
     else:
-        print(f"  single seed: pass@1 {values[0]:.4f}, ci_low {records[0]['ci_low']:.4f} "
-              f"(target {args.target}) — no t-test possible")
-        fails.check(records[0]["ci_low"] > args.target,
-                    f"single-seed ci_low {records[0]['ci_low']:.4f} does not clear {args.target}")
+        print("  (no verification/ rerun present yet — append one before merging)")
 
     print(f"\n{'VERDICT: PASS' if not fails.items else f'VERDICT: FAIL ({len(fails.items)} problem(s))'}")
     return 0 if not fails.items else 1
