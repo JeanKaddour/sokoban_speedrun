@@ -48,8 +48,9 @@ NUM_GPUS = int(os.environ.get("NUM_GPUS", os.environ.get("NODE_GPUS", "8")))
 # One-hour target recipe. Keep the ScaleRL-ish optimizer hparams, but use a benchmark-defined
 # non-trivial 1-box train/eval split and avoid debug/measurement I/O that slows the sprint.
 # The run recipe now lives in speedrun.py as the top-level RECIPE constant, which speedrun.main()
-# prepends to the CLI args. The launcher below only passes the per-run args (--run / --max-steps /
-# EXTRA_ARGS), and the eval path relies on the same RECIPE defaults via speedrun --eval-only.
+# prepends to the CLI args. The launcher below only passes per-run args (--run / EXTRA_ARGS, plus
+# an optional MAX_STEPS override), and the eval path relies on the same RECIPE defaults via
+# speedrun --eval-only.
 
 
 app = modal.App(APP_NAME)
@@ -165,6 +166,57 @@ def _last_bool_flag(args: list[str], enabled_flag: str, disabled_flag: str, defa
     return value
 
 
+def _safe_run_name(name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.strip())
+    return safe or "run"
+
+
+def _latest_checkpoint_for_run(run_name: str) -> str:
+    run_dir = os.path.join(VOLUME_MOUNT_PATH, "outputs", _safe_run_name(run_name))
+    try:
+        names = os.listdir(run_dir)
+    except FileNotFoundError:
+        raise FileNotFoundError(f"no output directory found for run {run_name!r}: {run_dir}") from None
+
+    candidates: list[tuple[int, str]] = []
+    for name in names:
+        match = re.fullmatch(r"step_(\d+)", name)
+        if match and os.path.isdir(os.path.join(run_dir, name)):
+            candidates.append((int(match.group(1)), name))
+    if not candidates:
+        raise FileNotFoundError(f"no step_* checkpoints found for run {run_name!r} in {run_dir}")
+    _, checkpoint_name = max(candidates)
+    return f"outputs/{_safe_run_name(run_name)}/{checkpoint_name}"
+
+
+def _latest_checkpoint() -> str:
+    outputs_dir = os.path.join(VOLUME_MOUNT_PATH, "outputs")
+    try:
+        run_names = os.listdir(outputs_dir)
+    except FileNotFoundError:
+        raise FileNotFoundError(f"no outputs directory found: {outputs_dir}") from None
+
+    candidates: list[tuple[float, int, str, str]] = []
+    for run_name in run_names:
+        run_dir = os.path.join(outputs_dir, run_name)
+        if not os.path.isdir(run_dir):
+            continue
+        for checkpoint_name in os.listdir(run_dir):
+            match = re.fullmatch(r"step_(\d+)", checkpoint_name)
+            checkpoint_dir = os.path.join(run_dir, checkpoint_name)
+            if match and os.path.isdir(checkpoint_dir):
+                candidates.append((
+                    os.path.getmtime(checkpoint_dir),
+                    int(match.group(1)),
+                    run_name,
+                    checkpoint_name,
+                ))
+    if not candidates:
+        raise FileNotFoundError(f"no step_* checkpoints found under {outputs_dir}")
+    _, _, run_name, checkpoint_name = max(candidates)
+    return f"outputs/{run_name}/{checkpoint_name}"
+
+
 def _needs_periodic_volume_commit(speedrun_args: list[str]) -> bool:
     """True when the run streams mid-run artifacts and wants the tight 60s commit cadence."""
     # The rollout STREAM is on by default (speedrun.py: --save-rollouts + --rollout-flush-every 10;
@@ -213,7 +265,7 @@ def _periodic_volume_commits(interval_s: float):
 )
 def train(
     run_name: str,
-    max_steps: int,
+    max_steps: int | None,
     num_trainers: int,
     extra_args: list[str] | None = None,
     final_eval_k: int = 0,
@@ -221,10 +273,11 @@ def train(
     final_eval_seeds: str = "12345",
 ) -> None:
     """Launch the speedrun sprint recipe from the volume (relative data/output paths resolve under
-    /vol). `run_name` (non-"dummy") turns on W&B logging; `max_steps` bounds the run. `num_trainers`
-    is the data-parallel trainer count: 1 => single process (1 trainer + NUM_GPUS-1 vLLM); N>1 =>
-    torchrun with N trainer ranks (+ NUM_GPUS-N vLLM generators). speedrun derives the vLLM split
-    from WORLD_SIZE and the baked-in NODE_GPUS, so no GPU-split args are passed."""
+    /vol). `run_name` labels the artifacts; `max_steps` optionally overrides the recipe.
+    `num_trainers` is the data-parallel trainer count: 1 => single process (1 trainer +
+    NUM_GPUS-1 vLLM); N>1 => torchrun with N trainer ranks (+ NUM_GPUS-N vLLM generators).
+    speedrun derives the vLLM split from WORLD_SIZE and the baked-in NODE_GPUS, so no GPU-split
+    args are passed."""
     env = dict(os.environ)
     # speedrun maps each trainer rank to a physical GPU itself, so CUDA_VISIBLE_DEVICES must be unset.
     env.pop("CUDA_VISIBLE_DEVICES", None)
@@ -244,7 +297,10 @@ def train(
     env.setdefault("WANDB_DIR", "/tmp/wandb")
     os.makedirs("/tmp/wandb", exist_ok=True)
 
-    speedrun_args = ["--run", run_name, "--max-steps", str(max_steps), *(extra_args or [])]
+    speedrun_args = ["--run", run_name]
+    if max_steps is not None:
+        speedrun_args += ["--max-steps", str(max_steps)]
+    speedrun_args += [*(extra_args or [])]
     if num_trainers > 1:
         command = [sys.executable, "-m", "torch.distributed.run", "--standalone",
                    f"--nproc_per_node={num_trainers}", "-m", "speedrun", *speedrun_args]
@@ -259,7 +315,7 @@ def train(
     with _periodic_volume_commits(commit_interval):
         subprocess.run(command, check=True, env=env, cwd=VOLUME_MOUNT_PATH)
         if final_eval_k > 0:
-            checkpoint = f"outputs/{run_name}/step_{max_steps - 1:06d}"
+            checkpoint = _latest_checkpoint_for_run(run_name)
             eval_run_name = f"{run_name}-final-eval"
             for eval_command in eval_commands(
                 checkpoint,
@@ -366,13 +422,13 @@ def evaluate(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: str
              eval_vllm_max_num_seqs: int = 16, eval_concurrency: int = 16,
              eval_data: str | None = None) -> None:
     """Authoritative held-out eval (speedrun.py --eval-only): own vLLM engine over all GPUs at the
-    full 12288-token leaderboard budget. `checkpoint` is a /vol path or an HF id (e.g. the base
-    model) — or a COMMA-SEPARATED list of final checkpoints (one per training seed), which
-    runs the whole record eval end-to-end in one call: every checkpoint evaluated under the same
-    protocol, one JSON each, then the significance verdict (mean pass@1 > `target`, p<0.01).
-    For a single checkpoint, `seeds` (comma-separated) runs one eval/JSON per eval seed
-    sequentially. `eval_limit`>0 evals only the first N puzzles (cheap dev runs); 0 = full set.
-    Writes outputs/<run>/eval_*.json with pass@1/pass@k + bootstrap CI per run."""
+    full 12288-token leaderboard budget. `checkpoint` is "latest", a /vol path, an HF id (e.g. the
+    base model), or a COMMA-SEPARATED list of final checkpoints (one per training seed), which runs
+    the whole record eval end-to-end in one call: every checkpoint evaluated under the same
+    protocol, one JSON each, then the significance verdict (mean pass@1 > `target`, p<0.01). For a
+    single checkpoint, `seeds` (comma-separated) runs one eval/JSON per eval seed sequentially.
+    `eval_limit`>0 evals only the first N puzzles (cheap dev runs); 0 = full set. Writes
+    outputs/<run>/eval_*.json with pass@1/pass@k + bootstrap CI per run."""
     env = dict(os.environ)
     env.pop("CUDA_VISIBLE_DEVICES", None)
     _ensure_persistent_cache_dirs()
@@ -384,6 +440,9 @@ def evaluate(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: str
     )
     env["LD_LIBRARY_PATH"] = _nvidia_ld_library_path()
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    if checkpoint.lower() == "latest":
+        checkpoint = _latest_checkpoint()
+        print(f"Resolved latest checkpoint to {checkpoint}", flush=True)
     record_mode = "," in checkpoint
     # 300s cadence so a mid-eval crash keeps a fresh model download / vLLM compile cache (the
     # per-command commit below only fires AFTER a full eval, ~30-60 min after those cache writes).
@@ -484,7 +543,7 @@ def main() -> None:
         print(f"Probe complete. Pull results: "
               f"modal volume get nanochat-rl-hf /outputs/{run_name} ./reports/probe_modal --force", flush=True)
         return
-    # Eval mode: EVAL_CHECKPOINT=<vol path or HF id> modal run --detach modal_app.py
+    # Eval mode: EVAL_CHECKPOINT=latest (or <vol path or HF id>) modal run --detach modal_app.py
     # Record mode: EVAL_CHECKPOINT="ckptA,ckptB,..." (one final checkpoint per training seed) runs
     # the whole record eval + significance verdict in one call; EVAL_TARGET sets the bar (default = the 4B leaderboard TARGET, 0.80).
     eval_ckpt = os.environ.get("EVAL_CHECKPOINT")
@@ -522,8 +581,9 @@ def main() -> None:
     # smaller boxes default to 1 trainer (3 trainers + 1 generator would starve generation).
     # Trainer count is a torchrun launch param (not a speedrun CLI arg), so it lives here; the rest
     # of the recipe is speedrun.py RECIPE.
-    # Full sprint e.g.: MAX_STEPS=50 modal run --detach modal_app.py  (default 8 GPUs, 4B-Instruct-2507)
-    max_steps = int(os.environ.get("MAX_STEPS", "4"))
+    # Bare launch runs speedrun.py's RECIPE. Set MAX_STEPS only for probes, smoke tests, or longer runs.
+    max_steps_env = os.environ.get("MAX_STEPS")
+    max_steps = int(max_steps_env) if max_steps_env else None
     num_trainers = int(os.environ.get("NTRAINERS", "3" if NUM_GPUS >= 8 else "1"))
     extra_args = shlex.split(os.environ.get("EXTRA_ARGS", ""))
     # MODEL overrides the RECIPE/argparse base model (default Qwen/Qwen3-4B-Instruct-2507). Prepended
@@ -534,12 +594,13 @@ def main() -> None:
     final_eval_k = int(os.environ.get("FINAL_EVAL_K", "0"))
     final_eval_limit = int(os.environ.get("FINAL_EVAL_LIMIT", "0"))
     final_eval_seeds = ",".join(str(s) for s in _parse_seeds(os.environ.get("FINAL_EVAL_SEEDS", "12345")))
-    kind = "probe" if max_steps <= 6 else "sprint"
-    run_name = os.environ.get("RUN_NAME") or f"sokoban-{kind}-nt{num_trainers}-{datetime.now():%Y%m%d-%H%M%S}"
+    kind = "probe" if max_steps is not None and max_steps <= 6 else "speedrun"
+    run_name = os.environ.get("RUN_NAME") or f"sokoban-{kind}-{datetime.now():%Y%m%d-%H%M%S}"
     call = train.spawn(run_name, max_steps, num_trainers, extra_args,
                        final_eval_k, final_eval_limit, final_eval_seeds)
+    max_steps_desc = str(max_steps) if max_steps is not None else "RECIPE"
     print(f"Spawned Modal function call: {call.object_id} "
-          f"(run={run_name}, max_steps={max_steps}, trainers={num_trainers}, "
+          f"(run={run_name}, max_steps={max_steps_desc}, trainers={num_trainers}, "
           f"extra_args={extra_args}, final_eval_k={final_eval_k}, "
           f"final_eval_limit={final_eval_limit}, final_eval_seeds=[{final_eval_seeds}])", flush=True)
     try:
