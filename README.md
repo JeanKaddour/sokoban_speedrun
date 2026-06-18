@@ -1,14 +1,17 @@
 # Sokoban Speedrun
 
-Fastest recipe for RL fine-tuning [Qwen3-4B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507) from 57% to **>80% pass@1** solve-rate on Sokoban puzzles, using a single **8xH100** node.
+Fastest recipe for RL fine-tuning [Qwen3-4B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507) from 57% to **>80% held-out pass@1** solve-rate on Sokoban puzzles, using a single **8xH100** node.
 
 [Play Sokoban](https://www.jeankaddour.com/sokoban) if the task is unfamiliar.
 
-![Sokoban Speedrun hero](records/hero.gif)
+<p align="center">
+  <img src="records/hero.gif" width="840"
+       alt="Train solve rate climbs over 1:27:31 on an 8×H100 node while a stopwatch ticks up; the separate held-out eval pass@1 scorecard counts up to 89.1%, clearing the 80% target.">
+</p>
 
 ## World Record History
 
-| #   | Record time | FLOPs       | Description                        | Date       | Log                                                  | pass@1                  | Contributors |
+| #   | Record time | FLOPs       | Description                        | Date       | Log                                                  | held-out pass@1         | Contributors |
 | --- | ----------- | ----------- | ---------------------------------- | ---------- | ---------------------------------------------------- | ----------------------- | ------------ |
 | 1   | 1:27:31     | 1.251 EFLOP | GRPO, LR 1.6e-6 annealed, 75 steps | 2026-06-17 | [records/2026-06-17_01](records/2026-06-17_01_grpo/) | 0.891 (CI [0.86, 0.92]) | @JeanKaddour |
 
