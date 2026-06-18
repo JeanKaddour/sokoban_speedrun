@@ -79,15 +79,17 @@ MSG_ERROR = "error"
 EVAL_PID_BASE = 1_000_000_000
 # ============================ RUN RECIPE (single source of truth) ============================
 # The benchmark sprint recipe lives here as a top-level constant. main() PREPENDS it to the CLI
-# args, so a bare `python -m speedrun --run X --max-steps N` (or the Modal launcher, which only
-# passes --run/--max-steps/--extra) reproduces it exactly. Any flag passed on the CLI appears AFTER
-# the recipe and therefore OVERRIDES the recipe value (argparse last-wins). --run and --max-steps are
-# deliberately NOT here (they vary per launch). Eval-only invocations also get the recipe prepended,
-# so --eval-data below is also the eval set --eval-only scores against unless overridden.
+# args, so the same hyperparameters apply to local launches and Modal. Any flag passed on the CLI
+# appears AFTER the recipe and therefore OVERRIDES the recipe value (argparse last-wins). --run is
+# deliberately NOT here (it varies per launch); --max-steps IS here (75 = the record's step count)
+# so it stays a CLI override for probes and longer runs.
+# Eval-only invocations also get the recipe prepended, so --eval-data below is also the eval set
+# --eval-only scores against unless overridden.
 # TRAINER COUNT: the 8-GPU node runs NTRAINERS=3 (3 trainer ranks + 5 vLLM generators) — the sweet
 # spot: generation keeps the async buffer full while the trainer is compute-bound, and a 4th trainer
 # starves generation. That is a torchrun launch param, NOT a speedrun CLI arg, so modal_app.py
-# defaults it from the GPU count (3 on 8-GPU nodes, 1 on smaller boxes), not in this list.
+# defaults it from the GPU count (3 on 8-GPU nodes, 1 on smaller boxes), not in this list. Local
+# record runs should use `NODE_GPUS=8 torchrun --standalone --nproc_per_node=3 -m speedrun ...`.
 RECIPE = [
     "--dtype", "float32",       # load trainer params/head fp32; train autocast runs body bf16, head/logits fp32
     "--train-data", "datasets/sokoban_train.jsonl",
@@ -110,6 +112,7 @@ RECIPE = [
     "--lr-schedule", "linear",
     "--min-lr-frac", "0.15",
     "--lr-decay-steps", "90",
+    "--max-steps", "75",          # the record's step count; override on the CLI for probes/longer runs
     "--grad-clip", "1.0",
     "--cispo-eps", "4.0",
     "--loss-normalization", "sequence",  # sample-level (GRPO).
@@ -2541,6 +2544,10 @@ def sanitize_run_name(name: str) -> str:
     return safe or "run"
 
 
+def default_run_name(kind: str = "speedrun") -> str:
+    return f"sokoban-{kind}-{time.strftime('%Y%m%d-%H%M%S')}"
+
+
 def _file_sha256(path: Path | str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as fh:
@@ -3056,6 +3063,10 @@ def run_pipeline(
         except TypeError:
             dist.init_process_group(backend="nccl", timeout=pg_timeout)
         dist.barrier()  # (1) the ONLY init barrier; symmetric all-rank; see invariant above.
+        if getattr(args, "auto_run_name", False):
+            run_name_box = [args.run if ddp_rank == 0 else None]
+            dist.broadcast_object_list(run_name_box, src=0)
+            args.run = run_name_box[0]
     print0(f"Pipeline trainer world size: {world_size}")
 
     set_seed(args.seed, device)
@@ -3222,7 +3233,7 @@ def run_pipeline(
         # wandb / rollout files / model-perf are RANK-0-ONLY (only rank 0 logs metrics and
         # owns the collect loop). This is part of the guarded rank-0 init path so workers learn
         # about W&B or filesystem setup failures before waiting for the first step scatter.
-        if args.run != "dummy":
+        if args.wandb and args.run != "dummy":
             import wandb
             wandb_run = wandb.init(project="nanochat-rl-hf", name=args.run, config=vars(args))
         model_perf_info = collect_model_perf_info(model)
@@ -4166,7 +4177,18 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["auto", "float32", "bfloat16", "float16"],
         help="Parameter dtype used when loading the model. LM head is kept in fp32 when non-fp32 is chosen.",
     )
-    parser.add_argument("--run", type=str, default="dummy", help="W&B run name; 'dummy' disables W&B")
+    parser.add_argument(
+        "--run",
+        type=str,
+        default=None,
+        help="Run/output name. Defaults to sokoban-speedrun-<date>; 'dummy' is still accepted.",
+    )
+    parser.add_argument(
+        "--wandb",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable W&B logging. Defaults to on only when --run is passed explicitly.",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"), help="Base directory for checkpoints")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-epochs", type=int, default=1)
@@ -4611,6 +4633,12 @@ def main(argv: list[str] | None = None) -> None:
     # Prepend the hardcoded RECIPE (top of file) so the benchmark recipe is the baseline; any flag
     # passed on the CLI comes AFTER and overrides its recipe value (argparse last-wins).
     args = parser.parse_args([*RECIPE, *cli])
+    explicit_run = any(arg == "--run" or arg.startswith("--run=") for arg in cli)
+    args.auto_run_name = not args.run
+    if args.auto_run_name:
+        args.run = default_run_name("eval" if args.eval_only else "speedrun")
+    if args.wandb is None:
+        args.wandb = explicit_run and args.run != "dummy"
     _validate_sampling_args(args)
     _resolve_loss_args(args)
 
