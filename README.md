@@ -15,14 +15,9 @@ Acknowledgements and contributors: [@joshua-a-harris](https://github.com/joshua-
 | --- | ----------- | ----------- | ------------------------------------ | ---------- | -------------------------------------------------------- | ---------------------- | ------------ |
 | 1   | 1:27:31     | 1.251 EFLOP | GRPO, LR 1.6e-6 annealed, 75 steps   | 2026-06-17 | [records/2026-06-17_01](records/2026-06-17_01_grpo/) | 0.891 (CI [0.86, 0.92]) | @JeanKaddour |
 
-Ranked by record time: the wall-clock from training step 1 to the final checkpoint. FLOPs is shown for reference, not scored — it's node-invariant, so it tracks a recipe's compute efficiency on its own, separate from how fast a given node happens to be.
-
-
-Each record links its full training log and eval JSON in the `[records/](records/)` directory, and its own page explains how the numbers were measured.
 
 ![leaderboard](records/leaderboard.png)
 
-*Every submission summarized in one view (`python plot_leaderboard.py`, regenerated as records land): each recipe's solve-rate-vs-wall-clock trajectory on the left, and its held-out pass@1 against record time (annotated with the run's FLOPs) on the right.*
 
 # Rules
 
