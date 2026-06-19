@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import glob
 import gzip
+import hashlib
 import json
 import sys
 import zlib
@@ -51,6 +52,7 @@ DEGENERATE_TAIL_RATIO = 0.15   # zlib(tail)/len(tail) below this == repetition l
 DEGENERATE_MAX_FRAC = 0.01     # more than 1% degenerate tails fails the health check
 DUP_WARN_FRAC = 0.10           # >10% duplicate completions within puzzles: warn only
 FLOAT_TOL = 1e-9
+SOURCE_DIVIDER = "=" * 100
 
 
 class Failures:
@@ -163,6 +165,43 @@ def verify_rollouts(record: dict, rollouts_path: Path, eval_task, eval_data_path
           f"degenerate tails {deg_frac:.2%}, dups {dup_frac:.2%}")
 
 
+def _train_log_paths(record_dir: Path) -> list[Path]:
+    return [
+        p for p in sorted(record_dir.glob("train_log_seed*.txt"))
+        if not p.name.endswith(".flops.txt")
+    ]
+
+
+def _embedded_speedrun_source(log_path: Path) -> str:
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    source, sep, _rest = text.partition(f"\n{SOURCE_DIVIDER}\n")
+    if not sep:
+        raise ValueError("could not find run-log source divider")
+    if source.startswith("<source unavailable:"):
+        raise ValueError("embedded speedrun.py source is unavailable")
+    return source if source.endswith("\n") else source + "\n"
+
+
+def verify_source_snapshots(record_dir: Path, fails: Failures, label: str) -> None:
+    for log_path in _train_log_paths(record_dir):
+        seed = log_path.stem.replace("train_log_", "")
+        snapshot = record_dir / "source" / f"speedrun_{seed}.py"
+        tag = f"{label} {seed}"
+        if not snapshot.exists():
+            fails.check(False, f"{tag}: missing source snapshot {snapshot.relative_to(record_dir)}")
+            continue
+        try:
+            embedded = _embedded_speedrun_source(log_path)
+            saved = snapshot.read_text(encoding="utf-8")
+        except Exception as exc:
+            fails.check(False, f"{tag}: could not verify source snapshot: {exc}")
+            continue
+        fails.check(saved == embedded, f"{tag}: source snapshot does not match embedded run-log source")
+        if saved == embedded:
+            sha = hashlib.sha256(saved.encode("utf-8")).hexdigest()
+            print(f"  ok    {tag}: source snapshot {snapshot.relative_to(record_dir)} sha256 {sha[:12]}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("record_dir", type=Path, help="records/<date>_<nn>_<name>/ directory to verify")
@@ -208,6 +247,7 @@ def main() -> int:
         return Path(path).stem.replace("eval_", "").split(".")[0]
 
     submission = [(seed_label(p), rescore(p, Path(p).name)) for p in primary_jsons]
+    verify_source_snapshots(args.record_dir, fails, "submission")
 
     for path in curve_jsons:
         record = json.loads(Path(path).read_text())
@@ -218,6 +258,8 @@ def main() -> int:
     # independent rerun. Re-score it identically; it must clear the bar too.
     verif_jsons = sorted(glob.glob(str(args.record_dir / "verification" / "eval_seed*.json")))
     verification = [(seed_label(p), rescore(p, f"verification/{Path(p).name}")) for p in verif_jsons]
+    if verification:
+        verify_source_snapshots(args.record_dir / "verification", fails, "verification")
 
     # Gate: every run — submission AND verification — independently clears the target via its
     # lower 95% bootstrap CI (single-seed protocol; no cross-seed averaging).

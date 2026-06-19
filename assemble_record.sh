@@ -14,8 +14,9 @@
 #   RUN=<VRUN> TRAIN_SEED=<vseed> VERIFY_OF=records/<date>_01_<name> \
 #       VERIFIER="@maintainer  PR#12" ./assemble_record.sh
 #
-# Pulls only the record artifacts (not the multi-GB checkpoint), renames to the seed convention,
-# then regenerates the record report + verifies (verify_record checks submission AND verification).
+# Pulls only the record artifacts (not the multi-GB checkpoint), including the source snapshot when
+# present, renames to the seed convention, then regenerates the record report + verifies
+# (verify_record checks submission AND verification).
 set -euo pipefail
 
 RUN="${RUN:?set RUN to the Modal run name (outputs/<RUN>/ on the volume)}"
@@ -79,12 +80,22 @@ echo ">> pulling record artifacts (not the checkpoint)"
 for f in "${pull[@]}"; do
   modal volume get "$VOL" "/outputs/$RUN/$f" "$stage/" --force
 done
+mkdir -p "$stage/source"
+if modal volume get "$VOL" "/outputs/$RUN/source/speedrun.py" "$stage/source/" --force; then
+  echo ">> pulled source snapshot"
+else
+  echo ">> source snapshot not found in run output; report generation will backfill from train log"
+fi
 
 mkdir -p "$DEST"
 cp "$stage/$log_name"  "$DEST/train_log_seed${TRAIN_SEED}.txt"
 cp "$stage/$eval_json" "$DEST/eval_seed${TRAIN_SEED}.json"
 cp "$stage/$eval_roll" "$DEST/eval_seed${TRAIN_SEED}.rollouts.jsonl.gz"
 [ -z "$VERIFY_OF" ] && cp "$stage/final_rollouts.jsonl.gz" "$DEST/final_rollouts_seed${TRAIN_SEED}.jsonl.gz"
+if [ -f "$stage/source/speedrun.py" ]; then
+  mkdir -p "$DEST/source"
+  cp "$stage/source/speedrun.py" "$DEST/source/speedrun_seed${TRAIN_SEED}.py"
+fi
 echo ">> assembled $DEST (seed $TRAIN_SEED)"
 
 if [ -n "$VERIFY_OF" ]; then
