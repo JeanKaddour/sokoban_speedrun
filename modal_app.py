@@ -49,8 +49,7 @@ NUM_GPUS = int(os.environ.get("NUM_GPUS", os.environ.get("NODE_GPUS", "8")))
 # non-trivial 1-box train/eval split and avoid debug/measurement I/O that slows the sprint.
 # The run recipe now lives in speedrun.py as the top-level RECIPE constant, which speedrun.main()
 # prepends to the CLI args. The launcher below only passes per-run args (--run / EXTRA_ARGS, plus
-# an optional MAX_STEPS override), and the eval path relies on the same RECIPE defaults via
-# speedrun --eval-only.
+# an optional MAX_STEPS override). Held-out eval defaults live in eval_speedrun.py.
 
 
 app = modal.App(APP_NAME)
@@ -330,9 +329,11 @@ def train(
 
 
 def _parse_seeds(spec: str) -> list[int]:
-    """Comma-separated eval-seed list, e.g. "1,2,3,4,5" (single-checkpoint mode only; a record
-    eval replicates over training runs via comma-separated EVAL_CHECKPOINT, with a single
-    eval seed). Duplicates are rejected: rerunning one seed would just overwrite its JSON."""
+    """Comma-separated eval-seed list, e.g. "1,2,3,4,5".
+
+    Single-checkpoint mode runs one JSON per seed. Comma-separated checkpoint mode uses the
+    first seed and evaluates each checkpoint once under the shared protocol.
+    """
     tokens = [tok for tok in spec.replace(" ", "").split(",") if tok]
     if not tokens:
         raise ValueError(f"EVAL_SEEDS must be a comma-separated list of ints, got {spec!r}")
@@ -346,34 +347,27 @@ def _parse_seeds(spec: str) -> list[int]:
 
 
 def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: list[int],
-                  target: float = 0.80, eval_max_tokens: int = 12288, eval_max_model_len: int = 16384,
+                  eval_max_tokens: int = 12288, eval_max_model_len: int = 16384,
                   interruption: bool = True, interrupt_answer_tokens: int = 512,
                   eval_gpu_mem_util: float = 0.9, eval_vllm_max_num_batched_tokens: int = 40960,
-                  eval_vllm_max_num_seqs: int = 16, eval_concurrency: int = 16,
+                  eval_vllm_max_num_seqs: int = 32, eval_concurrency: int = 32,
                   eval_data: str | None = None) -> list[list[str]]:
-    """speedrun --eval-only command(s). `checkpoint` may be a comma-separated list of final
-    checkpoints (one per training seed): that emits ONE record-eval command that evaluates all
-    of them under the same protocol at a single eval seed and ends with the built-in
-    significance verdict (mean pass@1 > `target` at p<0.01). A single checkpoint keeps the
-    per-seed behavior: one command per eval seed, each with an EXPLICIT --eval-seed and a
-    seed-distinct --eval-output. (Without these, every run silently sampled at speedrun.py's
-    default seed 12345 and successive runs overwrote one seed-agnostic JSON — a 5-seed record
-    claim would have had ~zero seed-to-seed variance and a meaningless p-value.)"""
+    """eval_speedrun command(s). `checkpoint` may be a comma-separated list of final
+    checkpoints (one per training seed): that emits one command evaluating them sequentially
+    under the same protocol at a single eval seed, with one JSON per checkpoint. A single
+    checkpoint keeps the per-seed behavior: one command per eval seed, each with an explicit
+    --eval-seed and a seed-distinct --eval-output."""
     if len(set(seeds)) < len(seeds):
         raise ValueError(f"duplicate seeds: {seeds}")
     checkpoints = [c for c in checkpoint.replace(" ", "").split(",") if c]
     if not checkpoints:
         raise ValueError(f"EVAL_CHECKPOINT must name at least one checkpoint, got {checkpoint!r}")
-    # --eval-data and --eval-top-p come from speedrun's RECIPE (prepended by speedrun.main());
-    # --eval-only reads them and ignores the training-side flags. Only the standalone eval-engine
-    # specifics are set here. Defaults are the leaderboard protocol: a generous 12288-token
-    # budget + interruption answer-forcing, which eliminates the budget-truncation confound and
-    # measures solving. A strict 6144/no-interruption protocol remains available via
-    # EVAL_MAX_TOKENS/EVAL_MAX_MODEL_LEN/EVAL_INTERRUPTION for diagnostics; --eval-max-model-len
-    # must cover prompt + max_tokens + the forced-answer continuation. The long-context scheduler
-    # defaults intentionally override speedrun.py's 1024-way eval recipe (sized for short budgets)
-    # to avoid overfeeding KV.
-    common = [sys.executable, "-m", "speedrun", "--eval-only",
+    # Defaults are the leaderboard protocol: a generous 12288-token budget + interruption
+    # answer-forcing, which eliminates the budget-truncation confound and measures solving.
+    # A strict 6144/no-interruption protocol remains available via EVAL_MAX_TOKENS /
+    # EVAL_MAX_MODEL_LEN / EVAL_INTERRUPTION for diagnostics; --eval-max-model-len must cover
+    # prompt + max_tokens + the forced-answer continuation.
+    common = [sys.executable, "-m", "eval_speedrun",
               "--run", run_name,
               "--eval-k", str(k), "--eval-max-tokens", str(eval_max_tokens),
               "--eval-max-model-len", str(eval_max_model_len), "--eval-vllm-dp", str(NUM_GPUS),
@@ -382,21 +376,20 @@ def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds
               "--eval-vllm-max-num-seqs", str(eval_vllm_max_num_seqs),
               "--eval-concurrency", str(eval_concurrency)]
     if eval_data:
-        # Appended AFTER the prepended RECIPE, so this overrides its --eval-data (argparse
-        # last-wins). Leave it unset for the default eval set (the RECIPE's
-        # datasets/sokoban_eval.jsonl); set it only to evaluate on a different set
+        # Leave unset for the default committed eval set. Set only to evaluate on a different set
         # (e.g. a harder transfer slice for ablations).
         common += ["--eval-data", eval_data]
     if interruption:
         common += ["--eval-interruption", "--eval-interrupt-answer-tokens", str(interrupt_answer_tokens)]
+    else:
+        common += ["--no-eval-interruption"]
     if eval_limit > 0:
         common += ["--eval-limit", str(eval_limit)]
     if len(checkpoints) > 1:
-        # Record eval: all checkpoints in one invocation (speedrun auto-names one JSON per
-        # checkpoint and prints the PASS/FAIL verdict; exit code 0/1 mirrors it).
-        return [common + ["--eval-checkpoint", *checkpoints,
-                          "--eval-seed", str(seeds[0]), "--eval-target", str(target)]]
-    # Mirror speedrun.py's own suffix derivation (step from the checkpoint path, else "latest")
+        # Record-style eval: all checkpoints in one invocation. eval_speedrun auto-names one JSON
+        # per checkpoint and does not emit an in-command verdict.
+        return [common + ["--eval-checkpoint", *checkpoints, "--eval-seed", str(seeds[0])]]
+    # Mirror eval_speedrun.py's own suffix derivation (step from the checkpoint path, else "latest")
     # and its run-name sanitization, so the per-seed files sit next to the default-path ones.
     m = re.search(r"step_?(\d+)", checkpoints[0])
     suffix = f"step{int(m.group(1)):06d}" if m else "latest"
@@ -416,19 +409,18 @@ def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds
     secrets=runtime_secrets,
 )
 def evaluate(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: str = "12345",
-             target: float = 0.80, eval_max_tokens: int = 12288, eval_max_model_len: int = 16384,
+             eval_max_tokens: int = 12288, eval_max_model_len: int = 16384,
              interruption: bool = True, eval_gpu_mem_util: float = 0.9,
              eval_vllm_max_num_batched_tokens: int = 40960,
-             eval_vllm_max_num_seqs: int = 16, eval_concurrency: int = 16,
+             eval_vllm_max_num_seqs: int = 32, eval_concurrency: int = 32,
              eval_data: str | None = None) -> None:
-    """Authoritative held-out eval (speedrun.py --eval-only): own vLLM engine over all GPUs at the
+    """Authoritative held-out eval (eval_speedrun.py): own vLLM engine over all GPUs at the
     full 12288-token leaderboard budget. `checkpoint` is "latest", a /vol path, an HF id (e.g. the
-    base model), or a COMMA-SEPARATED list of final checkpoints (one per training seed), which runs
-    the whole record eval end-to-end in one call: every checkpoint evaluated under the same
-    protocol, one JSON each, then the significance verdict (mean pass@1 > `target`, p<0.01). For a
-    single checkpoint, `seeds` (comma-separated) runs one eval/JSON per eval seed sequentially.
-    `eval_limit`>0 evals only the first N puzzles (cheap dev runs); 0 = full set. Writes
-    outputs/<run>/eval_*.json with pass@1/pass@k + bootstrap CI per run."""
+    base model), or a comma-separated list of final checkpoints (one per training seed), which runs
+    sequential independent evals in one call: every checkpoint evaluated under the same protocol,
+    one JSON each. For a single checkpoint, `seeds` (comma-separated) runs one eval/JSON per eval
+    seed sequentially. `eval_limit`>0 evals only the first N puzzles (cheap dev runs); 0 = full set.
+    Writes outputs/<run>/eval_*.json with pass@1/pass@k + bootstrap CI per run."""
     env = dict(os.environ)
     env.pop("CUDA_VISIBLE_DEVICES", None)
     _ensure_persistent_cache_dirs()
@@ -443,11 +435,10 @@ def evaluate(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: str
     if checkpoint.lower() == "latest":
         checkpoint = _latest_checkpoint()
         print(f"Resolved latest checkpoint to {checkpoint}", flush=True)
-    record_mode = "," in checkpoint
     # 300s cadence so a mid-eval crash keeps a fresh model download / vLLM compile cache (the
     # per-command commit below only fires AFTER a full eval, ~30-60 min after those cache writes).
     with _periodic_volume_commits(300):
-        for command in eval_commands(checkpoint, run_name, k, eval_limit, _parse_seeds(seeds), target,
+        for command in eval_commands(checkpoint, run_name, k, eval_limit, _parse_seeds(seeds),
                                      eval_max_tokens, eval_max_model_len, interruption,
                                      eval_gpu_mem_util=eval_gpu_mem_util,
                                      eval_vllm_max_num_batched_tokens=eval_vllm_max_num_batched_tokens,
@@ -456,13 +447,7 @@ def evaluate(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: str
                                      eval_data=eval_data):
             print(f"Eval: {' '.join(command)} (cwd={VOLUME_MOUNT_PATH})", flush=True)
             try:
-                if record_mode:
-                    # speedrun exits 0/1 on the PASS/FAIL verdict; don't crash the container on FAIL.
-                    rc = subprocess.run(command, check=False, env=env, cwd=VOLUME_MOUNT_PATH).returncode
-                    print(f"Record eval finished with exit code {rc} "
-                          f"({'PASS' if rc == 0 else 'FAIL or error — see verdict above'})", flush=True)
-                else:
-                    subprocess.run(command, check=True, env=env, cwd=VOLUME_MOUNT_PATH)
+                subprocess.run(command, check=True, env=env, cwd=VOLUME_MOUNT_PATH)
             finally:
                 volume.commit()  # commit per eval so partial results survive a crash
 
@@ -478,7 +463,7 @@ def evaluate(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: str
 def probe_datasets(eval_datasets: list[str], run_name: str, k: int, eval_limit: int,
                    max_tokens: int, max_model_len: int, interruption: bool,
                    model: str = "Qwen/Qwen3-4B-Instruct-2507") -> None:
-    """Base-model pass@k probe (P0) across a difficulty ladder. Runs speedrun --eval-only against
+    """Base-model pass@k probe (P0) across a difficulty ladder. Runs eval_speedrun against
     the BASE model on each eval dataset (relative /vol path) and writes one JSON per set to
     outputs/<run>/probe_<stem>.json. Used to locate the productive (0,1) reward-variance band from
     the per_puzzle_solved_count distribution BEFORE committing a training run to a dataset. Mirrors
@@ -500,7 +485,7 @@ def probe_datasets(eval_datasets: list[str], run_name: str, k: int, eval_limit: 
         for ds in eval_datasets:
             stem = osp.splitext(osp.basename(ds))[0]
             out = f"outputs/{run_name}/probe_{stem}.json"
-            command = [sys.executable, "-m", "speedrun", "--eval-only",
+            command = [sys.executable, "-m", "eval_speedrun",
                        "--run", run_name,
                        "--eval-checkpoint", model,
                        "--eval-data", ds,
@@ -514,6 +499,8 @@ def probe_datasets(eval_datasets: list[str], run_name: str, k: int, eval_limit: 
                 command += ["--eval-limit", str(eval_limit)]
             if interruption:
                 command += ["--eval-interruption", "--eval-interrupt-answer-tokens", "512"]
+            else:
+                command += ["--no-eval-interruption"]
             print(f"Probe: {' '.join(command)} (cwd={VOLUME_MOUNT_PATH})", flush=True)
             try:
                 subprocess.run(command, check=True, env=env, cwd=VOLUME_MOUNT_PATH)
@@ -544,18 +531,16 @@ def main() -> None:
               f"modal volume get nanochat-rl-hf /outputs/{run_name} ./reports/probe_modal --force", flush=True)
         return
     # Eval mode: EVAL_CHECKPOINT=latest (or <vol path or HF id>) modal run --detach modal_app.py
-    # Record mode: EVAL_CHECKPOINT="ckptA,ckptB,..." (one final checkpoint per training seed) runs
-    # the whole record eval + significance verdict in one call; EVAL_TARGET sets the bar (default = the 4B leaderboard TARGET, 0.80).
+    # Record-style mode: EVAL_CHECKPOINT="ckptA,ckptB,..." (one final checkpoint per training seed)
+    # evaluates each checkpoint sequentially and writes one independent eval JSON per checkpoint.
     eval_ckpt = os.environ.get("EVAL_CHECKPOINT")
     if eval_ckpt:
-        # Leaderboard eval protocol: k=8 on the fixed 100-puzzle d12 eval set
-        # (speedrun.py RECIPE's --eval-data), 12,288-token budget + interruption, seed 12345,
-        # target 0.80. EVAL_K / EVAL_DATA / EVAL_TARGET / EVAL_LIMIT override for ablations.
+        # Leaderboard eval protocol: k=8 on the fixed eval set, 12,288-token budget +
+        # interruption, seed 12345. EVAL_K / EVAL_DATA / EVAL_LIMIT override for ablations.
         k = int(os.environ.get("EVAL_K", "8"))
-        eval_data = os.environ.get("EVAL_DATA")  # None => speedrun RECIPE's --eval-data (the 128 set)
+        eval_data = os.environ.get("EVAL_DATA")  # None => eval_speedrun's default committed eval set
         eval_limit = int(os.environ.get("EVAL_LIMIT", "0"))  # 0 = full eval set; >0 = first N (cheap dev)
         seeds = ",".join(str(s) for s in _parse_seeds(os.environ.get("EVAL_SEEDS", "12345")))
-        target = float(os.environ.get("EVAL_TARGET", "0.80"))
         eval_max_tokens = int(os.environ.get("EVAL_MAX_TOKENS", "12288"))
         eval_max_model_len = int(os.environ.get("EVAL_MAX_MODEL_LEN", "16384"))
         eval_interruption = os.environ.get("EVAL_INTERRUPTION", "1") not in ("0", "false", "False", "")
@@ -565,12 +550,12 @@ def main() -> None:
         eval_concurrency = int(os.environ.get("EVAL_CONCURRENCY", "32"))
         run_name = os.environ.get("RUN_NAME") or f"sokoban-eval-{datetime.now():%Y%m%d-%H%M%S}"
         print(f"Running eval: ckpt={eval_ckpt}, run={run_name}, k={k}, limit={eval_limit}, "
-              f"data={eval_data or 'default (RECIPE)'}, seeds=[{seeds}], target={target}, "
+              f"data={eval_data or 'default'}, seeds=[{seeds}], "
               f"max_tokens={eval_max_tokens}, max_model_len={eval_max_model_len}, "
               f"interruption={eval_interruption}, gpu_mem_util={eval_gpu_mem_util}, "
               f"batched_tokens={eval_vllm_max_num_batched_tokens}, "
               f"max_num_seqs={eval_vllm_max_num_seqs}, concurrency={eval_concurrency}", flush=True)
-        evaluate.remote(eval_ckpt, run_name, k, eval_limit, seeds, target,
+        evaluate.remote(eval_ckpt, run_name, k, eval_limit, seeds,
                         eval_max_tokens, eval_max_model_len, eval_interruption,
                         eval_gpu_mem_util, eval_vllm_max_num_batched_tokens,
                         eval_vllm_max_num_seqs, eval_concurrency, eval_data)

@@ -18,8 +18,8 @@ cannot drift from what training and eval actually scored. Mid-run curve checkpoi
  4. HEALTH      — degenerate-tail fraction (zlib-compressible tails => repetition loops),
     duplicate-completion rate (sampler collapse), finish-reason mix, answered-rate match.
 
-With >=2 eval JSONs it then re-runs the leaderboard significance verdict (same one-sided
-t-test as speedrun.run_standalone_eval). Exit code: 0 PASS, 1 FAIL.
+It then applies the leaderboard gate: each primary submission run, and each verification rerun
+when present, must have lower 95% CI > target. Exit code: 0 PASS, 1 FAIL.
 
 Heavy imports note: speedrun.py imports torch/transformers at module level; run via
     uv run --with torch --with transformers --with reasoning-gym python verify_record.py ...
@@ -36,11 +36,13 @@ import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from speedrun import (  # noqa: E402  (single source of truth for scoring)
+from eval_speedrun import (  # noqa: E402  (single source of truth for eval aggregates)
     _bootstrap_ci,
-    _file_sha256,
     _pass_at_k_unbiased,
     _wilson_ci,
+)
+from speedrun import (  # noqa: E402  (single source of truth for scoring)
+    _file_sha256,
     extract_sokoban_answer,
     load_sokoban_jsonl_dataset,
 )
@@ -173,7 +175,7 @@ def main() -> int:
     # PRIMARY evals (eval_seed<TRAINSEED>.json) carry the record claim and are fully re-scored.
     # CURVE checkpoints (eval_step<NNNNNN>_seed<TRAINSEED>.json) are illustrative documentation of
     # the training trajectory: their aggregates are verified, but they are NOT the claim, so they
-    # neither require rollout artifacts nor count toward the significance verdict.
+    # neither require rollout artifacts nor count toward the final gate.
     primary_jsons = sorted(p for p in glob.glob(str(args.record_dir / "eval_seed*.json")))
     curve_jsons = sorted(glob.glob(str(args.record_dir / "eval_step*_seed*.json")))
     if not primary_jsons:

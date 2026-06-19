@@ -12,7 +12,6 @@ import os
 import queue
 import random
 import re
-import statistics
 import sys
 import threading
 import time
@@ -76,15 +75,13 @@ MSG_SHUTDOWN = "shutdown"
 MSG_ENGINE_READY = "engine_ready"
 MSG_WEIGHTS_READY = "weights_ready"
 MSG_ERROR = "error"
-EVAL_PID_BASE = 1_000_000_000
 # ============================ RUN RECIPE (single source of truth) ============================
 # The benchmark sprint recipe lives here as a top-level constant. main() PREPENDS it to the CLI
 # args, so the same hyperparameters apply to local launches and Modal. Any flag passed on the CLI
 # appears AFTER the recipe and therefore OVERRIDES the recipe value (argparse last-wins). --run is
 # deliberately NOT here (it varies per launch); --max-steps IS here (75 = the record's step count)
 # so it stays a CLI override for probes and longer runs.
-# Eval-only invocations also get the recipe prepended, so --eval-data below is also the eval set
-# --eval-only scores against unless overridden.
+# --eval-data stays in the recipe because --verify-datasets-only validates both train and eval sets.
 # TRAINER COUNT: the 8-GPU node runs NTRAINERS=3 (3 trainer ranks + 5 vLLM generators) — the sweet
 # spot: generation keeps the async buffer full while the trainer is compute-bound, and a 4th trainer
 # starves generation. That is a torchrun launch param, NOT a speedrun CLI arg, so modal_app.py
@@ -126,10 +123,6 @@ RECIPE = [
     "--vllm-stream-interval", "8",   # buffer token streaming to cut host/IPC overhead; no sampling/budget change
     "--vllm-max-num-batched-tokens", "8192",
     "--vllm-max-num-seqs", "512",
-    "--eval-vllm-max-num-batched-tokens", "16384",
-    "--eval-vllm-max-num-seqs", "1024",
-    "--eval-concurrency", "1024",
-    "--eval-top-p", "0.95",
     "--save-every", "0",
     "--save-final",
     "--wandb-rollout-samples", "20",  # rollouts/step logged to the wandb "rollouts_live" + final "rollouts" tables
@@ -429,7 +422,7 @@ def load_sokoban_jsonl_dataset(
     return dataset
 
 
-# ============================ VLLM GENERATION CHILD (rollout + in-loop-eval producer) ============================
+# ============================ VLLM GENERATION CHILD (rollout producer) ============================
 # vLLM scheduler/engine knobs plumbed verbatim from the CLI (`--vllm-*` for rollout generation,
 # `--eval-vllm-*` for the standalone eval engine) into AsyncEngineArgs. None means "preserve
 # vLLM's default" everywhere along the way. Adding a knob = one entry here + one add_argument in
@@ -556,7 +549,7 @@ def make_interrupt_config(
 ) -> dict[str, Any]:
     """Build the sampling['interrupt'] payload consumed by generate_group. The forced-answer
     continuation inherits the base sampling params unless an explicit override is given; the
-    training / in-loop-eval / standalone-eval paths all build their config through here so the
+    training / standalone-eval paths both build their config through here so the
     inherit-unless-overridden semantics cannot drift apart."""
     return {
         "marker_ids": list(marker_ids),
@@ -994,7 +987,7 @@ def build_optimizer(parameters: Iterator[torch.nn.Parameter], args: argparse.Nam
     params = list(parameters)
     # fused=True single-kernels the update over the ~64GB of fp32 param/grad/state traffic
     # (4B params × 16 B) instead of the multi-kernel foreach path. Same update math
-    # (not bitwise). CUDA-only, so fall back to the default path on CPU (tests / --device cpu).
+    # (not bitwise). CUDA-only, so fall back to the default path for non-CUDA direct tests.
     use_fused = bool(params) and all(p.is_cuda for p in params)
     return torch.optim.AdamW(
         params,
@@ -1935,430 +1928,6 @@ class PipelineWeightSync:
         )
 
 
-# ---------------------------------------------------------------------------
-# Held-out evaluation (the leaderboard metric). Decoupled from the training
-# signal: a fixed, held-out, reproducible pass@1/pass@k on the eval set, sized
-# for a tight CI. See run_standalone_eval / `--eval-only`.
-# ---------------------------------------------------------------------------
-
-def _pass_at_k_unbiased(n: int, c: int, k: int) -> float:
-    """Unbiased pass@k estimator (Chen et al., 2021): probability that at least one of k
-    samples drawn without replacement from n total (c correct) is correct."""
-    if k > n:
-        raise ValueError(f"pass@k requires k<=n, got k={k}, n={n}")
-    if n - c < k:
-        return 1.0
-    prod = 1.0
-    for i in range(n - c + 1, n + 1):
-        prod *= 1.0 - k / i
-    return 1.0 - prod
-
-
-def _wilson_ci(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
-    """Wilson score interval for a binomial proportion (used for the greedy k==1 case)."""
-    if n <= 0:
-        return (0.0, 1.0)
-    phat = successes / n
-    denom = 1.0 + z * z / n
-    center = (phat + z * z / (2 * n)) / denom
-    half = (z / denom) * math.sqrt(phat * (1.0 - phat) / n + z * z / (4 * n * n))
-    return (max(0.0, center - half), min(1.0, center + half))
-
-
-def _bootstrap_ci(values: list[float], *, n_boot: int = 10000, seed: int = 0,
-                  alpha: float = 0.05) -> tuple[float, float]:
-    """Percentile bootstrap CI for the mean of per-puzzle solve fractions. Puzzle-level
-    resampling captures both between-puzzle and within-puzzle (sampling) variance."""
-    n = len(values)
-    if n == 0:
-        return (0.0, 0.0)
-    try:
-        import numpy as _np
-        rng = _np.random.default_rng(seed)
-        arr = _np.asarray(values, dtype=float)
-        means = arr[rng.integers(0, n, size=(n_boot, n))].mean(axis=1)
-        return (float(_np.quantile(means, alpha / 2)), float(_np.quantile(means, 1.0 - alpha / 2)))
-    except Exception:
-        rng = random.Random(seed)
-        means = sorted(sum(values[rng.randrange(n)] for _ in range(n)) / n for _ in range(n_boot))
-        return (means[int((alpha / 2) * n_boot)], means[min(n_boot - 1, int((1.0 - alpha / 2) * n_boot))])
-
-
-async def run_held_out_eval(
-    engine,
-    tokenizer,
-    eval_task,
-    *,
-    k: int,
-    sampling: dict,
-    enable_thinking: bool = True,
-    indices: list[int] | None = None,
-    pass_at_ks: tuple[int, ...] = (1, 4, 8, 16),
-    concurrency: int = 128,
-    progress_every: int = 200,
-    collect_rollouts: bool = False,
-) -> dict:
-    """Evaluate the policy served by `engine` on `eval_task`: k samples per puzzle, each scored
-    with reasoning_gym's binary solve check via `eval_task.evaluate`. Returns pass@1, unbiased
-    pass@k, per-puzzle solve fractions and a confidence interval. Pure measurement (no logprobs,
-    no training); reuses the same prompt/scoring path as the trainer for an apples-to-apples set.
-    With collect_rollouts, also returns result["rollouts"]: one row per sample (completion text,
-    extracted moves, solved, finish_reason) so records can be re-scored offline (verify_record.py)."""
-    if indices is None:
-        indices = list(range(len(eval_task)))
-    eval_sampling = dict(sampling)
-    eval_sampling["logprobs"] = 0  # eval needs no per-token logprobs
-    sem = asyncio.Semaphore(concurrency)
-    n_total = len(indices)
-    done = 0
-
-    async def _one(idx: int) -> dict:
-        nonlocal done
-        conv = eval_task[idx]
-        prompt_ids = encode_prompt(tokenizer, conv["question"], enable_thinking)
-        async with sem:
-            samples = await generate_group(engine, prompt_ids.tolist(), k, eval_sampling)
-        c = answered = extract_fail = length_trunc = 0
-        rows: list[dict] = []
-        for j, s in enumerate(samples):
-            completion = tokenizer.decode(s["token_ids"], skip_special_tokens=True)
-            moves = extract_sokoban_answer(completion)
-            if moves is None:
-                extract_fail += 1
-            else:
-                answered += 1
-            if s.get("finish_reason") == "length":
-                length_trunc += 1
-            solved = eval_task.evaluate(conv, completion)
-            c += solved
-            if collect_rollouts:
-                rows.append({
-                    "puzzle_idx": idx, "sample": j, "solved": solved, "moves": moves,
-                    "finish_reason": s.get("finish_reason"),
-                    "gen_tokens": len(s["token_ids"]), "completion": completion,
-                })
-        done += 1
-        if progress_every and done % progress_every == 0:
-            print(f"  eval progress: {done}/{n_total} puzzles", flush=True)
-        return {
-            "n": len(samples),
-            "c": c,
-            "answered": answered,
-            "extract_fail": extract_fail,
-            "length_trunc": length_trunc,
-            "rows": rows,
-        }
-
-    results = await asyncio.gather(*[_one(i) for i in indices])
-
-    per_puzzle = [r["c"] / r["n"] if r["n"] else 0.0 for r in results]
-    n_puzzles = len(per_puzzle)
-    total_samples = sum(r["n"] for r in results)
-    total_solved = sum(r["c"] for r in results)
-    total_answered = sum(r["answered"] for r in results)
-    total_length_trunc = sum(r["length_trunc"] for r in results)
-    pass_at_1 = sum(per_puzzle) / max(1, n_puzzles)  # puzzle-weighted (== solved/total when n_i==k)
-
-    # vLLM can drop occasional None/empty completions (see _vllm_generate), so a puzzle may carry
-    # n < k samples. Clamp the estimator's k to the per-puzzle n: pass@min(j, n) <= pass@j, so a
-    # shortfall can only deflate the score (never inflate a record), and the eval cannot crash at
-    # aggregation (the estimator requires k <= n) after all the generation work is done.
-    n_short = sum(1 for r in results if r["n"] < k)
-    if n_short:
-        print(f"WARNING: {n_short}/{n_puzzles} puzzles returned fewer than k={k} samples; "
-              f"pass@k clamps k to each puzzle's sample count", flush=True)
-    pass_at_k = {
-        j: sum(_pass_at_k_unbiased(r["n"], r["c"], min(j, r["n"])) for r in results) / max(1, n_puzzles)
-        for j in pass_at_ks if j <= k
-    }
-
-    if n_puzzles > 1:
-        var = sum((v - pass_at_1) ** 2 for v in per_puzzle) / (n_puzzles - 1)
-        se = math.sqrt(var / n_puzzles)
-    else:
-        se = 0.0
-
-    if k == 1:
-        ci_low, ci_high = _wilson_ci(total_solved, total_samples)
-    else:
-        ci_low, ci_high = _bootstrap_ci(per_puzzle, seed=int(sampling.get("seed") or 0))
-
-    return {
-        "n_puzzles": n_puzzles,
-        "k": k,
-        "pass_at_1": pass_at_1,
-        "pass_at_k": pass_at_k,
-        "per_puzzle_solve_frac": per_puzzle,
-        "per_puzzle_n": [r["n"] for r in results],
-        "per_puzzle_solved_count": [r["c"] for r in results],
-        "per_puzzle_answered_count": [r["answered"] for r in results],
-        "per_puzzle_length_trunc_count": [r["length_trunc"] for r in results],
-        "ci_low": ci_low,
-        "ci_high": ci_high,
-        "se": se,
-        "n_extract_fail": sum(r["extract_fail"] for r in results),
-        "n_answered": total_answered,
-        "n_length_trunc": total_length_trunc,
-        "answer_rate": total_answered / max(1, total_samples),
-        "solve_given_answer": total_solved / max(1, total_answered),
-        "trunc_frac": total_length_trunc / max(1, total_samples),
-        "sampling": eval_sampling,
-        **({"rollouts": [row for r in results for row in r["rows"]]} if collect_rollouts else {}),
-    }
-
-
-# --- Student-t survival function P(T >= t) for the record significance test; scipy fast-path,
-# --- pure-stdlib fallback (Numerical Recipes incomplete beta). -------------------------------
-
-def _betacf(a: float, b: float, x: float) -> float:
-    MAXIT, EPS, FPMIN = 200, 3e-12, 1e-300
-    qab, qap, qam = a + b, a + 1.0, a - 1.0
-    c = 1.0
-    d = 1.0 - qab * x / qap
-    if abs(d) < FPMIN:
-        d = FPMIN
-    d = 1.0 / d
-    h = d
-    for mloop in range(1, MAXIT + 1):
-        m2 = 2 * mloop
-        aa = mloop * (b - mloop) * x / ((qam + m2) * (a + m2))
-        d = 1.0 + aa * d
-        if abs(d) < FPMIN:
-            d = FPMIN
-        c = 1.0 + aa / c
-        if abs(c) < FPMIN:
-            c = FPMIN
-        d = 1.0 / d
-        h *= d * c
-        aa = -(a + mloop) * (qab + mloop) * x / ((a + m2) * (qap + m2))
-        d = 1.0 + aa * d
-        if abs(d) < FPMIN:
-            d = FPMIN
-        c = 1.0 + aa / c
-        if abs(c) < FPMIN:
-            c = FPMIN
-        d = 1.0 / d
-        delta = d * c
-        h *= delta
-        if abs(delta - 1.0) < EPS:
-            break
-    return h
-
-
-def _betai(a: float, b: float, x: float) -> float:
-    """Regularized incomplete beta I_x(a, b)."""
-    if x <= 0.0:
-        return 0.0
-    if x >= 1.0:
-        return 1.0
-    lbeta = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
-    bt = math.exp(lbeta + a * math.log(x) + b * math.log(1.0 - x))
-    if x < (a + 1.0) / (a + b + 2.0):
-        return bt * _betacf(a, b, x) / a
-    return 1.0 - bt * _betacf(b, a, 1.0 - x) / b
-
-
-def student_t_sf(t: float, df: float) -> float:
-    """One-sided upper-tail probability P(T >= t) for a Student-t with `df` degrees of freedom."""
-    try:
-        from scipy.stats import t as _t  # fast, exact path when available
-        return float(_t.sf(t, df))
-    except Exception:
-        pass
-    if df <= 0:
-        return float("nan")
-    x = df / (df + t * t)
-    ib = _betai(df / 2.0, 0.5, x)  # = I_x(df/2, 1/2)
-    return 0.5 * ib if t > 0 else 1.0 - 0.5 * ib
-
-
-def _eval_one_checkpoint(args: argparse.Namespace, model_path: str, multi: bool) -> dict:
-    """Authoritative held-out evaluation of one checkpoint (or the base model), decoupled from
-    training: builds its own vLLM engine sized for the full rollout budget (and shuts it down
-    afterwards), runs the leaderboard pass@1/pass@k protocol on the fixed eval set, and writes a
-    per-checkpoint JSON. Returns the JSON record. No torchrun/DDP."""
-    eval_task = load_sokoban_jsonl_dataset(args.eval_data, split_name="eval")
-
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=args.trust_remote_code)
-    if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    indices = None
-    if args.eval_limit is not None and args.eval_limit > 0:
-        indices = list(range(min(args.eval_limit, len(eval_task))))
-
-    sampling = dict(
-        temperature=args.eval_temperature,
-        top_p=args.eval_top_p,
-        top_k=args.eval_top_k,
-        min_p=args.eval_min_p,
-        max_tokens=args.eval_max_tokens,
-        seed=args.eval_seed,
-        logprobs=0,
-    )
-    if args.eval_interruption:
-        marker_ids = tokenizer(
-            INTERRUPTION_TEXT if args.enable_thinking else INTERRUPTION_TEXT_NO_THINK,
-            add_special_tokens=False)["input_ids"]
-        sampling["interrupt"] = make_interrupt_config(
-            marker_ids, args.eval_interrupt_answer_tokens, args.eval_max_model_len,
-            base_temperature=args.eval_temperature, base_top_p=args.eval_top_p,
-            base_top_k=args.eval_top_k, base_min_p=args.eval_min_p,
-            temperature=args.eval_interrupt_temperature,
-            top_p=args.eval_interrupt_top_p, top_k=args.eval_interrupt_top_k,
-            min_p=args.eval_interrupt_min_p,
-        )
-
-    print(
-        f"[eval] model={model_path} eval_data={args.eval_data} "
-        f"n={len(indices) if indices is not None else len(eval_task)} k={args.eval_k} "
-        f"max_tokens={args.eval_max_tokens} sampling=temp{args.eval_temperature}/top_p{args.eval_top_p}/"
-        f"top_k{args.eval_top_k}/min_p{args.eval_min_p}/seed{args.eval_seed} "
-        f"interruption={args.eval_interruption}",
-        flush=True,
-    )
-
-    async def _run() -> dict:
-        engine = build_async_engine(
-            model_path,
-            num_dp=args.eval_vllm_dp,
-            dtype="bfloat16",
-            max_model_len=args.eval_max_model_len,
-            gpu_memory_utilization=args.eval_gpu_mem_util,
-            seed=args.eval_seed,
-            enforce_eager=args.eval_vllm_enforce_eager,
-            **vllm_tuning_from_args(args, prefix="eval_"),
-        )
-        try:
-            return await run_held_out_eval(
-                engine, tokenizer, eval_task,
-                k=args.eval_k, sampling=sampling,
-                enable_thinking=args.enable_thinking,
-                indices=indices,
-                concurrency=args.eval_concurrency,
-                collect_rollouts=args.eval_save_rollouts,
-            )
-        finally:
-            try:
-                engine.shutdown()
-            except Exception:
-                pass
-
-    result = asyncio.run(_run())
-
-    step = args.eval_step
-    if step is None:
-        m = re.search(r"step_?(\d+)", model_path)
-        step = int(m.group(1)) if m else None
-
-    record = {
-        "seed": args.eval_seed,
-        "run": args.run,
-        "step": step,
-        "checkpoint": model_path,
-        "model": args.model,
-        "eval_data": str(args.eval_data),
-        "git_commit": _git_commit(),
-        **{key: result[key] for key in (
-            "n_puzzles", "k", "pass_at_1", "pass_at_k", "ci_low", "ci_high", "se",
-            "n_extract_fail", "n_answered", "n_length_trunc", "answer_rate",
-            "solve_given_answer", "trunc_frac", "sampling", "per_puzzle_solve_frac",
-            "per_puzzle_n", "per_puzzle_solved_count", "per_puzzle_answered_count",
-            "per_puzzle_length_trunc_count",
-        )},
-    }
-
-    if args.eval_output is not None:
-        out_path = Path(args.eval_output)
-    else:
-        run_name = args.run if (args.run and args.run != "dummy") else "eval"
-        safe = sanitize_run_name(run_name)
-        suffix = f"step{step:06d}" if step is not None else "latest"
-        if multi:
-            # Disambiguate per-checkpoint JSONs by the checkpoint's run dir (outputs/<run>/step_NNNNNN).
-            ckpt_tag = sanitize_run_name(Path(model_path).parent.name or model_path)
-            out_path = args.output_dir / safe / f"eval_{ckpt_tag}_{suffix}.json"
-        else:
-            out_path = args.output_dir / safe / f"eval_{suffix}.json"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    # Eval rollouts artifact: full completions for offline re-scoring (verify_record.py). Written
-    # BEFORE the JSON so the record can name its artifact; gzipped (~3x) since completions dominate.
-    rollouts = result.get("rollouts")
-    if rollouts is not None:
-        rollouts_path = out_path.with_name(out_path.stem + ".rollouts.jsonl.gz")
-        meta = {
-            "type": "meta", "seed": args.eval_seed, "run": args.run, "step": step,
-            "checkpoint": model_path, "model": args.model,
-            "eval_data": str(args.eval_data), "eval_data_sha256": _file_sha256(args.eval_data),
-            "k": args.eval_k, "n_puzzles": result["n_puzzles"],
-            "git_commit": _git_commit(), "sampling": result["sampling"],
-        }
-        with gzip.open(rollouts_path, "wt", encoding="utf-8") as fh:
-            fh.write(json.dumps(meta, ensure_ascii=False) + "\n")
-            for row in rollouts:
-                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-        record["rollouts_file"] = rollouts_path.name
-        print(f"[eval] saved {len(rollouts)} eval rollouts -> {rollouts_path}", flush=True)
-    with out_path.open("w", encoding="utf-8") as fh:
-        json.dump(record, fh, indent=2)
-        fh.write("\n")
-
-    pk = " ".join(f"pass@{j}={result['pass_at_k'][j]:.4f}" for j in sorted(result["pass_at_k"]))
-    print(
-        f"[eval] {model_path} | n={result['n_puzzles']} k={result['k']} | "
-        f"pass@1={result['pass_at_1']:.4f} (95% CI [{result['ci_low']:.4f}, {result['ci_high']:.4f}], "
-        f"se={result['se']:.4f}) | {pk} | "
-        f"answer_rate={result['answer_rate']:.4f} solve|answer={result['solve_given_answer']:.4f} "
-        f"trunc={result['trunc_frac']:.4f} | extract_fail={result['n_extract_fail']} "
-        f"length_trunc={result['n_length_trunc']} | -> {out_path}",
-        flush=True,
-    )
-    return record
-
-
-def run_standalone_eval(args: argparse.Namespace) -> None:
-    """Single record-eval entrypoint: evaluates each --eval-checkpoint (one final checkpoint per
-    training seed) sequentially under the same protocol, writes one JSON per checkpoint, and —
-    given >=2 checkpoints — runs the leaderboard significance test (one-sided t-test that the
-    mean pass@1 clears --eval-target) and exits 0/1 on PASS/FAIL."""
-    checkpoints = [str(c) for c in args.eval_checkpoint] if args.eval_checkpoint else [args.model]
-    if len(set(checkpoints)) < len(checkpoints):
-        sys.exit(f"error: duplicate --eval-checkpoint paths {checkpoints} — each checkpoint must "
-                 "come from a distinct training run (the training run is the unit of replication).")
-    if args.eval_output is not None and len(checkpoints) > 1:
-        sys.exit("error: --eval-output is only valid with a single checkpoint; multi-checkpoint "
-                 "record evals auto-name one JSON per checkpoint.")
-
-    records = [_eval_one_checkpoint(args, mp, multi=len(checkpoints) > 1) for mp in checkpoints]
-    if len(records) < 2:
-        return
-
-    values = [float(r["pass_at_1"]) for r in records]
-    K = len(values)
-    mean = statistics.mean(values)
-    sd = statistics.stdev(values)  # ddof=1: checkpoint-to-checkpoint (seed-to-seed) variance
-    se = sd / math.sqrt(K)
-    df = K - 1
-    if se == 0.0:
-        t = math.inf if mean > args.eval_target else (-math.inf if mean < args.eval_target else 0.0)
-        p = 0.0 if mean > args.eval_target else (1.0 if mean < args.eval_target else 0.5)
-    else:
-        t = (mean - args.eval_target) / se
-        p = student_t_sf(t, df)
-    passed = p < args.eval_alpha and mean > args.eval_target
-
-    print(f"\n=== Record significance: mean(pass@1) > {args.eval_target} ===", flush=True)
-    print(f"  checkpoints (K) : {K}  {[round(v, 4) for v in values]}")
-    print(f"  mean +/- sd     : {mean:.4f} +/- {sd:.4f}   (se={se:.4f})")
-    print(f"  t / df          : {t:.3f} / {df}")
-    print(f"  one-sided p     : {p:.5f}   (alpha={args.eval_alpha})")
-    print("  decision        : " + ("PASS  "
-          f"(mean {mean:.4f} clears {args.eval_target} with p={p:.5f} < {args.eval_alpha})" if passed else
-          f"FAIL  (need mean>{args.eval_target} and p<{args.eval_alpha}; raise mean or add seeds)"),
-          flush=True)
-    raise SystemExit(0 if passed else 1)
-
-
 # ============================ MODEL LOAD / SAVE ============================
 class FP32LMHead(torch.nn.Module):
     """LM head that holds an fp32 weight and upcasts hidden states on the fly.
@@ -2571,7 +2140,7 @@ def _git_commit() -> str | None:
 class RunLogger:
     """Self-contained record log, modded-nanogpt style: rank 0 writes outputs/<run>/log_<8hex>.txt
     holding the full script source, environment attestation (versions, git commit, nvidia-smi,
-    argv/config), per-step record-clock lines, in-loop eval lines, and a final line stamped when
+    argv/config), per-step record-clock lines, and a final line stamped when
     the final checkpoint finishes writing — one file proves what ran, on what, with what result.
     The record clock starts at the START of the first training step (startup is untimed; see the
     README rules). Disabled instances (non-rank-0) are inert, and logging can never crash a run:
@@ -2681,16 +2250,6 @@ class RunLogger:
             f"grad_norm:{metrics.get('grad_norm', float('nan')):.4f}"
         )
 
-    def log_eval(self, round_step: int, metrics: dict) -> None:
-        self._write(
-            f"eval step:{round_step} "
-            f"pass@1:{metrics.get('eval/pass_at_1', float('nan')):.4f} "
-            f"answer_rate:{metrics.get('eval/answer_rate', float('nan')):.4f} "
-            f"solve_given_answer:{metrics.get('eval/solve_given_answer', float('nan')):.4f} "
-            f"trunc_frac:{metrics.get('eval/trunc_frac', float('nan')):.4f} "
-            f"record_time:{self.record_time():.1f}s"
-        )
-
     def log_final_checkpoint(self, checkpoint_dir: Path) -> None:
         self._write(f"final_checkpoint:{checkpoint_dir} record_time:{self.record_time():.1f}s")
 
@@ -2730,6 +2289,30 @@ def ewma_update(prev: float, value: float, alpha: float, *, seed: bool) -> float
     return value if seed else (1.0 - alpha) * prev + alpha * value
 
 
+def rollout_model_token_counts(prompt_length: int, sample: dict[str, Any]) -> tuple[int, int]:
+    """Approximate vLLM model-token work for one returned rollout sample as (prefill, decode).
+
+    Interruption samples are generated in two requests: prompt prefill + phase-1 decode, then
+    prompt+phase1+marker prefill + answer decode. The loss mask marks injected marker tokens
+    False, so it lets us separate marker prefill from actually decoded tokens.
+    """
+    token_ids = sample.get("token_ids") or []
+    loss_mask = sample.get("loss_mask")
+    if loss_mask is None:
+        return prompt_length, len(token_ids)
+    mask = list(loss_mask)
+    if len(mask) != len(token_ids):
+        return prompt_length, len(token_ids)
+    decode_tokens = sum(1 for keep in mask if keep)
+    try:
+        first_marker = mask.index(False)
+    except ValueError:
+        return prompt_length, decode_tokens
+    marker_tokens = sum(1 for keep in mask if not keep)
+    phase2_prefill = prompt_length + first_marker + marker_tokens
+    return prompt_length + phase2_prefill, decode_tokens
+
+
 @dataclass
 class CollectStats:
     """Rank-0 Phase-A bookkeeping for one step's collect loop (run_pipeline's
@@ -2758,6 +2341,8 @@ class CollectStats:
     groups_stale: int = 0
     consecutive_rejected: int = 0
     consecutive_rejected_max: int = 0
+    perf_rollout_prefill_tokens_total: int = 0
+    perf_rollout_decode_tokens_total: int = 0
 
     def register_reject(self, step: int, reject_limit: int) -> None:
         """One rejected group (stale / zero-variance / unusable): bump the consecutive-reject
@@ -2770,233 +2355,14 @@ class CollectStats:
                 f"(staleness bound too tight or rewards degenerate); aborting")
 
 
-class InloopEval:
-    """Rank-0 in-loop held-out eval, run through the SHARED training vLLM engine.
-
-    Eval prompts are enqueued with puzzle ids >= EVAL_PID_BASE so the Phase-A collect loop can
-    route their results here instead of training on them. Per-round per-puzzle counts accumulate
-    as results stream back (interleaved with training rollouts, possibly across several train
-    steps); a round is logged ONLY once every puzzle returned — a partial round is never logged
-    as eval/pass_at_1, only warned about past --inloop-eval-deadline-steps."""
-
-    def __init__(self, args: argparse.Namespace, tokenizer, eval_task: FixedSokobanDataset,
-                 interrupt_marker_ids: list[int] | None, prompt_q, wandb_run, run_logger) -> None:
-        self.args = args
-        self.tokenizer = tokenizer
-        self.eval_task = eval_task
-        self.interrupt_marker_ids = interrupt_marker_ids
-        self.prompt_q = prompt_q
-        self.wandb_run = wandb_run
-        self.run_logger = run_logger
-        self.prompts: list[dict[str, Any]] = []
-        self.rounds: dict[int, dict[str, Any]] = {}
-        self.pid_to_round: dict[int, tuple[int, int]] = {}
-        self.next_eval_pid = EVAL_PID_BASE
-
-    def prepare_prompts(self) -> None:
-        """Pre-tokenize the eval set once (rank-0 setup) and validate it fits max_model_len."""
-        args = self.args
-        max_prompt_len = 0
-        for idx in range(len(self.eval_task)):
-            conv = self.eval_task[idx]
-            prompt_ids = encode_prompt(self.tokenizer, conv["question"], args.enable_thinking)
-            max_prompt_len = max(max_prompt_len, int(prompt_ids.numel()))
-            self.prompts.append({
-                "index": idx,
-                "conversation": conv,
-                "prompt_ids": prompt_ids.tolist(),
-            })
-        if max_prompt_len + args.inloop_eval_max_tokens > args.max_model_len:
-            raise ValueError(
-                f"--max-model-len {args.max_model_len} too small for in-loop eval: "
-                f"max eval prompt ({max_prompt_len}) + --inloop-eval-max-tokens "
-                f"({args.inloop_eval_max_tokens}) exceeds it"
-            )
-        if not isinstance(self.wandb_run, DummyWandb):
-            self.wandb_run.define_metric("eval/*", step_metric="eval/round_step")
-        print0(
-            f"In-loop held-out eval ON: every={args.inloop_eval_every} steps, "
-            f"n={len(self.prompts)}, k={args.inloop_eval_k}, "
-            f"max_tokens={args.inloop_eval_max_tokens}, "
-            f"interruption={args.inloop_eval_interruption}"
-        )
-
-    def _sampling(self) -> dict[str, Any]:
-        args = self.args
-        sampling_eval = {
-            "temperature": args.eval_temperature,
-            "top_p": args.eval_top_p,
-            "top_k": args.eval_top_k,
-            "max_tokens": args.inloop_eval_max_tokens,
-            "seed": args.inloop_eval_seed,
-            "logprobs": 0,
-        }
-        if args.inloop_eval_interruption:
-            if self.interrupt_marker_ids is None:
-                raise RuntimeError("--inloop-eval-interruption requested but interruption marker was not initialized")
-            sampling_eval["interrupt"] = make_interrupt_config(
-                self.interrupt_marker_ids, args.inloop_eval_interrupt_answer_tokens, args.max_model_len,
-                base_temperature=args.eval_temperature, base_top_p=args.eval_top_p,
-                base_top_k=args.eval_top_k,
-                temperature=args.eval_interrupt_temperature,
-                top_p=args.eval_interrupt_top_p, top_k=args.eval_interrupt_top_k,
-            )
-        return sampling_eval
-
-    def launch_round(self, round_step: int, weight_version: int) -> None:
-        args = self.args
-        if args.inloop_eval_every <= 0 or not self.prompts:
-            return
-        if round_step in self.rounds:
-            return
-        state = {
-            "round_step": round_step,
-            "launched_at_step": round_step,
-            "weight_version": weight_version,
-            "expected": len(self.prompts),
-            "received": 0,
-            "n_samples": 0,
-            "n_answered": 0,
-            "n_solved": 0,
-            "n_length_trunc": 0,
-            "pids": [],
-            "per_puzzle_n": [0] * len(self.prompts),
-            "per_puzzle_solved_count": [0] * len(self.prompts),
-            "per_puzzle_answered_count": [0] * len(self.prompts),
-            "per_puzzle_length_trunc_count": [0] * len(self.prompts),
-        }
-        self.rounds[round_step] = state
-        sampling_eval = self._sampling()
-        for idx, item in enumerate(self.prompts):
-            pid = self.next_eval_pid
-            self.next_eval_pid += 1
-            state["pids"].append(pid)
-            self.pid_to_round[pid] = (round_step, idx)
-            self.prompt_q.put({
-                "type": MSG_GENERATE,
-                "puzzle_id": pid,
-                "prompt_token_ids": item["prompt_ids"],
-                "num_samples": args.inloop_eval_k,
-                "sampling": sampling_eval,
-            })
-        print0(
-            f"launched in-loop eval for step {round_step}: "
-            f"{len(self.prompts)} puzzles x k={args.inloop_eval_k}"
-        )
-
-    def process_result(self, msg: dict[str, Any], current_step: int) -> None:
-        pid = int(msg["puzzle_id"])
-        route = self.pid_to_round.pop(pid, None)
-        if route is None:
-            return
-        round_step, eval_idx = route
-        state = self.rounds.get(round_step)
-        if state is None:
-            return
-
-        conv = self.prompts[eval_idx]["conversation"]
-        n = solved = answered = length_trunc = 0
-        for sample in msg["samples"]:
-            n += 1
-            completion = self.tokenizer.decode(sample["token_ids"], skip_special_tokens=True)
-            if extract_sokoban_answer(completion) is not None:
-                answered += 1
-            if sample.get("finish_reason") == "length":
-                length_trunc += 1
-            solved += self.eval_task.evaluate(conv, completion)
-
-        state["received"] += 1
-        state["n_samples"] += n
-        state["n_answered"] += answered
-        state["n_solved"] += solved
-        state["n_length_trunc"] += length_trunc
-        state["per_puzzle_n"][eval_idx] = n
-        state["per_puzzle_solved_count"][eval_idx] = solved
-        state["per_puzzle_answered_count"][eval_idx] = answered
-        state["per_puzzle_length_trunc_count"][eval_idx] = length_trunc
-
-        if state["received"] >= state["expected"]:
-            self._finalize_round(round_step, current_step)
-
-    def warn_overdue(self, current_step: int) -> None:
-        """Flag (once per round) rounds still incomplete past the deadline; never logs them."""
-        for round_step, state in self.rounds.items():
-            if current_step - int(state["launched_at_step"]) < self.args.inloop_eval_deadline_steps:
-                continue
-            if state.get("deadline_warned"):
-                continue
-            state["deadline_warned"] = True
-            print0(
-                f"in-loop eval step {round_step:3d} still pending after "
-                f"{self.args.inloop_eval_deadline_steps} train steps "
-                f"({int(state['received'])}/{int(state['expected'])} puzzles); "
-                "not logging eval/pass_at_1 until the full eval set completes"
-            )
-
-    def _finalize_round(self, round_step: int, current_step: int) -> None:
-        state = self.rounds.pop(round_step, None)
-        if state is None:
-            return
-        for pid in state["pids"]:
-            self.pid_to_round.pop(pid, None)
-
-        received = int(state["received"])
-        expected = int(state["expected"])
-        if received != expected:
-            raise RuntimeError(
-                f"refusing to finalize incomplete in-loop eval round {round_step}: "
-                f"received {received}/{expected} puzzles"
-            )
-        per_puzzle = [
-            c / n
-            for c, n in zip(state["per_puzzle_solved_count"], state["per_puzzle_n"])
-            if n > 0
-        ]
-        total_samples = int(state["n_samples"])
-        total_answered = int(state["n_answered"])
-        total_solved = int(state["n_solved"])
-        total_trunc = int(state["n_length_trunc"])
-        pass_at_1 = sum(per_puzzle) / max(1, len(per_puzzle))
-        answer_rate = total_answered / max(1, total_samples)
-        solve_given_answer = total_solved / max(1, total_answered)
-        trunc_frac = total_trunc / max(1, total_samples)
-        metrics = {
-            "eval/round_step": round_step,
-            "eval/logged_step": current_step,
-            "eval/round_weight_version": state["weight_version"],
-            "eval/round_complete_frac": received / max(1, expected),
-            "eval/received_puzzles": received,
-            "eval/expected_puzzles": expected,
-            "eval/pass_at_1": pass_at_1,
-            "eval/answer_rate": answer_rate,
-            "eval/solve_given_answer": solve_given_answer,
-            "eval/trunc_frac": trunc_frac,
-            "eval/n_samples": total_samples,
-            "eval/n_answered": total_answered,
-            "eval/n_solved": total_solved,
-            "eval/n_length_trunc": total_trunc,
-            "eval/finalize_reason_complete": 1.0,
-        }
-        self.wandb_run.log(metrics)
-        self.run_logger.log_eval(round_step, metrics)
-        print0(
-            f"in-loop eval step {round_step:3d} (complete, {received}/{expected} puzzles) | "
-            f"pass@1 {pass_at_1:.3f} answer {answer_rate:.3f} "
-            f"solve|answer {solve_given_answer:.3f} trunc {trunc_frac:.3f}"
-        )
-
-
 def run_pipeline(
     args: argparse.Namespace,
     train_task: FixedSokobanDataset | None = None,
-    eval_task: FixedSokobanDataset | None = None,
 ) -> None:
     import multiprocessing as mp
 
     if train_task is None:
         train_task = load_sokoban_jsonl_dataset(args.train_data, split_name="train")
-    if eval_task is None:
-        eval_task = load_sokoban_jsonl_dataset(args.eval_data, split_name="eval")
     # File-order band labels for the per-band reward curves (puzzle_id maps to file index mod
     # dataset size on epoch wrap). Datasets without metadata.band just skip the per-band metrics.
     train_band_by_index = [
@@ -3013,14 +2379,22 @@ def run_pipeline(
             "training requires --dtype float32 (non-fp32 untie of lm_head desyncs the "
             "vLLM generator head from the trained policy on tied-embedding models)"
         )
+    if args.device and args.device.lower() != "cuda":
+        raise ValueError(
+            "--device is currently only supported as 'cuda' for training; the pipeline depends "
+            "on CUDA vLLM generation and NCCL weight transfer"
+        )
+    if not torch.cuda.is_available():
+        raise RuntimeError("training requires CUDA; no CUDA device is available")
 
     # Trainer ranks select their GPU via set_device(LOCAL_RANK) over all visible devices; a
     # preset CUDA_VISIBLE_DEVICES would break that physical rank->GPU mapping. The vLLM child
     # gets its own CVD from the layout below only for the child process start.
-    assert "CUDA_VISIBLE_DEVICES" not in os.environ, (
-        "run with CUDA_VISIBLE_DEVICES unset so each trainer rank maps to physical GPU "
-        "LOCAL_RANK and the vLLM child can claim GPUs T..T+M-1"
-    )
+    if "CUDA_VISIBLE_DEVICES" in os.environ:
+        raise ValueError(
+            "run with CUDA_VISIBLE_DEVICES unset so each trainer rank maps to physical GPU "
+            "LOCAL_RANK and the vLLM child can claim GPUs T..T+M-1"
+        )
     # The recipe fills one NODE_GPUS-GPU node: torchrun WORLD_SIZE is the trainer count T
     # (1 when launched without torchrun), and the vLLM generators take the rest, M = NODE_GPUS - T.
     # That makes `torchrun --nproc_per_node=T -m speedrun` the whole launch, no GPU-split flags.
@@ -3086,9 +2460,7 @@ def run_pipeline(
     pad_token_id = tokenizer.pad_token_id
     if len(train_task) < 1:
         raise ValueError("No training examples available")
-    if len(eval_task) < 1:
-        raise ValueError("No eval examples available")
-    print0(f"Loaded datasets: train={len(train_task)} from {train_task.path}; eval={len(eval_task)} from {eval_task.path}")
+    print0(f"Loaded dataset: train={len(train_task)} from {train_task.path}")
 
     optimizer = build_optimizer(model.parameters(), args)
     steps_per_epoch = max(1, len(train_task) // args.examples_per_step)
@@ -3118,7 +2490,7 @@ def run_pipeline(
     next_consume_pid = 0
     train_prompt_cache: list[PromptCacheEntry] = []
     interrupt_marker_ids: list[int] | None = None
-    if args.interruption or args.inloop_eval_interruption:
+    if args.interruption:
         interrupt_marker_ids = tokenizer(
             INTERRUPTION_TEXT if args.enable_thinking else INTERRUPTION_TEXT_NO_THINK,
             add_special_tokens=False)["input_ids"]
@@ -3167,7 +2539,6 @@ def run_pipeline(
     wandb_run = DummyWandb()
     model_perf_info = None
     run_logger = RunLogger(run_dir=run_dir, args=args, enabled=master_process)
-    inloop_eval: InloopEval | None = None  # rank 0 only; built in _rank0_setup (needs queues + wandb)
 
     def enqueue_puzzle(pid):
         if not train_prompt_cache:
@@ -3190,7 +2561,7 @@ def run_pipeline(
     def _rank0_setup() -> None:
         nonlocal train_prompt_cache
         nonlocal child, wsync, prompt_q, result_q, control_q, status_q
-        nonlocal wandb_run, model_perf_info, rollout_stream_q, rollout_stream_thread, inloop_eval
+        nonlocal wandb_run, model_perf_info, rollout_stream_q, rollout_stream_thread
         # Rendezvous steps (2)-(4); see the two-NCCL-group invariant above. All of this runs on
         # rank 0 only, with NO dist.* collective between (2) and (4): the workers are parked at the
         # (5) init-status broadcast, so a stray trainer-group collective here would have no peer
@@ -3245,10 +2616,6 @@ def run_pipeline(
             rollout_stream_thread.start()
             print0(f"Streaming rollouts to {run_dir / 'rollouts.jsonl.gz'} "
                    f"(async, every {args.rollout_flush_every} steps)")
-        inloop_eval = InloopEval(args, tokenizer, eval_task, interrupt_marker_ids,
-                                 prompt_q, wandb_run, run_logger)
-        if args.inloop_eval_every > 0:
-            inloop_eval.prepare_prompts()
     wandb_rollouts_enabled = False
     wandb_rollout_rows: list[list] = []
     wandb_rollout_columns = ["step", "weight_version", "staleness", "puzzle_id", "status",
@@ -3334,26 +2701,27 @@ def run_pipeline(
     def _collect_step_batch(step: int, t_step_start: float, times: dict[str, float]) -> CollectStats:
         """Phase A (RANK 0 ONLY): bank examples_per_step fresh, signal-bearing rollout groups,
         consuming groups in STRICT DATASET-FILE ORDER via the reorder buffer (results arrive in
-        completion order). In-loop-eval results (pid >= EVAL_PID_BASE) are routed out of band;
-        stale / zero-variance / unusable groups are rejected in file order (with the reject-limit
-        safety abort in CollectStats.register_reject). Raises on engine errors — the caller's
-        blanket handler broadcasts the poison sentinel."""
+        completion order). Stale / zero-variance / unusable groups are rejected in file order
+        (with the reject-limit safety abort in CollectStats.register_reject). Raises on engine
+        errors — the caller's blanket handler broadcasts the poison sentinel."""
         nonlocal next_consume_pid
         cs = CollectStats()
         reject_limit = max(256, args.examples_per_step * 64)
 
         def _absorb_result(msg: dict) -> None:
-            """Route one result_q message: engine errors raise, in-loop-eval results go out of
-            band, train groups land in the reorder buffer keyed by pid. No ticket reissue here —
+            """Route one result_q message: engine errors raise and train groups land in the
+            reorder buffer keyed by pid. No ticket reissue here —
             that happens at consume time, otherwise the generator forms a closed enqueue loop
             with itself and races arbitrarily far ahead of the trainer."""
             if msg["type"] == MSG_ERROR:
                 raise _abort_step(f"engine child error: {msg['msg']}")
             pid = msg["puzzle_id"]
-            if pid >= EVAL_PID_BASE:
-                inloop_eval.process_result(msg, step)
-                return
-            reorder_buffer[pid] = (msg, puzzles.pop(pid))
+            meta = puzzles.pop(pid)
+            for raw_sample in msg.get("samples", []):
+                prefill, decode = rollout_model_token_counts(meta["prefix_length"], raw_sample)
+                cs.perf_rollout_prefill_tokens_total += prefill
+                cs.perf_rollout_decode_tokens_total += decode
+            reorder_buffer[pid] = (msg, meta)
 
         while cs.puzzles_used < args.examples_per_step:
             head_wait_start = time.monotonic()
@@ -3516,7 +2884,9 @@ def run_pipeline(
                            is_ratio_acc: float, is_clip_acc: float, is_tok_acc: int,
                            log_ratio_acc: float, is_ratio_sq_acc: float,
                            global_token_count: int, num_microbatches: int,
-                           entropy_sum_acc: float = 0.0, entropy_tok_acc: float = 0.0) -> None:
+                           entropy_sum_acc: float = 0.0, entropy_tok_acc: float = 0.0,
+                           train_padded_tokens: float = 0.0,
+                           train_forward_backward_passes: float = 0.0) -> None:
         """RANK 0 end-of-step bookkeeping: metric assembly, wandb/console/record-log lines, the
         EWMA canaries, the live rollout table, checkpoint saving, and the warn/abort guards.
         Raises (e.g. the non-finite grad_norm abort) propagate to the caller's poison handler."""
@@ -3623,11 +2993,13 @@ def run_pipeline(
         }
         metrics.update(estimate_step_perf_metrics(
             model_info=model_perf_info,
-            train_padded_tokens=float(global_token_count),
-            train_forward_backward_passes=float(num_microbatches),
-            rollout_prefill_tokens=float(cs.prefill_tokens_total),
-            rollout_decode_tokens=float(cs.gen_tokens_total),
-            rollout_forward_passes=float(cs.gen_tokens_total),
+            train_padded_tokens=train_padded_tokens,
+            train_forward_backward_passes=train_forward_backward_passes,
+            rollout_prefill_tokens=float(cs.perf_rollout_prefill_tokens_total),
+            rollout_decode_tokens=float(cs.perf_rollout_decode_tokens_total),
+            rollout_forward_passes=float(
+                cs.perf_rollout_prefill_tokens_total + cs.perf_rollout_decode_tokens_total
+            ),
             train_seconds=times["train"],
             rollout_seconds=times["collect"],
         ))
@@ -3695,7 +3067,6 @@ def run_pipeline(
             _stream_flush_pending()
         wandb_run.log(metrics)
         run_logger.log_step(step, num_steps, metrics)
-        inloop_eval.warn_overdue(step)
         if should_save_checkpoint_for_step(step, num_steps, args.save_every, args.save_final):
             checkpoint_dir = save_hf_checkpoint(model, tokenizer, run_dir, step)
             print0(f"Saved checkpoint to {checkpoint_dir}")
@@ -3898,6 +3269,8 @@ def run_pipeline(
             # populated only when --log-entropy is on. Reduced with the IS accumulators below.
             entropy_sum_acc_t = torch.zeros((), dtype=torch.float32, device=device)
             entropy_tok_acc_t = torch.zeros((), dtype=torch.float32, device=device)
+            train_padded_tokens_t = torch.zeros((), dtype=torch.float32, device=device)
+            train_forward_backward_passes_t = torch.zeros((), dtype=torch.float32, device=device)
             num_microbatches = 0
             # ---- Phase E (ALL RANKS): backward over THIS rank's shard with normalizer=1.0 and
             # the GLOBAL counts (identical loss-call args to the single-GPU path). The microbatch
@@ -3926,6 +3299,8 @@ def run_pipeline(
                 attention_mask = attn_host.to(device, non_blocking=True)
                 labels = labels_host.to(device, non_blocking=True)
                 beh = beh_host.to(device, non_blocking=True)
+                train_padded_tokens_t = train_padded_tokens_t + float(ids_host.numel())
+                train_forward_backward_passes_t = train_forward_backward_passes_t + 1.0
                 times["batch_tensorize"] += time.monotonic() - t_tensorize_start
                 mb_stats: dict = {}
                 prompt_mode = args.loss_normalization == "prompt"
@@ -3983,6 +3358,7 @@ def run_pipeline(
                     is_ratio_acc_t, is_clip_acc_t, is_tok_acc_t.to(torch.float32),
                     log_ratio_acc_t, is_ratio_sq_acc_t, loss_sum_t,
                     entropy_sum_acc_t, entropy_tok_acc_t,
+                    train_padded_tokens_t, train_forward_backward_passes_t,
                 ])
                 dist.all_reduce(diag_t, op=dist.ReduceOp.SUM)
                 is_ratio_acc_t, is_clip_acc_t = diag_t[0], diag_t[1]
@@ -3990,6 +3366,7 @@ def run_pipeline(
                 log_ratio_acc_t, is_ratio_sq_acc_t = diag_t[3], diag_t[4]
                 loss_sum_t = diag_t[5]
                 entropy_sum_acc_t, entropy_tok_acc_t = diag_t[6], diag_t[7]
+                train_padded_tokens_t, train_forward_backward_passes_t = diag_t[8], diag_t[9]
             # ---- Phase F (ALL RANKS): clip + step on the global gradient; identical grads +
             # identical AdamW state keep every rank's params byte-identical afterward. ----
             t_optimizer_start = time.monotonic()
@@ -4005,6 +3382,8 @@ def run_pipeline(
             is_ratio_sq_acc = float(is_ratio_sq_acc_t.detach())
             entropy_sum_acc = float(entropy_sum_acc_t.detach())
             entropy_tok_acc = float(entropy_tok_acc_t.detach())
+            train_padded_tokens = float(train_padded_tokens_t.detach())
+            train_forward_backward_passes = float(train_forward_backward_passes_t.detach())
             grad_norm = float(grad_norm_t.detach())
             times["train"] = time.monotonic() - t_train_start
 
@@ -4029,13 +3408,6 @@ def run_pipeline(
             if master_process:
                 try:
                     _sync_weights_to_generators(times)
-                    if (
-                        args.inloop_eval_every > 0
-                        and has_next_step
-                        and step > 0
-                        and step % args.inloop_eval_every == 0
-                    ):
-                        inloop_eval.launch_round(step, current_version)
                 except BaseException:
                     if has_next_step:
                         _broadcast_poison(poison_sent)
@@ -4052,6 +3424,7 @@ def run_pipeline(
                         is_ratio_acc, is_clip_acc, is_tok_acc, log_ratio_acc, is_ratio_sq_acc,
                         global_token_count, num_microbatches,
                         entropy_sum_acc, entropy_tok_acc,
+                        train_padded_tokens, train_forward_backward_passes,
                     )
                 except BaseException:
                     if has_next_step:
@@ -4162,7 +3535,8 @@ def build_parser() -> argparse.ArgumentParser:
                              "(pairs with --no-enable-thinking, the default). For a hybrid thinking base, "
                              "pass --enable-thinking as well.")
     parser.add_argument("--trust-remote-code", action="store_true", help="Pass trust_remote_code=True to HF loaders")
-    parser.add_argument("--device", type=str, default="", help="cuda|cpu|mps, empty means autodetect")
+    parser.add_argument("--device", type=str, default="",
+                        help="Training device override. Only 'cuda' is supported by this vLLM/NCCL pipeline.")
     parser.add_argument("--train-data", type=Path, default=Path("datasets/sokoban_train.jsonl"), help="Train JSONL file with question, answer, and metadata.gamestr")
     parser.add_argument("--eval-data", type=Path, default=Path("datasets/sokoban_eval.jsonl"), help="Eval JSONL file with question, answer, and metadata.gamestr")
     parser.add_argument(
@@ -4404,111 +3778,19 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Hand the pending rollout-stream rows to the background writer every N "
                              "steps (each flush = one gzip member appended to rollouts.jsonl.gz); "
                              "0 = flush only at teardown.")
-    parser.add_argument("--eval-save-rollouts", action=argparse.BooleanOptionalAction, default=True,
-                        help="With --eval-output/--eval-only: write every eval completion to "
-                             "<eval-json-stem>.rollouts.jsonl.gz so the record can be re-scored "
-                             "offline by verify_record.py.")
-
-    parser.add_argument("--inloop-eval-every", type=int, default=0,
-                        help="Run held-out eval through the shared vLLM engine every N training steps; "
-                             "0 disables. Eval requests are excluded from training bookkeeping.")
-    parser.add_argument("--inloop-eval-k", type=int, default=4,
-                        help="Samples per held-out puzzle for in-loop eval.")
-    parser.add_argument("--inloop-eval-max-tokens", type=int, default=6144,
-                        help="Generation budget per puzzle for in-loop eval.")
-    parser.add_argument("--inloop-eval-interruption", action=argparse.BooleanOptionalAction, default=False,
-                        help="Use interruption-based answer forcing for in-loop held-out eval, matching "
-                             "the training length-control protocol.")
-    parser.add_argument("--inloop-eval-interrupt-answer-tokens", type=int, default=512,
-                        help="Token budget for the forced final answer in interrupted in-loop eval.")
-    parser.add_argument("--inloop-eval-seed", type=int, default=12345,
-                        help="Fixed sampling seed for paired in-loop eval rounds.")
-    parser.add_argument("--inloop-eval-deadline-steps", type=int, default=5,
-                        help="Warn if an in-loop eval round is still incomplete after this many training steps; "
-                             "partial eval rounds are never logged as eval/pass_at_1.")
-
-    # Standalone held-out evaluation (the authoritative leaderboard metric). Runs in its own
-    # process with a dedicated vLLM engine sized for the full rollout budget; no torchrun/DDP.
-    parser.add_argument("--eval-only", action="store_true",
-                        help="Evaluate a checkpoint (or the base model) on the held-out set and exit.")
-    parser.add_argument("--eval-checkpoint", type=Path, nargs="+", default=None,
-                        help="Checkpoint dir(s) to evaluate; defaults to --model (evaluate the base model). "
-                             "Pass one final checkpoint per training seed to run the full record eval: "
-                             "each is evaluated under the same protocol, then the significance test "
-                             "(mean pass@1 > --eval-target at --eval-alpha) prints a PASS/FAIL verdict.")
-    parser.add_argument("--eval-target", type=float, default=0.80,
-                        help="Leaderboard TARGET: the pass@1 lower-CI a record must clear. 0.80 is the "
-                             "gate (Qwen3-4B-Instruct-2507 on the eval set: base ~0.53, a trained run ~0.84 — "
-                             "a deliberate stretch the current best barely clears, so record claims should "
-                             "seed-replicate).")
-    parser.add_argument("--eval-alpha", type=float, default=0.01,
-                        help="Significance level for the record t-test (multi-checkpoint eval).")
-    parser.add_argument("--eval-k", type=int, default=16,
-                        help="Samples per puzzle for --eval-only; k=16 enables pass@{1,4,8,16}.")
-    parser.add_argument("--eval-max-tokens", type=int, default=6144,
-                        help="Generation budget per puzzle for --eval-only (leaderboard protocol).")
-    parser.add_argument("--eval-max-model-len", type=int, default=8192,
-                        help="vLLM max_model_len for the eval engine; must be >= prompt + --eval-max-tokens.")
-    parser.add_argument("--eval-interruption", action=argparse.BooleanOptionalAction, default=False,
-                        help="Use interruption-based answer forcing for --eval-only.")
-    parser.add_argument("--eval-interrupt-answer-tokens", type=int, default=512,
-                        help="Token budget for the forced final answer in interrupted --eval-only.")
-    parser.add_argument("--eval-interrupt-temperature", type=float, default=None,
-                        help="Sampling temperature for forced final-answer continuations during eval; "
-                             "default inherits --eval-temperature.")
-    parser.add_argument("--eval-interrupt-top-p", type=float, default=None,
-                        help="Nucleus sampling threshold for forced final-answer continuations during eval; "
-                             "default inherits --eval-top-p.")
-    parser.add_argument("--eval-interrupt-top-k", type=int, default=None,
-                        help="Top-k sampling for forced final-answer continuations during eval; "
-                             "default inherits --eval-top-k.")
-    parser.add_argument("--eval-interrupt-min-p", type=float, default=None,
-                        help="Min-p sampling for forced final-answer continuations during eval; "
-                             "default inherits --eval-min-p.")
-    parser.add_argument("--eval-temperature", type=float, default=0.8, help="--eval-only sampling temperature.")
-    parser.add_argument("--eval-top-p", type=float, default=0.95, help="--eval-only nucleus sampling threshold.")
-    parser.add_argument("--eval-top-k", type=int, default=0, help="--eval-only top-k (0 disables).")
-    parser.add_argument("--eval-min-p", type=float, default=0.0,
-                        help="--eval-only min-p (0 disables). Keeps tokens with prob >= min_p * max_prob; "
-                             "a temperature-robust tail cutoff. Combine with --eval-top-p 1.0 to isolate it.")
-    parser.add_argument("--eval-seed", type=int, default=12345,
-                        help="Sampling/bootstrap seed for --eval-only (vary per leaderboard seed; keep eval DATA fixed).")
-    parser.add_argument("--eval-output", type=Path, default=None,
-                        help="Per-run eval JSON path; default <output-dir>/<run>/eval_step<NNN>.json.")
-    parser.add_argument("--eval-step", type=int, default=None,
-                        help="Step number recorded in the eval JSON; parsed from the checkpoint dir name if omitted.")
-    parser.add_argument("--eval-vllm-dp", type=int, default=1, help="Data-parallel GPUs for the eval engine.")
-    parser.add_argument("--eval-gpu-mem-util", type=float, default=0.85,
-                        help="gpu_memory_utilization for the eval engine.")
-    parser.add_argument("--eval-vllm-enforce-eager", action=argparse.BooleanOptionalAction, default=False,
-                        help="Pass enforce_eager=True to the standalone eval vLLM engine.")
-    _add_vllm_tuning_args(
-        parser, prefix="eval_", ctx="the standalone eval engine",
-        seqs_note="When unset, the AsyncLLM (ENGINE_CONTEXT) falls back to 128, NOT the H100 1024 "
-                  "tier. To realize a higher value you must also raise --eval-concurrency in lockstep.",
-        batched_note="When unset, the AsyncLLM (ENGINE_CONTEXT) falls back to 2048, NOT the H100 "
-                     "8192 tier.",
-    )
-    parser.add_argument("--eval-limit", type=int, default=None,
-                        help="Evaluate only the first N puzzles (smoke tests); default = full eval set.")
-    parser.add_argument("--eval-concurrency", type=int, default=128,
-                        help="Max concurrent in-flight eval requests (asyncio semaphore) for the "
-                             "standalone --eval-only path. Raise in lockstep with --eval-vllm-max-num-seqs "
-                             "so the engine is actually fed beyond 128 sequences.")
     return parser
 
 
 def _validate_sampling_args(args: argparse.Namespace) -> None:
-    for name in ("temperature", "interrupt_temperature", "eval_temperature", "eval_interrupt_temperature"):
+    for name in ("temperature", "interrupt_temperature"):
         value = getattr(args, name)
         if value is not None and value < 0.0:
             raise ValueError(f"--{name.replace('_', '-')} must be non-negative")
-    for name in ("top_p", "interrupt_top_p", "eval_top_p", "eval_interrupt_top_p",
-                 "eval_min_p", "eval_interrupt_min_p"):
+    for name in ("top_p", "interrupt_top_p"):
         value = getattr(args, name)
         if value is not None and not (0.0 <= value <= 1.0):
             raise ValueError(f"--{name.replace('_', '-')} must be in [0, 1]")
-    for name in ("top_k", "interrupt_top_k", "eval_top_k", "eval_interrupt_top_k"):
+    for name in ("top_k", "interrupt_top_k"):
         value = getattr(args, name)
         if value is not None and value < 0:
             raise ValueError(f"--{name.replace('_', '-')} must be non-negative")
@@ -4526,19 +3808,18 @@ _VLLM_POSITIVE_KEYS = (
 
 
 def _validate_vllm_scheduler_args(args: argparse.Namespace) -> None:
-    for prefix in ("", "eval_"):
-        for key in _VLLM_POSITIVE_KEYS:
-            value = getattr(args, f"{prefix}vllm_{key}")
-            if value is not None and value < 1:
-                raise ValueError(f"{_vllm_flag(prefix, key)} must be positive")
-        threshold = getattr(args, f"{prefix}vllm_long_prefill_token_threshold")
-        if threshold is not None and threshold < 0:
-            raise ValueError(f"{_vllm_flag(prefix, 'long_prefill_token_threshold')} must be non-negative")
-        partial = getattr(args, f"{prefix}vllm_max_num_partial_prefills")
-        long_partial = getattr(args, f"{prefix}vllm_max_long_partial_prefills")
-        if (long_partial if long_partial is not None else 1) > (partial if partial is not None else 1):
-            raise ValueError(f"{_vllm_flag(prefix, 'max_long_partial_prefills')} must be <= "
-                             f"{_vllm_flag(prefix, 'max_num_partial_prefills')}")
+    for key in _VLLM_POSITIVE_KEYS:
+        value = getattr(args, f"vllm_{key}")
+        if value is not None and value < 1:
+            raise ValueError(f"{_vllm_flag('', key)} must be positive")
+    threshold = getattr(args, "vllm_long_prefill_token_threshold")
+    if threshold is not None and threshold < 0:
+        raise ValueError(f"{_vllm_flag('', 'long_prefill_token_threshold')} must be non-negative")
+    partial = getattr(args, "vllm_max_num_partial_prefills")
+    long_partial = getattr(args, "vllm_max_long_partial_prefills")
+    if (long_partial if long_partial is not None else 1) > (partial if partial is not None else 1):
+        raise ValueError(f"{_vllm_flag('', 'max_long_partial_prefills')} must be <= "
+                         f"{_vllm_flag('', 'max_num_partial_prefills')}")
 
 
 # Training-pipeline integer-bound checks: (attr, minimum, requirement phrase). Bespoke checks
@@ -4550,13 +3831,6 @@ _PIPELINE_MIN_ARGS = (
     ("logits_chunk_size", 1, "positive"),
     ("interrupt_answer_tokens", 1, "positive"),
     ("warmup_steps", 0, "non-negative"),
-    ("inloop_eval_every", 0, "non-negative"),
-    ("inloop_eval_k", 1, "at least 1"),
-    ("inloop_eval_max_tokens", 1, "positive"),
-    ("inloop_eval_interrupt_answer_tokens", 1, "positive"),
-    ("inloop_eval_deadline_steps", 1, "at least 1"),
-    ("eval_max_tokens", 1, "positive"),
-    ("eval_interrupt_answer_tokens", 1, "positive"),
 )
 
 
@@ -4592,7 +3866,7 @@ def _resolve_loss_args(args: argparse.Namespace) -> None:
 
 
 def _validate_pipeline_args(args: argparse.Namespace) -> None:
-    """Bounds checks for a TRAINING launch (the eval-only/verify-only paths skip these)."""
+    """Bounds checks for a training launch; --verify-datasets-only skips these."""
     for attr, minimum, requirement in _PIPELINE_MIN_ARGS:
         if getattr(args, attr) < minimum:
             raise ValueError(f"--{attr.replace('_', '-')} must be {requirement}")
@@ -4626,7 +3900,6 @@ def _validate_pipeline_args(args: argparse.Namespace) -> None:
         if interrupt_max > args.max_new_tokens:
             raise ValueError("--interrupt-max-tokens must be <= --max-new-tokens")
 
-
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     cli = sys.argv[1:] if argv is None else argv
@@ -4636,15 +3909,11 @@ def main(argv: list[str] | None = None) -> None:
     explicit_run = any(arg == "--run" or arg.startswith("--run=") for arg in cli)
     args.auto_run_name = not args.run
     if args.auto_run_name:
-        args.run = default_run_name("eval" if args.eval_only else "speedrun")
+        args.run = default_run_name("speedrun")
     if args.wandb is None:
         args.wandb = explicit_run and args.run != "dummy"
     _validate_sampling_args(args)
     _resolve_loss_args(args)
-
-    if args.eval_only:
-        run_standalone_eval(args)
-        return
 
     if args.verify_datasets_only:
         train_task = load_sokoban_jsonl_dataset(
@@ -4671,13 +3940,8 @@ def main(argv: list[str] | None = None) -> None:
         split_name="train",
         verify_gold=False,
     )
-    eval_task = load_sokoban_jsonl_dataset(
-        args.eval_data,
-        split_name="eval",
-        verify_gold=False,
-    )
 
-    run_pipeline(args, train_task=train_task, eval_task=eval_task)
+    run_pipeline(args, train_task=train_task)
 
 
 if __name__ == "__main__":

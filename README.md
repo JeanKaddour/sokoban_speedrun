@@ -38,6 +38,7 @@ On a local 8xH100 node:
 
 ```bash
 NODE_GPUS=8 torchrun --standalone --nproc_per_node=3 -m speedrun
+python -m eval_speedrun --eval-checkpoint outputs/<run>/step_000075
 ```
 
 ### Modal
