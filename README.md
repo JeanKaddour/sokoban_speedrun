@@ -54,4 +54,4 @@ EVAL_CHECKPOINT=latest modal run modal_app.py
 
 ## Credits
 
-Thanks to [@joshua-a-harris](https://github.com/joshua-a-harris/fundoku), [nanochat](https://github.com/karpathy/nanochat), [modded-nanoGPT](https://github.com/KellerJordan/modded-nanogpt), [nanoRL](https://joshuaharrissite.substack.com/p/nanorl), [ScaleRL](https://arxiv.org/abs/2510.13786), and [ReasoningGym](https://github.com/open-thought/reasoning-gym).
+Thanks to [@joshua-a-harris](https://github.com/joshua-a-harris) and his [nanoRL speedrun](https://joshuaharrissite.substack.com/p/nanorl), [nanochat](https://github.com/karpathy/nanochat), [modded-nanoGPT](https://github.com/KellerJordan/modded-nanogpt), [nanoRL](https://joshuaharrissite.substack.com/p/nanorl), [ScaleRL](https://arxiv.org/abs/2510.13786), and [ReasoningGym](https://github.com/open-thought/reasoning-gym).
