@@ -28,7 +28,7 @@ Fastest wall-clock run wins: one training run on one 8xH100 node, measured from 
 
 ### Submit
 
-1. Train, then eval the final checkpoint. Logs, rollouts, and eval JSON are written automatically.
+1. Train, then eval the final checkpoint. Logs, rollouts, source snapshots, and eval JSON are written automatically.
 2. Run `python make_record_report.py records/<your-dir>` and fill in the `Idea` section.
 3. Open a PR adding the record directory plus a leaderboard row. CI runs `python verify_record.py records/<your-dir>`.
 
