@@ -21,7 +21,6 @@ from concurrent.futures import ThreadPoolExecutor
 from collections import Counter, deque
 from dataclasses import asdict, dataclass, field, replace
 from datetime import timedelta
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -282,13 +281,11 @@ def extract_sokoban_answer(completion: str) -> str | None:
     return moves
 
 
-@lru_cache(maxsize=1)
-def _sokoban_scorer():
-    return reasoning_gym.create_dataset("sokoban", size=1, seed=0)
+_SOKOBAN_DATASET = reasoning_gym.create_dataset("sokoban", size=1, seed=0)
 
 
 def score_sokoban_moves(moves: str | None, entry: dict[str, Any]) -> float:
-    return float(_sokoban_scorer().score_answer(answer=moves, entry=entry))
+    return float(_SOKOBAN_DATASET.score_answer(answer=moves, entry=entry))
 
 
 def score_sokoban_progress(moves: str | None, entry: dict[str, Any]) -> float:
@@ -306,12 +303,11 @@ def score_sokoban_progress(moves: str | None, entry: dict[str, Any]) -> float:
     if not isinstance(moves, str):
         return 0.0
     import numpy as np
-    scorer = _sokoban_scorer()
     try:
         grid = [list(line) for line in entry["metadata"]["gamestr"].replace(" ", "").strip().split("\n")]
         matrix = np.array(grid)
         h, w = matrix.shape
-        game = scorer._Game(height=h, width=w)
+        game = _SOKOBAN_DATASET._Game(height=h, width=w)
         game.load_puzzle_matrix(matrix)
         init_state = game.get_curr_state()
         for move in moves:
