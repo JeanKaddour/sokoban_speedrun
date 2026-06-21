@@ -418,6 +418,174 @@ def load_sokoban_jsonl_dataset(
     return dataset
 
 
+# ============================ MODEL LOAD / SAVE ============================
+class FP32LMHead(torch.nn.Module):
+    """LM head that holds an fp32 weight and upcasts hidden states on the fly.
+
+    Constructed from an existing `nn.Linear` (typically `model.lm_head` after the
+    base model is loaded in bf16). Detaches and clones the weight so it stands
+    independent of any tied embedding parameter.
+    """
+
+    def __init__(self, lm_head: torch.nn.Linear):
+        super().__init__()
+        self.in_features = lm_head.in_features
+        self.out_features = lm_head.out_features
+        self.weight = torch.nn.Parameter(
+            lm_head.weight.detach().clone().to(torch.float32)
+        )
+        if lm_head.bias is not None:
+            self.bias = torch.nn.Parameter(
+                lm_head.bias.detach().clone().to(torch.float32)
+            )
+        else:
+            self.bias = None
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return F.linear(hidden_states.to(self.weight.dtype), self.weight, self.bias)
+
+
+_TORCH_DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
+
+
+def resolve_torch_dtype(dtype_name: str, device: torch.device) -> torch.dtype:
+    if dtype_name == "auto":
+        bf16_ok = device.type == "cuda" and torch.cuda.is_bf16_supported()
+        return torch.bfloat16 if bf16_ok else torch.float32
+    try:
+        return _TORCH_DTYPES[dtype_name]
+    except KeyError:
+        raise ValueError(f"Unsupported dtype: {dtype_name}") from None
+
+
+def _resolve_flash_attention_2_or_raise() -> None:
+    """Fail fast (with an actionable message) if attn_implementation='flash_attention_2' cannot be
+    satisfied, instead of crashing mid-run on the first forward. transformers 5.8 can serve FA2 from
+    the HF `kernels` hub when the standalone flash-attn package is absent (the case here), but that
+    needs the `kernels` library + a one-time hub download of kernels-community/flash-attn2."""
+    try:
+        from transformers.utils import is_flash_attn_2_available
+        if is_flash_attn_2_available():
+            return  # native flash-attn build present
+    except Exception:
+        pass
+    try:
+        from transformers.modeling_flash_attention_utils import lazy_import_flash_attention
+    except Exception:
+        # Resolver API absent in this transformers version; let from_pretrained resolve at load time.
+        return
+    try:
+        from transformers.utils import is_kernels_available
+        kernels_ok = is_kernels_available()
+    except Exception:
+        kernels_ok = True  # let lazy_import_flash_attention be the judge
+    if not kernels_ok:
+        raise RuntimeError(
+            "--attn-implementation flash_attention_2 needs either the flash-attn package or the HF "
+            "`kernels` library (pip install kernels), or use --attn-implementation sdpa."
+        )
+    try:
+        lazy_import_flash_attention("kernels-community/flash-attn2")
+    except Exception as exc:
+        raise RuntimeError(
+            "--attn-implementation flash_attention_2: failed to load the kernels-hub flash-attn2 "
+            f"kernel (needs a one-time HF-hub download / network access): {exc!r}. Pre-download it "
+            "on the node or use --attn-implementation sdpa."
+        ) from exc
+
+
+def load_model_and_tokenizer(args: argparse.Namespace, device: torch.device):
+    dtype = resolve_torch_dtype(args.dtype, device)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=args.trust_remote_code)
+
+    added_pad_token = False
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+        else:
+            tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+            added_pad_token = True
+
+    loader_kwargs = dict(trust_remote_code=args.trust_remote_code)
+    # When flash_attention_2 (the default) is requested, resolve the kernel up front; if it's
+    # unavailable (no `kernels` pkg / no network / unsupported GPU), fall back to SDPA with a
+    # warning rather than crash the run — the fallback is visible in the log + as a higher train_s.
+    # fp32 head/tie is unaffected: the attention impl only runs the bf16-autocast body matmul.
+    requested_attn = args.attn_implementation
+    if requested_attn == "flash_attention_2":
+        try:
+            _resolve_flash_attention_2_or_raise()
+        except Exception as exc:
+            print0(f"WARNING: --attn-implementation flash_attention_2 unavailable; falling back to sdpa: {exc}")
+            requested_attn = "sdpa"
+    if requested_attn != "sdpa":
+        loader_kwargs["attn_implementation"] = requested_attn
+    try:
+        model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype, **loader_kwargs)
+    except TypeError:
+        model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype, **loader_kwargs)
+    if added_pad_token:
+        model.resize_token_embeddings(len(tokenizer))
+    model.to(device)
+    print0(f"Attention implementation: {getattr(model.config, '_attn_implementation', 'unknown')}")
+
+    if dtype != torch.float32 and hasattr(model, "lm_head") and isinstance(model.lm_head, torch.nn.Linear):
+        model.lm_head = FP32LMHead(model.lm_head)
+        model.lm_head.to(device)
+        if getattr(model.config, "tie_word_embeddings", False):
+            model.config.tie_word_embeddings = False
+
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        model.config.use_cache = False
+
+    if args.compile:
+        # Compile the transformer BODY only (the fp32 head + chunked CE stay eager — they run under
+        # their own checkpoint with autocast disabled). dynamic=True avoids recompiles on the varying
+        # per-microbatch sequence lengths (var-prefix batches); watch train_s for recompile churn.
+        model.model = torch.compile(model.model, dynamic=True)
+        print0("torch.compile enabled on the transformer body (dynamic=True)")
+
+    return model, tokenizer
+
+
+def strip_compiled_state_dict_keys(state_dict: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove torch.compile's `_orig_mod.` segment from state-dict keys.
+
+    With --compile, model.model is an OptimizedModule, so the raw state dict names body
+    keys `model._orig_mod.layers...`. transformers does NOT strip that prefix on load, so
+    from_pretrained would silently random-init the entire body (warning only) and any eval
+    of the checkpoint would score garbage. Mirrors PipelineWeightSync._named_parameters,
+    which is what keeps the live vLLM weight sync compile-safe; no-op when --compile is off.
+    """
+    return {name.replace("_orig_mod.", ""): value for name, value in state_dict.items()}
+
+
+def save_hf_checkpoint(
+    model,
+    tokenizer,
+    output_dir: Path,
+    step: int,
+) -> Path:
+    checkpoint_dir = output_dir / f"step_{step:06d}"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    state_dict = strip_compiled_state_dict_keys(model.state_dict())
+    # Belt-and-braces: a compiled-module prefix in the saved keys means from_pretrained
+    # would silently drop those weights — refuse to write such a checkpoint.
+    leaked = [name for name in state_dict if "_orig_mod" in name]
+    if leaked:
+        raise RuntimeError(f"compiled-module prefix leaked into checkpoint keys: {leaked[:3]}")
+    model.save_pretrained(checkpoint_dir, state_dict=state_dict)
+    tokenizer.save_pretrained(checkpoint_dir)
+    return checkpoint_dir
+
+
+def should_save_checkpoint_for_step(step: int, num_steps: int, save_every: int, save_final: bool) -> bool:
+    final_step = step == num_steps - 1
+    periodic_save = save_every > 0 and step > 0 and step % save_every == 0
+    return periodic_save or (final_step and save_final)
+
+
 # ============================ VLLM GENERATION CHILD (rollout producer) ============================
 # vLLM scheduler/engine knobs plumbed verbatim from the CLI (`--vllm-*` for rollout generation,
 # `--eval-vllm-*` for the standalone eval engine) into AsyncEngineArgs. None means "preserve
@@ -1015,7 +1183,7 @@ def get_lr_multiplier(
         raise ValueError(f"Unsupported LR schedule: {schedule}")
     # Linear decay from peak (1.0, at the end of warmup) down to the floor `min_lr_frac`, reached at
     # absolute step `lr_decay_steps` (defaults to num_steps), then HELD at the floor for the rest of
-    # the run. With min_lr_frac=0.0 and lr_decay_steps=None this is the legacy decay-to-zero schedule.
+    # the run.
     decay_end = lr_decay_steps if lr_decay_steps is not None else num_steps
     if warmup_steps == 0:
         if num_steps <= 1:
@@ -1054,14 +1222,12 @@ def make_pad_example(pad_token_id: int) -> "RolloutExample":
     )
 
 
-def strip_rollout_completion(example: "RolloutExample") -> "RolloutExample":
-    """Return a training-only copy of a rollout without the decoded completion payload."""
-    return example if example.completion == "" else replace(example, completion="")
-
-
 def strip_rollout_completions(examples: list["RolloutExample"]) -> list["RolloutExample"]:
     """Drop decoded strings from examples that are only needed for training/scatter payloads."""
-    return [strip_rollout_completion(example) for example in examples]
+    return [
+        example if example.completion == "" else replace(example, completion="")
+        for example in examples
+    ]
 
 
 def sort_and_shard_for_microbatching(
@@ -1352,11 +1518,6 @@ def build_prompt_cache(
     return cache
 
 
-def decode_completion(tokenizer, sequence: torch.Tensor, prefix_length: int) -> str:
-    generated = sequence[prefix_length:]
-    return tokenizer.decode(generated.tolist(), skip_special_tokens=True)
-
-
 def trim_generated_with_logprobs_and_text(
     tokenizer,
     sequence: torch.Tensor,
@@ -1428,7 +1589,8 @@ def process_rollout_sample(
             loss_mask,
         )
     else:
-        completion = decode_completion(tokenizer, sequence, prefix_length)
+        generated = sequence[prefix_length:]
+        completion = tokenizer.decode(generated.tolist(), skip_special_tokens=True)
         moves = extract_sokoban_answer(completion)
     reward = score_sokoban_progress(moves, conversation)
     return ProcessedRolloutSample(
@@ -1924,174 +2086,6 @@ class PipelineWeightSync:
         )
 
 
-# ============================ MODEL LOAD / SAVE ============================
-class FP32LMHead(torch.nn.Module):
-    """LM head that holds an fp32 weight and upcasts hidden states on the fly.
-
-    Constructed from an existing `nn.Linear` (typically `model.lm_head` after the
-    base model is loaded in bf16). Detaches and clones the weight so it stands
-    independent of any tied embedding parameter.
-    """
-
-    def __init__(self, lm_head: torch.nn.Linear):
-        super().__init__()
-        self.in_features = lm_head.in_features
-        self.out_features = lm_head.out_features
-        self.weight = torch.nn.Parameter(
-            lm_head.weight.detach().clone().to(torch.float32)
-        )
-        if lm_head.bias is not None:
-            self.bias = torch.nn.Parameter(
-                lm_head.bias.detach().clone().to(torch.float32)
-            )
-        else:
-            self.bias = None
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return F.linear(hidden_states.to(self.weight.dtype), self.weight, self.bias)
-
-
-_TORCH_DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
-
-
-def resolve_torch_dtype(dtype_name: str, device: torch.device) -> torch.dtype:
-    if dtype_name == "auto":
-        bf16_ok = device.type == "cuda" and torch.cuda.is_bf16_supported()
-        return torch.bfloat16 if bf16_ok else torch.float32
-    try:
-        return _TORCH_DTYPES[dtype_name]
-    except KeyError:
-        raise ValueError(f"Unsupported dtype: {dtype_name}") from None
-
-
-def _resolve_flash_attention_2_or_raise() -> None:
-    """Fail fast (with an actionable message) if attn_implementation='flash_attention_2' cannot be
-    satisfied, instead of crashing mid-run on the first forward. transformers 5.8 can serve FA2 from
-    the HF `kernels` hub when the standalone flash-attn package is absent (the case here), but that
-    needs the `kernels` library + a one-time hub download of kernels-community/flash-attn2."""
-    try:
-        from transformers.utils import is_flash_attn_2_available
-        if is_flash_attn_2_available():
-            return  # native flash-attn build present
-    except Exception:
-        pass
-    try:
-        from transformers.modeling_flash_attention_utils import lazy_import_flash_attention
-    except Exception:
-        # Resolver API absent in this transformers version; let from_pretrained resolve at load time.
-        return
-    try:
-        from transformers.utils import is_kernels_available
-        kernels_ok = is_kernels_available()
-    except Exception:
-        kernels_ok = True  # let lazy_import_flash_attention be the judge
-    if not kernels_ok:
-        raise RuntimeError(
-            "--attn-implementation flash_attention_2 needs either the flash-attn package or the HF "
-            "`kernels` library (pip install kernels), or use --attn-implementation sdpa."
-        )
-    try:
-        lazy_import_flash_attention("kernels-community/flash-attn2")
-    except Exception as exc:
-        raise RuntimeError(
-            "--attn-implementation flash_attention_2: failed to load the kernels-hub flash-attn2 "
-            f"kernel (needs a one-time HF-hub download / network access): {exc!r}. Pre-download it "
-            "on the node or use --attn-implementation sdpa."
-        ) from exc
-
-
-def load_model_and_tokenizer(args: argparse.Namespace, device: torch.device):
-    dtype = resolve_torch_dtype(args.dtype, device)
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=args.trust_remote_code)
-
-    added_pad_token = False
-    if tokenizer.pad_token_id is None:
-        if tokenizer.eos_token is not None:
-            tokenizer.pad_token = tokenizer.eos_token
-        else:
-            tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
-            added_pad_token = True
-
-    loader_kwargs = dict(trust_remote_code=args.trust_remote_code)
-    # When flash_attention_2 (the default) is requested, resolve the kernel up front; if it's
-    # unavailable (no `kernels` pkg / no network / unsupported GPU), fall back to SDPA with a
-    # warning rather than crash the run — the fallback is visible in the log + as a higher train_s.
-    # fp32 head/tie is unaffected: the attention impl only runs the bf16-autocast body matmul.
-    requested_attn = args.attn_implementation
-    if requested_attn == "flash_attention_2":
-        try:
-            _resolve_flash_attention_2_or_raise()
-        except Exception as exc:
-            print0(f"WARNING: --attn-implementation flash_attention_2 unavailable; falling back to sdpa: {exc}")
-            requested_attn = "sdpa"
-    if requested_attn != "sdpa":
-        loader_kwargs["attn_implementation"] = requested_attn
-    try:
-        model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype, **loader_kwargs)
-    except TypeError:
-        model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype, **loader_kwargs)
-    if added_pad_token:
-        model.resize_token_embeddings(len(tokenizer))
-    model.to(device)
-    print0(f"Attention implementation: {getattr(model.config, '_attn_implementation', 'unknown')}")
-
-    if dtype != torch.float32 and hasattr(model, "lm_head") and isinstance(model.lm_head, torch.nn.Linear):
-        model.lm_head = FP32LMHead(model.lm_head)
-        model.lm_head.to(device)
-        if getattr(model.config, "tie_word_embeddings", False):
-            model.config.tie_word_embeddings = False
-
-    if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        model.config.use_cache = False
-
-    if args.compile:
-        # Compile the transformer BODY only (the fp32 head + chunked CE stay eager — they run under
-        # their own checkpoint with autocast disabled). dynamic=True avoids recompiles on the varying
-        # per-microbatch sequence lengths (var-prefix batches); watch train_s for recompile churn.
-        model.model = torch.compile(model.model, dynamic=True)
-        print0("torch.compile enabled on the transformer body (dynamic=True)")
-
-    return model, tokenizer
-
-
-def strip_compiled_state_dict_keys(state_dict: Mapping[str, Any]) -> dict[str, Any]:
-    """Remove torch.compile's `_orig_mod.` segment from state-dict keys.
-
-    With --compile, model.model is an OptimizedModule, so the raw state dict names body
-    keys `model._orig_mod.layers...`. transformers does NOT strip that prefix on load, so
-    from_pretrained would silently random-init the entire body (warning only) and any eval
-    of the checkpoint would score garbage. Mirrors PipelineWeightSync._named_parameters,
-    which is what keeps the live vLLM weight sync compile-safe; no-op when --compile is off.
-    """
-    return {name.replace("_orig_mod.", ""): value for name, value in state_dict.items()}
-
-
-def save_hf_checkpoint(
-    model,
-    tokenizer,
-    output_dir: Path,
-    step: int,
-) -> Path:
-    checkpoint_dir = output_dir / f"step_{step:06d}"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    state_dict = strip_compiled_state_dict_keys(model.state_dict())
-    # Belt-and-braces: a compiled-module prefix in the saved keys means from_pretrained
-    # would silently drop those weights — refuse to write such a checkpoint.
-    leaked = [name for name in state_dict if "_orig_mod" in name]
-    if leaked:
-        raise RuntimeError(f"compiled-module prefix leaked into checkpoint keys: {leaked[:3]}")
-    model.save_pretrained(checkpoint_dir, state_dict=state_dict)
-    tokenizer.save_pretrained(checkpoint_dir)
-    return checkpoint_dir
-
-
-def should_save_checkpoint_for_step(step: int, num_steps: int, save_every: int, save_final: bool) -> bool:
-    final_step = step == num_steps - 1
-    periodic_save = save_every > 0 and step > 0 and step % save_every == 0
-    return periodic_save or (final_step and save_final)
-
-
 # ============================ RECORD-KEEPING (wandb stub, run log, attestation) ============================
 class DummyWandb:
     def log(self, *args, **kwargs):
@@ -2111,14 +2105,6 @@ def sanitize_run_name(name: str) -> str:
 
 def default_run_name(kind: str = "speedrun") -> str:
     return f"sokoban-{kind}-{time.strftime('%Y%m%d-%H%M%S')}"
-
-
-def _file_sha256(path: Path | str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 def _git_commit() -> str | None:

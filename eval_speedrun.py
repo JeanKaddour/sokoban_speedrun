@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import gzip
+import hashlib
 import json
 import math
 import random
@@ -22,7 +23,6 @@ from speedrun import (
     INTERRUPTION_TEXT,
     INTERRUPTION_TEXT_NO_THINK,
     _add_vllm_tuning_args,
-    _file_sha256,
     _git_commit,
     build_async_engine,
     default_run_name,
@@ -34,6 +34,14 @@ from speedrun import (
     sanitize_run_name,
     vllm_tuning_from_args,
 )
+
+
+def _file_sha256(path: Path | str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _pass_at_k_unbiased(n: int, c: int, k: int) -> float:
