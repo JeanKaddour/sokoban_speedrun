@@ -74,6 +74,7 @@ MSG_SHUTDOWN = "shutdown"
 MSG_ENGINE_READY = "engine_ready"
 MSG_WEIGHTS_READY = "weights_ready"
 MSG_ERROR = "error"
+WANDB_PROJECT = "sokoban-speedrun-llm"
 # ============================ RUN RECIPE (single source of truth) ============================
 # The benchmark sprint recipe lives here as a top-level constant. main() PREPENDS it to the CLI
 # args, so the same hyperparameters apply to local launches and Modal. Any flag passed on the CLI
@@ -2624,7 +2625,7 @@ def run_pipeline(
         # about W&B or filesystem setup failures before waiting for the first step scatter.
         if args.wandb and args.run != "dummy":
             import wandb
-            wandb_run = wandb.init(project="nanochat-rl-hf", name=args.run, config=vars(args))
+            wandb_run = wandb.init(project=WANDB_PROJECT, name=args.run, config=vars(args))
         model_perf_info = collect_model_perf_info(model)
         if args.save_rollouts:
             run_dir.mkdir(parents=True, exist_ok=True)
