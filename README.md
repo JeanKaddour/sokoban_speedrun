@@ -58,7 +58,7 @@ EVAL_CHECKPOINT=latest uv run modal run modal_app.py
 
 ### Rules
 
-Fastest wall-clock run wins: one run on one node, from training step 1 through the first checkpoint whose held-out CI clears the target.
+Fastest wall-clock run wins: one run on a single **1×H100** node, from training step 1 through the first checkpoint whose held-out CI clears the target.
 
 - **Target:** lower 95% CI on held-out Boxoban solve-rate > **0.70**.
 - **Eval:** official [DeepMind Boxoban](https://github.com/google-deepmind/boxoban-levels) held-out splits (per-level greedy scoring); default `unfiltered/test`.
