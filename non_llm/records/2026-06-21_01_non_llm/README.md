@@ -17,9 +17,9 @@ DeepMind `unfiltered/test` 1000-level held-out split by greedy per-level pass@1.
 
 | seed | held-out eval pass@1 | 95% CI | record clock |
 |---|---|---|---|
-| seed42 | 0.7279 | [0.7010, 0.7545] | 0:19:36 |
+| seed42 | 0.7440 | [0.7177, 0.7701] | 0:22:24 |
 
-**Held-out eval pass@1 0.7279, lower 95% CI 0.7010 vs TARGET 0.7: CLEARS.**
+**Held-out eval pass@1 0.7440, lower 95% CI 0.7177 vs TARGET 0.7: CLEARS.**
 
 ![hero](plots/hero.png)
 
@@ -37,7 +37,7 @@ DeepMind `unfiltered/test` 1000-level held-out split by greedy per-level pass@1.
 
 Verifier unrecorded:
 
-- re-ran at seed123, recipe commit `f52c955747` → pass@1 **0.7335** (95% CI [0.7059, 0.7598]) — **CLEARS 0.7** ✓
+- re-ran at seed123, recipe commit `c79722ed8a` → pass@1 **0.7451** (95% CI [0.7186, 0.7712]) — **CLEARS 0.7** ✓
 
 Confirms the recipe reproduces independently; the record time above is the submission run's, not this rerun's. Artifacts: [`verification/`](verification/).
 
@@ -124,5 +124,6 @@ uv run python verify_record.py records/2026-06-21_01_non_llm
 ```
 
 <!-- END AUTO-GENERATED -->
+
 
 
