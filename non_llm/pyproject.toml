@@ -5,8 +5,10 @@ description = "Sokoban Speedrun non-LLM track"
 readme = "../README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "matplotlib>=3.9.0",
     "modal>=1.1.0",
     "numpy>=2.0.0",
+    "pandas>=2.2.0",
     "pybind11>=2.13.0",
     "pufferlib @ git+https://github.com/JeanKaddour/PufferLib.git@e90b58e",
     "rich-argparse>=1.7.0",

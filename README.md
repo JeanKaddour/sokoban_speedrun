@@ -41,6 +41,7 @@ uv run python -m eval_speedrun --eval-checkpoint outputs/<run>/step_000075
 
 # Modal (modal_app.py rents an 8xH100)
 uv run modal volume put nanochat-rl-hf datasets/sokoban_train.jsonl /datasets/sokoban_train.jsonl
+uv run modal volume put nanochat-rl-hf datasets/sokoban_eval.jsonl /datasets/sokoban_eval.jsonl
 uv run modal run --detach modal_app.py
 EVAL_CHECKPOINT=latest uv run modal run modal_app.py
 ```
@@ -82,14 +83,14 @@ LLM track:
 
 ```bash
 cd llm
-uv run --with matplotlib --with pandas python ../make_record_report.py records/<your-dir> --track llm
+uv run python ../make_record_report.py records/<your-dir>
 ```
 
 Non-LLM track:
 
 ```bash
 cd non_llm
-uv run --with matplotlib --with pandas python ../make_record_report.py records/<your-dir> --track non-llm
+uv run python ../make_record_report.py records/<your-dir>
 ```
 
 3. Open a PR adding the record dir + a row in the matching track's world record history. CI runs the track's verifier.

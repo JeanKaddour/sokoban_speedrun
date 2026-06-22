@@ -20,7 +20,7 @@ between the AUTO markers is regenerated, everything outside them is never touche
 On first run a scaffold with a TODO "Idea" section is created.
 
 Run from a track directory via:
-    uv run --with matplotlib --with pandas [--with wandb] python ../make_record_report.py ...
+    uv run python ../make_record_report.py ...
 """
 
 from __future__ import annotations
@@ -518,6 +518,7 @@ def verification_block(record_dir: Path, target: float) -> list[str]:
 # both the LLM and non-LLM tracks; `--track` selects the right script + commands).
 TRACKS = {
     "llm": {
+        "target": 0.80,
         "script": "speedrun.py",
         "reproduce": [
             "# train (recipe defaults live in speedrun.py RECIPE + modal_app.py)",
@@ -528,11 +529,12 @@ TRACKS = {
         "verify": ["uv run python verify_record.py {record}"],
     },
     "non-llm": {
+        "target": 0.70,
         "script": "speedrun_non_llm.py",
         "reproduce": [
             "# train (recipe defaults live in speedrun_non_llm.py RECIPE)",
             "RUN_NAME=<run> DIFFICULTY=4 TOTAL_TIMESTEPS=<steps> uv run modal run --detach modal_app_non_llm.py",
-            "# eval the final checkpoint; maintainers verify by rerunning at an independent seed",
+            "# eval the final checkpoint; reuse the same EXTRA_ARGS when training used non-default config",
             "EVAL_CHECKPOINT=/vol/outputs/<run>/final.pt DIFFICULTY=4 uv run modal run modal_app_non_llm.py",
         ],
         "verify": [],
@@ -633,17 +635,32 @@ def write_readme(record_dir: Path, block: str) -> None:
         f"trusting/forking it.\n\n{auto}")
 
 
+def infer_track(record_dir: Path) -> str:
+    """Infer the speedrun track from the normal `cd llm` / `cd non_llm` workflow."""
+    paths = [record_dir.resolve(), Path.cwd().resolve()]
+    for path in paths:
+        parts = set(path.parts)
+        if "non_llm" in parts:
+            return "non-llm"
+        if "llm" in parts:
+            return "llm"
+    return "llm"
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("record_dir", type=Path)
     ap.add_argument("--wandb-runs", default=None,
                     help="comma-separated entity/project/run_id list, one per seed, ordered like the seed files")
     ap.add_argument("--prev", type=Path, default=None, help="previous record dir for the config diff")
-    ap.add_argument("--target", type=float, default=0.80)
+    ap.add_argument("--target", type=float, default=None,
+                    help="override the selected track's target threshold")
     ap.add_argument("--subtitle", default="", help="optional hero subtitle, e.g. a track label")
-    ap.add_argument("--track", choices=["llm", "non-llm"], default="llm",
-                    help="selects the Source/Reproduce commands for the record's track")
+    ap.add_argument("--track", choices=["llm", "non-llm"], default=None,
+                    help="override the inferred record track")
     args = ap.parse_args()
+    track = args.track or infer_track(args.record_dir)
+    target = args.target if args.target is not None else TRACKS[track]["target"]
 
     set_house_style()
     record = load_record(args.record_dir)
@@ -657,14 +674,14 @@ def main() -> None:
         if len(online_frames) != len(seeds):
             raise SystemExit(f"got {len(online_frames)} W&B runs for {len(seeds)} seed logs")
 
-    plot_training(record, online_frames, plots / "training.png", args.target)
+    plot_training(record, online_frames, plots / "training.png", target)
     plot_stability(record, plots / "stability.png")
-    plot_eval(record, args.target, plots / "eval.png")
-    plot_hero_card(record, args.target, plots / "hero.png", online_frames, subtitle=args.subtitle)
+    plot_eval(record, target, plots / "eval.png")
+    plot_hero_card(record, target, plots / "hero.png", online_frames, subtitle=args.subtitle)
 
     source_rows = ensure_all_source_snapshots(args.record_dir)
     write_readme(args.record_dir,
-                 auto_block(record, args.record_dir, args.target, args.prev, source_rows, track=args.track))
+                 auto_block(record, args.record_dir, target, args.prev, source_rows, track=track))
     print(f"wrote {plots}/*.png (incl. hero.png) and updated {args.record_dir / 'README.md'}")
 
 
