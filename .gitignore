@@ -227,3 +227,4 @@ modal_verl_app.py
 # Reference papers / scratch notes (kept locally, not tracked)
 *.pdf
 scaleRL.md
+resources/
