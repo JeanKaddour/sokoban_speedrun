@@ -7,8 +7,6 @@ Fastest recipes to RL models to solve Sokoban to a held-out target on one node:
 
 [Play Sokoban](https://www.jeankaddour.com/sokoban) if the task is unfamiliar.
 
-Each track is its own top-level uv project. Run uv commands from inside the relevant
-track directory; no project flag is needed.
 
 ## LLM Track
 
