@@ -2,7 +2,7 @@
 
 Sibling of `modal_app.py` (which drives the LLM `speedrun.py`) and `modal_verl_app.py`. The non-LLM
 track is a different stack, so it gets its own image: a CUDA-devel base with clang + a cu126 torch,
-into which the PufferLib fork is copied and the `boxoban` env extension is built (`--float`) at image
+into which the `boxoban` env extension is built (`--float`) at image
 build time. Records run on a single H100 (Boxoban PPO is GPU-light; a full run is minutes).
 
 Usage (mirrors modal_app.py's env-var local entrypoint):

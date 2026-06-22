@@ -4,13 +4,10 @@ A from-scratch deep-RL agent that learns to solve Sokoban, racing the SAME metri
 track in ``speedrun.py``: wall-clock-to-target (and FLOPs-to-target), where the target is a
 held-out Sokoban solve-rate whose lower 95% CI clears a threshold.
 
-Quickstart (local RTX-3090, dedicated cu126 venv; see README.md):
+Quickstart (local; see README.md):
 
-    # one-time: build the boxoban env extension (float32) into the fork
-    cd third_party/pufferlib && PATH=../../.venv_puffer/bin:$PATH bash build.sh boxoban --float
-
-    # train to target, then eval the final checkpoint (record artifacts -> outputs/<run>/)
-    .venv_puffer/bin/python speedrun_non_llm.py --run my-run
+    uv sync
+    uv run python speedrun_non_llm.py
 
 Boxoban obs is a 4x10x10 byte grid (channels: agent, walls, boxes, targets); actions are
 {noop,down,up,left,right}. Solved == every box on a target. difficulty 0=basic..4=unfiltered.
@@ -57,6 +54,7 @@ def _amp(enabled: bool, device: str):
 
 
 ENV_NAME = "boxoban"
+DEFAULT_RUN_NAME = "boxoban-non-llm"
 DIFFICULTY_NAMES = {0: "basic", 1: "easy", 2: "medium", 3: "hard", 4: "unfiltered"}
 OBS_CHANNELS, GRID = 4, 10
 NUM_ACTIONS = 5
@@ -72,8 +70,8 @@ RECIPE = {
     # RL reaches a meaningful solve-rate here with the conv+recurrent arch, whereas medium/hard stay ~0
     # full-solve even for PufferLib's own recipe. basic/easy are PufferLib's procedural tiers (leaky).
     "difficulty": 4,            # 0=basic 1=easy 2=medium 3=hard 4=unfiltered
-    "num_agents": 32768,        # matches PufferLib's tuned total_agents (use 8192 on a 24GB 3090)
-    "max_episode_steps": 150,   # matches PufferLib's tuned boxoban.ini (was 120 — gave fewer solve steps)
+    "num_agents": 8192,         # proven-best on unfiltered (h256); the recipe's 32768 didn't help here
+    "max_episode_steps": 120,   # 120 > the recipe's 150 on held-out (ablation: 150 cost ~0.04 solve-rate)
     "holdout_frac": 0.1,        # fraction of the level pool held out (disjoint) for the eval gate
     # --- PPO rollout / optimization (PuffeRL) ---
     "total_timesteps": 200_000_000,
@@ -103,8 +101,8 @@ RECIPE = {
     "arch": "cnn-mingru",       # cnn | mingru|lstm|gru|mlp | cnn-{mingru,lstm,gru}
     "hidden_size": 256,
     "num_layers": 3,            # recurrent (planning) depth — deeper generalizes better on official sets
-    "bf16": True,               # bf16 autocast for the policy forward/loss (big speedup on H100/5090
-                                # tensor cores). --bf16 0 => fp32 (bit-identical to PufferLib's PuffeRL).
+    "bf16": False,              # fp32 by default: bf16 autocast is ~1.3x faster but costs ~0.09 held-out
+                                # solve-rate on unfiltered (ablation) — accuracy beats speed for records.
     # --- bookkeeping ---
     "seed": 42,
     "wandb": False,             # --wandb 1 to enable; logs train/loss/opt/perf metrics per iter
@@ -169,6 +167,42 @@ class DummyWandb:
     def finish(self, *a, **k): pass
 
 
+def _pufferlib_build_env() -> dict[str, str]:
+    env = dict(os.environ)
+    pybin = str(Path(sys.executable).resolve().parent)
+    env["PATH"] = pybin + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def ensure_boxoban_extension() -> None:
+    """Build the vendored PufferLib boxoban extension on first use.
+
+    The README path should stay `uv sync && uv run python speedrun_non_llm.py`; the script owns the
+    repo-specific native-extension detail.
+    """
+    if not PUFFERLIB_DIR.exists():
+        raise SystemExit(f"missing vendored PufferLib checkout: {PUFFERLIB_DIR}")
+    env = _pufferlib_build_env()
+    code = (
+        "import sys; "
+        f"sys.path.insert(0, {str(PUFFERLIB_DIR)!r}); "
+        "import pufferlib._C as C; "
+        "print(getattr(C, 'env_name', ''))"
+    )
+    check = subprocess.run([sys.executable, "-c", code], cwd=str(REPO_DIR), env=env,
+                           capture_output=True, text=True)
+    if check.returncode == 0 and check.stdout.strip() == ENV_NAME:
+        return
+
+    reason = (check.stderr or check.stdout).strip()
+    if reason:
+        print(f"[setup] rebuilding PufferLib {ENV_NAME} extension ({reason.splitlines()[-1]})", flush=True)
+    else:
+        print(f"[setup] building PufferLib {ENV_NAME} extension", flush=True)
+    subprocess.run(["bash", "build.sh", ENV_NAME, "--float"], cwd=str(PUFFERLIB_DIR),
+                   env=env, check=True)
+
+
 # ============================ official DeepMind held-out levels ==============================
 # The boxoban env's bin format is [agent(100), walls(100), boxes(100), targets(100), meta(5)] per
 # 10x10 puzzle (= PUZZLE_SIZE 405). This encoder is byte-identical to the env's own C parser (verified
@@ -217,10 +251,18 @@ def build_boxoban_bin(level_dir: Path, out_path: Path) -> int:
 
 
 def ensure_holdout_bin(difficulty_name: str | None, split: str) -> Path | None:
-    """Encode the official <difficulty>/<split> levels into a held-out bin (cached). Returns the
-    absolute bin path, or None if those official levels aren't present (→ index-partition fallback)."""
+    """Resolve the held-out level bin for <difficulty>/<split>. Returns the absolute bin path, or None
+    if neither a committed bin nor the raw levels are present (→ index-partition fallback).
+
+    Priority: (1) a SINGLE committed `data/boxoban_<diff>_<split>.bin` shipped in the repo — this is
+    what makes the repo self-contained (the leaderboard held-out is ~400KB; no 200MB of raw text). If
+    absent, (2) encode it from the raw `resources/.../levels/<diff>/<split>` text (local dev / other
+    splits the repo doesn't ship)."""
     if not difficulty_name:
         return None
+    committed = REPO_DIR / "data" / f"boxoban_{difficulty_name}_{split}.bin"
+    if committed.exists():
+        return committed
     levels = PUFFERLIB_DIR / "resources" / "boxoban" / "levels" / difficulty_name / split
     if not levels.is_dir() or not any(levels.glob("*.txt")):
         return None
@@ -444,10 +486,11 @@ class BoxobanVecEnv:
 
     def __init__(self, *, difficulty: int, num_agents: int, max_steps: int, seed: int,
                  eval_mode: bool = False, holdout_frac: float = 0.0):
+        ensure_boxoban_extension()
         from pufferlib import pufferl, _C
         assert getattr(_C, "env_name", None) == ENV_NAME, (
             f"_C built for {getattr(_C, 'env_name', None)!r}, not {ENV_NAME!r}. "
-            f"Run: cd {PUFFERLIB_DIR} && bash build.sh {ENV_NAME} --float")
+            "Run `uv run python speedrun_non_llm.py` to rebuild the local extension.")
         saved = sys.argv
         sys.argv = [saved[0]]
         try:
@@ -927,7 +970,7 @@ def profile_run(cfg: argparse.Namespace) -> None:
 # ============================ CLI ===========================================================
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Sokoban Speedrun — non-LLM (PufferLib boxoban + in-file PuffeRL PPO)")
-    p.add_argument("--run", type=str, default=f"boxoban-{int(time.time())}")
+    p.add_argument("--run", type=str, default=DEFAULT_RUN_NAME)
     p.add_argument("--output-dir", type=str, default="outputs")
     for key, val in RECIPE.items():
         flag = "--" + key.replace("_", "-")
