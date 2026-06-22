@@ -3,7 +3,7 @@
 Usage:
     # no arg: auto-targets the current record (fastest run under records/ that clears
     # the target), so regenerating after a new submission needs no edits:
-    uv run --with matplotlib --with pandas --with pillow \
+    uv run --with pillow \
         python records/plot_hero_animation.py
 
     # or pin a specific record dir:

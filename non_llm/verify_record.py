@@ -39,7 +39,6 @@ from speedrun_non_llm import (  # noqa: E402  (single source of truth for eval a
     _bootstrap_ci,
     _file_sha256,
     _pass_at_k_unbiased,
-    _wilson_ci,
 )
 
 FLOAT_TOL = 1e-9
@@ -88,11 +87,12 @@ def verify_aggregates(record: dict, fails: Failures, tag: str) -> None:
         fails.check(_close(claimed, derived), f"{tag}: pass_at_k[{j}] {claimed} != derived {derived}")
     fails.check(_close(record["answer_rate"], sum(record["per_puzzle_answered_count"]) / max(1, sum(ns))),
                 f"{tag}: answer_rate inconsistent with per-puzzle answered counts")
-    seed = int(record["sampling"].get("seed") or 0)
-    if record["k"] == 1:
-        lo, hi = _wilson_ci(sum(cs), sum(ns))
-    else:
-        lo, hi = _bootstrap_ci(fracs, seed=seed)
+    # Re-derive the CI EXACTLY as evaluate() does: a percentile bootstrap over the per-level solve
+    # fractions, seeded by the eval seed. evaluate() always uses the bootstrap (never a Wilson
+    # interval), so the verifier must too — mirroring it is the whole point of importing
+    # _bootstrap_ci from speedrun_non_llm, so the CI method can't drift between producer and verifier.
+    seed = int(record["sampling"].get("seed") or record.get("seed") or 0)
+    lo, hi = _bootstrap_ci(fracs, seed=seed)
     fails.check(_close(record["ci_low"], lo) and _close(record["ci_high"], hi),
                 f"{tag}: CI [{record['ci_low']}, {record['ci_high']}] != re-derived [{lo}, {hi}]")
 
@@ -119,14 +119,22 @@ def verify_holdout(record: dict, fails: Failures, tag: str, data_dir: Path) -> N
     expected = record.get("holdout_n_levels")
     fails.check(expected is None or len(pool) == expected,
                 f"{tag}: eval bin has {len(pool)} levels, record claims {expected}")
+    scored = set(shas)
     missing = [s for s in shas if s not in pool]
     fails.check(not missing, f"{tag}: {len(missing)} scored level(s) are NOT in the committed eval bin "
                              f"— eval pool does not match the leaderboard test split")
+    # Full-coverage gate: pass@1 is the mean over scored levels, so it is only a valid measurement of
+    # the canonical held-out split if EVERY committed level was scored. Partial coverage (early-stop
+    # before saturation, or starved levels) would silently average over an easier subset — FAIL it.
+    uncovered = [s for s in pool if s not in scored]
+    fails.check(not uncovered,
+                f"{tag}: {len(uncovered)}/{len(pool)} committed eval levels were NOT scored "
+                f"(coverage {len(scored)}/{len(pool)}) — pass@1 must be measured over the FULL held-out split")
     fails.check(len(shas) == record["n_puzzles"] and len(set(shas)) == len(shas),
                 f"{tag}: per_puzzle_level_sha length/uniqueness inconsistent with n_puzzles")
-    if not missing:
+    if not missing and not uncovered:
         print(f"  ok    {tag}: eval bin {bin_name} sha {str(local_sha)[:12]}; "
-              f"all {len(shas)} scored levels in pool (coverage {len(shas)}/{len(pool)})")
+              f"FULL coverage: all {len(pool)} committed levels scored")
 
 
 def verify_source_snapshots(record_dir: Path, fails: Failures, label: str) -> None:

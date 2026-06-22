@@ -120,6 +120,9 @@ RECIPE = {
 # ============================ eval aggregates (verbatim from eval_speedrun.py) ===============
 # Single source of truth for the record aggregates: verify_record.py imports these so an offline
 # re-derivation of pass@1 / pass@k / CI can never drift from what evaluate() actually computed.
+# NOTE: this track's CI is ALWAYS the percentile bootstrap over per-level solve fractions (see
+# evaluate()); unlike the LLM track's eval_speedrun.py there is no Wilson (k==1) path, so none is
+# defined here — the verifier must not introduce one either.
 def _pass_at_k_unbiased(n: int, c: int, k: int) -> float:
     if k > n:
         raise ValueError(f"pass@k requires k<=n, got k={k}, n={n}")
@@ -129,16 +132,6 @@ def _pass_at_k_unbiased(n: int, c: int, k: int) -> float:
     for i in range(n - c + 1, n + 1):
         prod *= 1.0 - k / i
     return 1.0 - prod
-
-
-def _wilson_ci(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
-    if n <= 0:
-        return (0.0, 1.0)
-    phat = successes / n
-    denom = 1.0 + z * z / n
-    center = (phat + z * z / (2 * n)) / denom
-    half = (z / denom) * math.sqrt(phat * (1.0 - phat) / n + z * z / (4 * n * n))
-    return (max(0.0, center - half), min(1.0, center + half))
 
 
 def _bootstrap_ci(values: list[float], *, n_boot: int = 10000, seed: int = 0,
@@ -734,6 +727,9 @@ def puff_train(policy: nn.Module, optimizer: torch.optim.Optimizer, obs, act, va
 
     b0, a = cfg.prio_beta0, cfg.prio_alpha
     clip_coef, vf_clip = cfg.clip_coef, cfg.vf_clip_coef
+    # Prioritized-replay IS-bias anneal. The `* a` (prio_alpha) factor is intentional — this is a
+    # verbatim port of PuffeRL (pufferlib.torch_pufferl.PuffeRL.train: `anneal_beta = b0 +
+    # (1-b0)*a*epoch/total_epochs`), NOT the textbook `b0 + (1-b0)*epoch/total`. Do not "fix" it.
     anneal_beta = b0 + (1 - b0) * a * epoch / total_epochs
     ratio_buf = torch.ones(total_agents, horizon, device=device)
 
@@ -1009,14 +1005,18 @@ def evaluate(cfg: argparse.Namespace, checkpoint: Path) -> dict:
     lvl_solved: dict = defaultdict(int)
     lvl_n: dict = defaultdict(int)
     total_eps = 0
-    # Greedy eval is deterministic (fp32 + recurrent state zeroed at each episode start), so every
-    # replay of a held-out level returns the SAME result: per_puzzle_solve_frac is 0/1 per level and
-    # the replays buy coverage of the level POOL (coupon-collector), not statistical samples. Once the
-    # pool is saturated — no new level for a long dry spell (4x the levels seen so far, a strong tail
-    # margin) — further episodes can change neither pass@1 nor the CI, so stop early and skip the
-    # redundant compute. Sampling eval (eval_greedy=False) keeps the full episode budget because there
-    # the replays ARE independent samples that tighten each per-level estimate.
-    deterministic = bool(cfg.eval_greedy) and not getattr(cfg, "bf16", False)
+    # Greedy eval is NEAR-deterministic (fp32 + recurrent state zeroed at each episode start): a given
+    # held-out level almost always replays to the same outcome, so the replays mostly buy coverage of
+    # the level POOL (coupon-collector), not statistical samples. It is not bit-exact on GPU, though —
+    # batched conv/matmul reductions are run-order dependent and occasionally flip the argmax of a
+    # near-tie, so a level's per_puzzle_solve_frac can land just under 1.0 (e.g. 0.95) rather than a
+    # clean 0/1. Those flips are rare enough that, once the pool is saturated (no new level for a long
+    # dry spell — 4x the levels seen so far) further replays only jitter already-near-saturated
+    # per-level fractions and cannot materially move pass@1, so we stop early and skip the redundant
+    # compute. (verify_record.py independently FAILs any record that did not score the full committed
+    # pool, so early-stop can never silently under-cover the official split.) Sampling eval
+    # (eval_greedy=False) keeps the full budget — there the replays ARE independent samples.
+    greedy_saturating = bool(cfg.eval_greedy) and not getattr(cfg, "bf16", False)
     eps_since_new = 0
     while total_eps < cfg.eval_episodes:
         with torch.no_grad(), _amp(getattr(cfg, "bf16", False), device):
@@ -1036,7 +1036,7 @@ def evaluate(cfg: argparse.Namespace, checkpoint: Path) -> dict:
             for s_ in state:                       # reset recurrent state for finished envs
                 s_[:, idx, :] = 0.0
             init_board[idx] = env.obs().to(device, copy=True)[idx]   # new episode's start board
-            if deterministic and len(lvl_n) and eps_since_new >= max(4096, 4 * len(lvl_n)):
+            if greedy_saturating and len(lvl_n) and eps_since_new >= max(4096, 4 * len(lvl_n)):
                 break
     env_perf = float(env.log().get("perf", float("nan")))  # PufferLib's C-aggregated solve mean (num_agents-invariant)
     env.close()
