@@ -1,14 +1,17 @@
 [project]
-name = "sokoban_speedrun"
+name = "sokoban-speedrun-llm"
 version = "0.1.0"
-description = "Sokoban Speedrun"
-readme = "README.md"
+description = "Sokoban Speedrun LLM track"
+readme = "../README.md"
 requires-python = ">=3.10"
 dependencies = [
     "accelerate>=1.0.0",
     "datasets>=2.19.0",
     "kernels==0.11.7",
+    "matplotlib>=3.9.0",
     "modal>=1.1.0",
+    "numpy>=2.0.0",
+    "pandas>=2.2.0",
     "reasoning-gym==0.1.25",
     "safetensors>=0.4.0",
     "torch==2.11.0",

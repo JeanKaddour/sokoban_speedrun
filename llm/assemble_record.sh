@@ -3,11 +3,11 @@
 #
 # Both modes need the train run AND its final-checkpoint eval finished + committed to the volume
 # (eval reuses RUN_NAME so its JSON lands in the same /outputs/<RUN>/ dir):
-#   MAX_STEPS=<steps> RUN_NAME=<RUN> modal run --detach modal_app.py
-#   EVAL_CHECKPOINT=/vol/outputs/<RUN>/step_<FINAL_STEP> RUN_NAME=<RUN> modal run modal_app.py
+#   MAX_STEPS=<steps> RUN_NAME=<RUN> uv run modal run --detach modal_app.py
+#   EVAL_CHECKPOINT=/vol/outputs/<RUN>/step_<FINAL_STEP> RUN_NAME=<RUN> uv run modal run modal_app.py
 #
 # SUBMISSION (the record itself):
-#   RUN=<RUN> DEST=records/<date>_01_<name> IDEA_FILE=reports/baseline-rerun-idea.md ./assemble_record.sh
+#   RUN=<RUN> DEST=records/<date>_01_<name> IDEA_FILE=../reports/baseline-rerun-idea.md ./assemble_record.sh
 #
 # VERIFICATION (an independent rerun, dropped into the record's verification/ subdir — run a SECOND
 # training+eval with a different seed first, then):
@@ -107,11 +107,11 @@ elif [ -n "$IDEA_FILE" ] && [ ! -f "$DEST/README.md" ]; then
 fi
 
 echo ">> generating report + plots for $RECORD"
-uv run --with matplotlib --with pandas python make_record_report.py "$RECORD"
+uv run python ../make_record_report.py "$RECORD"
 echo ">> verifying $RECORD (submission + verification)"
-uv run --with matplotlib --with pandas python verify_record.py "$RECORD"
-echo ">> regenerating top-level hero (records/hero.gif)"
-uv run --with matplotlib --with pandas --with pillow python records/plot_hero_animation.py "$RECORD" --out records/hero.gif
+uv run python verify_record.py "$RECORD"
+echo ">> regenerating LLM track hero (records/hero.gif)"
+uv run --with pillow python records/plot_hero_animation.py "$RECORD" --out records/hero.gif
 echo
 if [ -n "$VERIFY_OF" ]; then
   echo ">> DONE. Verification appended to $RECORD; its README now has a ## Verification section."

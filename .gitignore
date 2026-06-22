@@ -151,6 +151,7 @@ activemq-data/
 .env
 .envrc
 .venv
+.venv_puffer/
 env/
 venv/
 ENV/
@@ -218,11 +219,12 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Training artifacts
+# These may be created at the repo root or inside llm/ and non_llm/.
 outputs/
 wandb/
-third_party/verl/
 reports/
-modal_verl_app.py
+/non_llm/resources/
+/non_llm/.pufferlib-src/
 
 # Reference papers / scratch notes (kept locally, not tracked)
 *.pdf

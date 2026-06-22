@@ -1,57 +1,101 @@
 # Sokoban Speedrun
 
-Fastest recipe for RL fine-tuning [Qwen3-4B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507) from 57% to **>80% held-out pass@1** solve-rate on Sokoban puzzles, using a single **8xH100** node.
+Fastest recipes to RL models to solve Sokoban to a held-out target on one node:
+
+- **[LLM Track](#llm-track)**: RL-fine-tune [Qwen3-4B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507) from 57% to **>80% held-out pass@1** on one **8xH100**.
+- **[Non-LLM Track](#non-llm-track)**: train a **from-scratch** agent on a **single H100**.
 
 [Play Sokoban](https://www.jeankaddour.com/sokoban) if the task is unfamiliar.
 
-<p align="center">
-  <img src="records/hero.gif" width="840"
-       alt="Full-width training solve-rate curve over an 8×H100 run while the run clock ticks up to the 1:27:31 record.">
-</p>
+Each track is its own top-level uv project. Run uv commands from inside the relevant
+track directory; no project flag is needed.
 
-## World Record History
+## LLM Track
 
-| #   | Record time | FLOPs       | Description                        | Date       | Log                                                  | held-out pass@1         | Contributors |
-| --- | ----------- | ----------- | ---------------------------------- | ---------- | ---------------------------------------------------- | ----------------------- | ------------ |
-| 1   | 1:27:31     | 1.251 EFLOP | GRPO, LR 1.6e-6 annealed, 75 steps | 2026-06-17 | [records/2026-06-17_01](records/2026-06-17_01_grpo/) | 0.891 (CI [0.86, 0.92]) | @JeanKaddour |
+### World record history
 
-## Rules
 
-Fastest wall-clock run wins: one training run on one 8xH100 node, measured from training step 1 through final checkpoint write, whose final checkpoint clears the target.
+| #   | Record time (h:mm:ss) | FLOPs        | Description                        | Date       | Log                                                          | held-out pass@1         | Contributors |
+| --- | --------------------- | ------------ | ---------------------------------- | ---------- | ------------------------------------------------------------ | ----------------------- | ------------ |
+| 1   | 1:27:31               | 1.250837e+18 | GRPO, LR 1.6e-6 annealed, 75 steps | 2026-06-17 | [llm/records/2026-06-17_01](llm/records/2026-06-17_01_grpo/) | 0.891 (CI [0.86, 0.92]) | @JeanKaddour |
 
-- **Target:** lower 95% bootstrap CI > 0.80 on [datasets/sokoban_eval.jsonl](datasets/sokoban_eval.jsonl).
+
+### Rules
+
+Fastest wall-clock run wins: one run on one 8xH100 node, from training step 1 through the final checkpoint, which must clear the target.
+
+- **Target:** lower 95% bootstrap CI > 0.80 on [llm/datasets/sokoban_eval.jsonl](llm/datasets/sokoban_eval.jsonl).
 - **Eval:** 8 completions/puzzle, 12,288 tokens, temperature 0.8, top-p 0.95, seed 12345.
-- **Fixed:** model, [train set](datasets/sokoban_train.jsonl), eval set, reward function, hardware.
+- **Fixed:** model, [train set](llm/datasets/sokoban_train.jsonl), eval set, reward function, hardware.
 - **Open:** RL algorithm, loss, schedules, engine, parallelism, domain-agnostic rewards, prompt.
 - **Not allowed:** Sokoban-specific hints, heuristics, or few-shot examples.
 - **Verification:** maintainers rerun at a second seed; both runs must clear the target.
 
-### Submit
-
-1. Train, then eval the final checkpoint. Logs, rollouts, source snapshots, and eval JSON are written automatically.
-2. Run `python make_record_report.py records/<your-dir>` and fill in the `Idea` section.
-3. Open a PR adding the record directory plus a leaderboard row. CI runs `python verify_record.py records/<your-dir>`.
-
-## Running the current record
-
-On a local 8xH100 node:
+### Running
 
 ```bash
-NODE_GPUS=8 torchrun --standalone --nproc_per_node=3 -m speedrun
-python -m eval_speedrun --eval-checkpoint outputs/<run>/step_000075
+cd llm
+uv sync
+NODE_GPUS=8 uv run torchrun --standalone --nproc_per_node=3 -m speedrun
+uv run python -m eval_speedrun --eval-checkpoint outputs/<run>/step_000075
+
+# Modal (modal_app.py rents an 8xH100)
+uv run modal volume put nanochat-rl-hf datasets/sokoban_train.jsonl /datasets/sokoban_train.jsonl
+uv run modal volume put nanochat-rl-hf datasets/sokoban_eval.jsonl /datasets/sokoban_eval.jsonl
+uv run modal run --detach modal_app.py
+EVAL_CHECKPOINT=latest uv run modal run modal_app.py
 ```
 
-### Modal
+## Non-LLM Track
 
-`modal_app.py` rents an 8xH100 box on [Modal](https://modal.com). Upload the datasets once, then start a run and eval its checkpoint after it finishes:
+### World record history
+
+
+| #   | Record time (mm:ss) | Description     | Date       | Log                                                                     | held-out pass@1         | Contributors |
+| --- | ------------------- | --------------- | ---------- | ----------------------------------------------------------------------- | ----------------------- | ------------ |
+| 1   | 22:24               | cnn-mingru h256 | 2026-06-21 | [non_llm/records/2026-06-21_01](non_llm/records/2026-06-21_01_non_llm/) | 0.744 (CI [0.72, 0.77]) | @JeanKaddour |
+
+
+### Rules
+
+Fastest wall-clock run wins: one run on a single **1×H100** node, from training step 1 through the first checkpoint whose held-out CI clears the target.
+
+- **Target:** lower 95% CI on held-out Boxoban solve-rate > **0.70**.
+- **Eval:** official [DeepMind Boxoban](https://github.com/google-deepmind/boxoban-levels) held-out splits (per-level greedy scoring); default `unfiltered/test`.
+- **Disjointness:** training draws only from the official `unfiltered/train` split; eval uses the disjoint `unfiltered/test`. The eval bin's sha256 and every scored level are pinned in the record so `verify_record.py` confirms the eval pool offline.
+- **Open:** policy architecture, RL algorithm, optimizer, schedules, implementation.
+- **Verification:** `verify_record.py` re-derives pass@1/CI; maintainers also rerun at a second seed. Both runs must clear the target.
+
+### Running
 
 ```bash
-modal volume put nanochat-rl-hf datasets/sokoban_train.jsonl /datasets/sokoban_train.jsonl
-modal volume put nanochat-rl-hf datasets/sokoban_eval.jsonl /datasets/sokoban_eval.jsonl
-modal run --detach modal_app.py
-EVAL_CHECKPOINT=latest modal run modal_app.py
+cd non_llm
+uv sync
+uv run python speedrun_non_llm.py
+uv run modal run --detach modal_app_non_llm.py
 ```
+
+## Submitting a record
+
+1. Train, then eval the final checkpoint — logs, source snapshots, and the eval JSON are written automatically.
+2. Generate the report for the relevant track and fill in the `Idea` section:
+
+LLM track:
+
+```bash
+cd llm
+uv run python ../make_record_report.py records/<your-dir>
+```
+
+Non-LLM track:
+
+```bash
+cd non_llm
+uv run python ../make_record_report.py records/<your-dir>
+```
+
+3. Open a PR adding the record dir + a row in the matching track's world record history. CI runs the track's verifier.
 
 ## Credits
 
-Thanks to [@joshua-a-harris](https://github.com/joshua-a-harris) and his [nanoRL speedrun](https://joshuaharrissite.substack.com/p/nanorl), [nanochat](https://github.com/karpathy/nanochat), [modded-nanoGPT](https://github.com/KellerJordan/modded-nanogpt), [nanoRL](https://joshuaharrissite.substack.com/p/nanorl), [ScaleRL](https://arxiv.org/abs/2510.13786), and [ReasoningGym](https://github.com/open-thought/reasoning-gym).
+[@joshua-a-harris](https://github.com/joshua-a-harris)'s [nanoRL speedrun](https://joshuaharrissite.substack.com/p/nanorl), [nanochat](https://github.com/karpathy/nanochat), [modded-nanoGPT](https://github.com/KellerJordan/modded-nanogpt), [ScaleRL](https://arxiv.org/abs/2510.13786), [ReasoningGym for the LLM-track Sokoban env](https://github.com/open-thought/reasoning-gym), [DeepMind for Boxoban](https://github.com/google-deepmind/boxoban-levels) and [PufferLib for the efficient `boxoban` implementation](https://github.com/PufferAI/PufferLib).

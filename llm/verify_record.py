@@ -22,7 +22,7 @@ It then applies the leaderboard gate: each primary submission run, and each veri
 when present, must have lower 95% CI > target. Exit code: 0 PASS, 1 FAIL.
 
 Heavy imports note: speedrun.py imports torch/transformers at module level; run via
-    uv run --with torch --with transformers --with reasoning-gym python verify_record.py ...
+    cd llm && uv run python verify_record.py ...
 """
 
 from __future__ import annotations
@@ -36,7 +36,9 @@ import sys
 import zlib
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+sys.path.insert(0, str(SCRIPT_DIR.parent))
 from eval_speedrun import (  # noqa: E402  (single source of truth for eval aggregates)
     _bootstrap_ci,
     _file_sha256,
