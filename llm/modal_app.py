@@ -510,7 +510,7 @@ def probe_datasets(eval_datasets: list[str], run_name: str, k: int, eval_limit: 
 
 @app.local_entrypoint()
 def main() -> None:
-    # Probe mode: PROBE_DATASETS="datasets/a_eval.jsonl,datasets/b_eval.jsonl" modal run modal_app.py
+    # Probe mode: PROBE_DATASETS="datasets/a_eval.jsonl,datasets/b_eval.jsonl" uv run modal run modal_app.py
     #   (blocking .remote(); no --detach needed). Locates the (0,1) reward-variance band on the base
     #   model. RUN_NAME pins the output dir; pull with `modal volume get nanochat-rl-hf /outputs/<run>`.
     probe_spec = os.environ.get("PROBE_DATASETS")
@@ -530,7 +530,7 @@ def main() -> None:
         print(f"Probe complete. Pull results: "
               f"modal volume get nanochat-rl-hf /outputs/{run_name} ./reports/probe_modal --force", flush=True)
         return
-    # Eval mode: EVAL_CHECKPOINT=latest (or <vol path or HF id>) modal run --detach modal_app.py
+    # Eval mode: EVAL_CHECKPOINT=latest (or <vol path or HF id>) uv run modal run --detach modal_app.py
     # Record-style mode: EVAL_CHECKPOINT="ckptA,ckptB,..." (one final checkpoint per training seed)
     # evaluates each checkpoint sequentially and writes one independent eval JSON per checkpoint.
     eval_ckpt = os.environ.get("EVAL_CHECKPOINT")

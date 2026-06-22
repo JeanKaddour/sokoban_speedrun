@@ -116,12 +116,10 @@ Standalone `speedrun_non_llm.py` snapshots are saved per run and checked against
 
 ```bash
 # train (recipe defaults live in speedrun_non_llm.py RECIPE)
-RUN_NAME=<run> DIFFICULTY=4 TOTAL_TIMESTEPS=<steps> modal run --detach modal_app_non_llm.py
-# eval the final checkpoint, then verify offline
-EVAL_CHECKPOINT=/vol/outputs/<run>/final.pt DIFFICULTY=4 modal run modal_app_non_llm.py
-python verify_record.py records/non_llm/2026-06-21_01_non_llm
+RUN_NAME=<run> DIFFICULTY=4 TOTAL_TIMESTEPS=<steps> uv run modal run --detach modal_app_non_llm.py
+# eval the final checkpoint; maintainers verify by rerunning at an independent seed
+EVAL_CHECKPOINT=/vol/outputs/<run>/final.pt DIFFICULTY=4 uv run modal run modal_app_non_llm.py
 ```
 
 <!-- END AUTO-GENERATED -->
-
 

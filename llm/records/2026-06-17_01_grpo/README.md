@@ -204,10 +204,10 @@ Standalone `speedrun.py` snapshots are saved per run and checked against the emb
 
 ```bash
 # train (recipe defaults live in speedrun.py RECIPE + modal_app.py)
-MAX_STEPS=<steps> RUN_NAME=<run> modal run --detach modal_app.py
+MAX_STEPS=<steps> RUN_NAME=<run> uv run modal run --detach modal_app.py
 # eval the final checkpoint under the leaderboard protocol, then verify offline
-EVAL_CHECKPOINT=/vol/outputs/<run>/step_<final> modal run modal_app.py
-python verify_record.py records/2026-06-17_01_grpo
+EVAL_CHECKPOINT=/vol/outputs/<run>/step_<final> uv run modal run modal_app.py
+uv run python verify_record.py records/2026-06-17_01_grpo
 ```
 
 <!-- END AUTO-GENERATED -->

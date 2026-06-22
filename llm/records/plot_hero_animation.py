@@ -38,7 +38,9 @@ from matplotlib.ticker import PercentFormatter  # noqa: E402
 from PIL import Image  # noqa: E402
 
 RECORDS_DIR = Path(__file__).resolve().parent
-REPO_ROOT = RECORDS_DIR.parent
+TRACK_ROOT = RECORDS_DIR.parent
+REPO_ROOT = TRACK_ROOT.parent
+sys.path.insert(0, str(TRACK_ROOT))
 sys.path.insert(0, str(REPO_ROOT))
 
 from make_record_report import (  # noqa: E402

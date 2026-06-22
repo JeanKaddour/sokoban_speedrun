@@ -31,11 +31,6 @@ import numpy as np
 
 SOURCE_PATH = Path(__file__).resolve()
 REPO_DIR = SOURCE_PATH.parent
-# The vendored PufferLib fork (the environment dependency). Overridable for Modal, where the fork is
-# copied to a fixed image path rather than living under the repo tree.
-PUFFERLIB_DIR = Path(os.environ.get("PUFFERLIB_DIR") or (REPO_DIR / "third_party" / "pufferlib"))
-if str(PUFFERLIB_DIR) not in sys.path:
-    sys.path.insert(0, str(PUFFERLIB_DIR))
 
 import contextlib  # noqa: E402
 import torch  # noqa: E402
@@ -167,40 +162,26 @@ class DummyWandb:
     def finish(self, *a, **k): pass
 
 
-def _pufferlib_build_env() -> dict[str, str]:
-    env = dict(os.environ)
-    pybin = str(Path(sys.executable).resolve().parent)
-    env["PATH"] = pybin + os.pathsep + env.get("PATH", "")
-    return env
+def pufferlib_root() -> Path:
+    import pufferlib
+    return Path(pufferlib.__file__).resolve().parent.parent
 
 
 def ensure_boxoban_extension() -> None:
-    """Build the vendored PufferLib boxoban extension on first use.
-
-    The README path should stay `uv sync && uv run python speedrun_non_llm.py`; the script owns the
-    repo-specific native-extension detail.
-    """
-    if not PUFFERLIB_DIR.exists():
-        raise SystemExit(f"missing vendored PufferLib checkout: {PUFFERLIB_DIR}")
-    env = _pufferlib_build_env()
-    code = (
-        "import sys; "
-        f"sys.path.insert(0, {str(PUFFERLIB_DIR)!r}); "
-        "import pufferlib._C as C; "
-        "print(getattr(C, 'env_name', ''))"
-    )
-    check = subprocess.run([sys.executable, "-c", code], cwd=str(REPO_DIR), env=env,
-                           capture_output=True, text=True)
-    if check.returncode == 0 and check.stdout.strip() == ENV_NAME:
-        return
-
-    reason = (check.stderr or check.stdout).strip()
-    if reason:
-        print(f"[setup] rebuilding PufferLib {ENV_NAME} extension ({reason.splitlines()[-1]})", flush=True)
-    else:
-        print(f"[setup] building PufferLib {ENV_NAME} extension", flush=True)
-    subprocess.run(["bash", "build.sh", ENV_NAME, "--float"], cwd=str(PUFFERLIB_DIR),
-                   env=env, check=True)
+    """Validate that the external PufferLib dependency provides the Boxoban native env."""
+    try:
+        from pufferlib import _C
+    except Exception as exc:
+        raise SystemExit(
+            "PufferLib's native extension `pufferlib._C` is unavailable. "
+            "Install a PufferLib build that includes the Boxoban native environment."
+        ) from exc
+    env_name = getattr(_C, "env_name", None)
+    if env_name != ENV_NAME:
+        raise SystemExit(
+            f"PufferLib native extension is built for {env_name!r}, expected {ENV_NAME!r}. "
+            "Install a PufferLib build that includes the Boxoban native environment."
+        )
 
 
 # ============================ official DeepMind held-out levels ==============================
@@ -263,10 +244,11 @@ def ensure_holdout_bin(difficulty_name: str | None, split: str) -> Path | None:
     committed = REPO_DIR / "data" / f"boxoban_{difficulty_name}_{split}.bin"
     if committed.exists():
         return committed
-    levels = PUFFERLIB_DIR / "resources" / "boxoban" / "levels" / difficulty_name / split
+    levels = pufferlib_root() / "resources" / "boxoban" / "levels" / difficulty_name / split
     if not levels.is_dir() or not any(levels.glob("*.txt")):
         return None
-    out = PUFFERLIB_DIR / "resources" / "boxoban" / f"boxoban_maps_{difficulty_name}_{split}.bin"
+    out = REPO_DIR / "resources" / "boxoban" / f"boxoban_maps_{difficulty_name}_{split}.bin"
+    out.parent.mkdir(parents=True, exist_ok=True)
     if not out.exists():
         print(f"[eval] encoding official held-out {difficulty_name}/{split} -> {out.name}")
         build_boxoban_bin(levels, out)
@@ -274,7 +256,7 @@ def ensure_holdout_bin(difficulty_name: str | None, split: str) -> Path | None:
 
 
 # ============================ action sampling (ported from pufferlib.torch_pufferl) ==========
-# Faithful copies so logprob/entropy match PuffeRL bit-for-bit (tests/test_ppo_equivalence.py).
+# Faithful copies so logprob/entropy match PuffeRL bit-for-bit.
 from torch.distributions.utils import logits_to_probs  # noqa: E402
 
 
@@ -490,7 +472,7 @@ class BoxobanVecEnv:
         from pufferlib import pufferl, _C
         assert getattr(_C, "env_name", None) == ENV_NAME, (
             f"_C built for {getattr(_C, 'env_name', None)!r}, not {ENV_NAME!r}. "
-            "Run `uv run python speedrun_non_llm.py` to rebuild the local extension.")
+            "Run `uv run python speedrun_non_llm.py` from non_llm/ to rebuild the local extension.")
         saved = sys.argv
         sys.argv = [saved[0]]
         try:
@@ -704,7 +686,7 @@ class RunLogger:
             import importlib.metadata
             lines.append(f"pufferlib: {importlib.metadata.version('pufferlib')}")
         except Exception:
-            lines.append("pufferlib: (vendored fork third_party/pufferlib)")
+            lines.append("pufferlib: unknown")
         lines.append(f"git commit: {_git_commit()}")
         lines.append(f"source snapshot: source/speedrun_non_llm.py sha256:{sha}")
         try:
@@ -750,7 +732,8 @@ def flops_per_env_step(num_params: int, replay_ratio: float) -> float:
 def train(cfg: argparse.Namespace) -> Path:
     out_dir = (REPO_DIR / cfg.output_dir / cfg.run).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    os.chdir(PUFFERLIB_DIR)  # boxoban C env caches level files under a cwd-relative resources/
+    ensure_boxoban_extension()
+    os.chdir(pufferlib_root())  # boxoban C env caches level files under a cwd-relative resources/
     set_seed(cfg.seed)
 
     env = BoxobanVecEnv(difficulty=cfg.difficulty, num_agents=cfg.num_agents,
@@ -819,7 +802,8 @@ def evaluate(cfg: argparse.Namespace, checkpoint: Path) -> dict:
     """Roll the trained policy over the DISJOINT held-out Boxoban split; gate on solve-rate's lower
     95% CI. The forked boxoban env reserves the last holdout_frac of the level pool for eval (never
     sampled during training). Each episode is one attempt (k=1) -> pass@1 = solve rate."""
-    os.chdir(PUFFERLIB_DIR)
+    ensure_boxoban_extension()
+    os.chdir(pufferlib_root())
     set_seed(cfg.eval_seed)
     diff_name = DIFFICULTY_NAMES.get(cfg.difficulty)
     holdout_bin = ensure_holdout_bin(diff_name, cfg.eval_split)
@@ -922,7 +906,8 @@ def evaluate(cfg: argparse.Namespace, checkpoint: Path) -> dict:
 def profile_run(cfg: argparse.Namespace) -> None:
     """Time per-iteration cost split into env-step / policy-inference (rollout) / train (fwd+bwd+Muon),
     so we can reason about where wall-clock goes and how it scales to other GPUs."""
-    os.chdir(PUFFERLIB_DIR)
+    ensure_boxoban_extension()
+    os.chdir(pufferlib_root())
     set_seed(cfg.seed)
     env = BoxobanVecEnv(difficulty=cfg.difficulty, num_agents=cfg.num_agents,
                         max_steps=cfg.max_episode_steps, seed=cfg.seed)

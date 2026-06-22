@@ -86,7 +86,8 @@ WANDB_PROJECT = "sokoban-speedrun-llm"
 # spot: generation keeps the async buffer full while the trainer is compute-bound, and a 4th trainer
 # starves generation. That is a torchrun launch param, NOT a speedrun CLI arg, so modal_app.py
 # defaults it from the GPU count (3 on 8-GPU nodes, 1 on smaller boxes), not in this list. Local
-# record runs should use `NODE_GPUS=8 torchrun --standalone --nproc_per_node=3 -m speedrun ...`.
+# record runs should use `cd llm` then
+# `NODE_GPUS=8 uv run torchrun --standalone --nproc_per_node=3 -m speedrun ...`.
 RECIPE = [
     "--dtype", "float32",       # load trainer params/head fp32; train autocast runs body bf16, head/logits fp32
     "--train-data", "datasets/sokoban_train.jsonl",
@@ -1698,7 +1699,7 @@ def token_logprobs_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> to
 
 def entropy_from_logits(logits: torch.Tensor) -> torch.Tensor:
     """Per-token Shannon entropy H(pi) = logsumexp(logits) - E_pi[logits] of the policy's
-    next-token distribution (verl's `entropy_from_logits` formulation). Computed from the SAME
+    next-token distribution. Computed from the SAME
     fp32 logits the policy loss already materializes, so it adds only an O(vocab) reduction —
     no second LM-head matmul, no extra forward over tokens. The single (chunk, vocab) softmax
     temp is allocated after the cross-entropy temp is freed, so it does not raise the
@@ -1822,7 +1823,7 @@ def policy_gradient_loss_from_token_logprobs(
             if clip_eps_low is None or clip_eps_high is None:
                 raise ValueError("clip_eps_low/clip_eps_high are required for the grpo loss")
             # PPO-clip surrogate (GRPO/DAPO): gradient flows through the ratio itself.
-            # min in objective space == max in loss space (verl compute_policy_loss_vanilla).
+            # min in objective space == max in loss space.
             ratio = torch.exp(torch.clamp(log_ratio, min=-20.0, max=20.0))
             obj_unclipped = ratio * advantage_weight
             obj_clipped = torch.clamp(ratio, 1.0 - clip_eps_low, 1.0 + clip_eps_high) * advantage_weight
@@ -1987,8 +1988,8 @@ def batch_normalize_advantages(advantages: torch.Tensor, eps: float = 1e-6) -> t
 def compute_group_advantages(rewards: torch.Tensor, mode: str = "centered") -> torch.Tensor:
     """Per-group advantages from one puzzle group's rewards.
 
-    'grpo': (r - mean(r)) / std(r), matching the reference GRPO outcome advantage used by
-    verl/slime. Groups with fewer than two samples or near-zero std return zeros; with the
+    'grpo': (r - mean(r)) / std(r), matching the common GRPO outcome advantage. Groups
+    with fewer than two samples or near-zero std return zeros; with the
     zero-variance filter enabled they are rejected anyway.
 
     'centered': r - mean(r) — an RLOO/Dr.GRPO-style group
@@ -3742,7 +3743,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--advantage-mode", choices=["auto", "grpo", "centered", "maxrl"], default="auto",
                         help="Per-group advantage estimator. 'auto' uses 'grpo' for --loss-fn grpo "
                              "and 'centered' otherwise. 'grpo': (r - group_mean) / group_std, matching "
-                             "verl/slime GRPO. 'centered': r - group_mean, an RLOO/Dr.GRPO-style "
+                             "the common GRPO estimator. 'centered': r - group_mean, an RLOO/Dr.GRPO-style "
                              "baseline with no per-group std. 'maxrl' (arXiv MaxRL): "
                              "(r - r_hat)/(N * r_hat), up-weighting low-pass-rate (hard) prompts "
                              "toward the maximum-likelihood gradient and zeroing all-fail groups. "

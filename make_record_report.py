@@ -1,7 +1,7 @@
 """Generate the standard plots + per-record README for a record submission.
 
 Usage:
-    python make_record_report.py records/<dir> \
+    python ../make_record_report.py records/<dir> \
         [--wandb-runs entity/project/id1,entity/project/id2,...] \
         [--prev records/<previous-record-dir>]
 
@@ -19,7 +19,8 @@ The record README is written with the human-authored sections preserved: everyth
 between the AUTO markers is regenerated, everything outside them is never touched.
 On first run a scaffold with a TODO "Idea" section is created.
 
-Run via:  uv run --with matplotlib --with pandas [--with wandb] python make_record_report.py ...
+Run from a track directory via:
+    uv run --with matplotlib --with pandas [--with wandb] python ../make_record_report.py ...
 """
 
 from __future__ import annotations
@@ -229,10 +230,14 @@ def draw_speedrun(ax, df, color: str, target: float, annotate: bool = True) -> f
 
 
 def fmt_flops(f: float | None) -> str:
-    """Human-readable FLOPs-to-target (the node-invariant leaderboard metric)."""
+    """Raw FLOPs-to-target (the node-invariant leaderboard metric).
+
+    Reported as the exact FLOP count in scientific notation (matching the ``.6e``
+    cum_flops format in the train logs) rather than rounded to ``EFLOP``: this is a
+    speedrun metric where small gaps decide records, so no unit-rounding."""
     if f is None or not (isinstance(f, (int, float)) and math.isfinite(f)) or f <= 0:
         return "—"
-    return f"{f / 1e18:.3f} EFLOP"
+    return f"{f:.6e}"
 
 
 def train_log_paths(record_dir: Path) -> list[Path]:
@@ -428,7 +433,7 @@ def plot_eval(record: dict, target: float, out: Path) -> None:
 
 
 def plot_hero_card(record: dict, target: float, out: Path,
-                   online_frames: list[pd.DataFrame] | None = None) -> None:
+                   online_frames: list[pd.DataFrame] | None = None, subtitle: str = "") -> None:
     """Clean 16:9 record card: training climb, record time, pass@1, target."""
     logs, evals = record["logs"], record["evals"]
     fig = plt.figure(figsize=(12.8, 7.2), constrained_layout=False)
@@ -437,8 +442,11 @@ def plot_hero_card(record: dict, target: float, out: Path,
     ax_main = fig.add_subplot(gs[0, 0])
     ax_card = fig.add_subplot(gs[0, 1]); ax_card.axis("off")
 
-    fig.text(0.065, 0.925, "Sokoban Speedrun", fontsize=36, fontweight="bold",
+    fig.text(0.065, 0.93, "Sokoban Speedrun", fontsize=36, fontweight="bold",
              color=INK, ha="left", va="center")
+    if subtitle:
+        fig.text(0.066, 0.872, subtitle, fontsize=15, fontweight="bold",
+                 color=MUTED, ha="left", va="center")
 
     smax = 0.0
     source = "filtered"
@@ -482,7 +490,7 @@ def verification_block(record_dir: Path, target: float) -> list[str]:
     verification/ is itself a record dir — an independent rerun (train_log_seed*.txt +
     eval_seed*.json + rollouts) plus an optional one-line verifier.txt (e.g. '@maintainer  PR#12'
     or 'Self-verified by the maintainers'). The verdict is derived from the eval JSON, so it can
-    never drift from the committed artifacts; `verify_record.py records/<dir>` re-scores it too."""
+    never drift from the committed artifacts; the track verifier re-scores it too."""
     vdir = record_dir / "verification"
     vevals = sorted(vdir.glob("eval_seed*.json")) if vdir.is_dir() else []
     if not vevals:
@@ -506,13 +514,39 @@ def verification_block(record_dir: Path, target: float) -> list[str]:
     return lines
 
 
-def source_block(record_dir: Path, source_rows: list[dict]) -> list[str]:
+# Track-specific strings for the auto-generated Source + Reproduce blocks (records are first-class for
+# both the LLM and non-LLM tracks; `--track` selects the right script + commands).
+TRACKS = {
+    "llm": {
+        "script": "speedrun.py",
+        "reproduce": [
+            "# train (recipe defaults live in speedrun.py RECIPE + modal_app.py)",
+            "MAX_STEPS=<steps> RUN_NAME=<run> uv run modal run --detach modal_app.py",
+            "# eval the final checkpoint under the leaderboard protocol, then verify offline",
+            "EVAL_CHECKPOINT=/vol/outputs/<run>/step_<final> uv run modal run modal_app.py",
+        ],
+        "verify": ["uv run python verify_record.py {record}"],
+    },
+    "non-llm": {
+        "script": "speedrun_non_llm.py",
+        "reproduce": [
+            "# train (recipe defaults live in speedrun_non_llm.py RECIPE)",
+            "RUN_NAME=<run> DIFFICULTY=4 TOTAL_TIMESTEPS=<steps> uv run modal run --detach modal_app_non_llm.py",
+            "# eval the final checkpoint; maintainers verify by rerunning at an independent seed",
+            "EVAL_CHECKPOINT=/vol/outputs/<run>/final.pt DIFFICULTY=4 uv run modal run modal_app_non_llm.py",
+        ],
+        "verify": [],
+    },
+}
+
+
+def source_block(record_dir: Path, source_rows: list[dict], script: str = "speedrun.py") -> list[str]:
     if not source_rows:
         return []
     lines = [
         "## Source",
         "",
-        "Standalone `speedrun.py` snapshots are saved per run and checked against the embedded run-log source.",
+        f"Standalone `{script}` snapshots are saved per run and checked against the embedded run-log source.",
         "",
         "| run | seed | snapshot | sha256 |",
         "|---|---|---|---|",
@@ -527,7 +561,7 @@ def source_block(record_dir: Path, source_rows: list[dict]) -> list[str]:
 
 
 def auto_block(record: dict, record_dir: Path, target: float, prev_dir: Path | None,
-               source_rows: list[dict]) -> str:
+               source_rows: list[dict], track: str = "llm") -> str:
     evals, logs = record["evals"], record["logs"]
     clocks = {s: logs[s]["final_time_s"] for s in sorted(logs)}
     flops = {s: logs[s].get("final_flops") for s in sorted(logs)}
@@ -558,7 +592,7 @@ def auto_block(record: dict, record_dir: Path, target: float, prev_dir: Path | N
               "![eval](plots/eval.png)", "",
               "</details>", ""]
     lines += verification_block(record_dir, target)
-    lines += source_block(record_dir, source_rows)
+    lines += source_block(record_dir, source_rows, TRACKS[track]["script"])
     # Config: headline table + diff vs previous record + full dict.
     args = logs[sorted(logs)[0]]["args"]
     lines += ["## Config", "", "| arg | value |", "|---|---|"]
@@ -575,12 +609,8 @@ def auto_block(record: dict, record_dir: Path, target: float, prev_dir: Path | N
                 lines += [f"| `{k}` | `{b}` | `{a}` |" for k, b, a in diffs]
     full = json.dumps({k: str(v) for k, v in sorted(args.items())}, indent=2)
     lines += ["", "<details><summary>full args</summary>", "", "```json", full, "```", "</details>", ""]
-    lines += ["## Reproduce", "", "```bash",
-              "# train (recipe defaults live in speedrun.py RECIPE + modal_app.py)",
-              "MAX_STEPS=<steps> RUN_NAME=<run> modal run --detach modal_app.py",
-              "# eval the final checkpoint under the leaderboard protocol, then verify offline",
-              "EVAL_CHECKPOINT=/vol/outputs/<run>/step_<final> modal run modal_app.py",
-              f"python verify_record.py records/{record_dir.name}", "```", ""]
+    verify_cmds = [cmd.format(record=record_dir.as_posix()) for cmd in TRACKS[track]["verify"]]
+    lines += ["## Reproduce", "", "```bash", *TRACKS[track]["reproduce"], *verify_cmds, "```", ""]
     return "\n".join(lines)
 
 
@@ -610,6 +640,9 @@ def main() -> None:
                     help="comma-separated entity/project/run_id list, one per seed, ordered like the seed files")
     ap.add_argument("--prev", type=Path, default=None, help="previous record dir for the config diff")
     ap.add_argument("--target", type=float, default=0.80)
+    ap.add_argument("--subtitle", default="", help="optional hero subtitle, e.g. a track label")
+    ap.add_argument("--track", choices=["llm", "non-llm"], default="llm",
+                    help="selects the Source/Reproduce commands for the record's track")
     args = ap.parse_args()
 
     set_house_style()
@@ -627,11 +660,11 @@ def main() -> None:
     plot_training(record, online_frames, plots / "training.png", args.target)
     plot_stability(record, plots / "stability.png")
     plot_eval(record, args.target, plots / "eval.png")
-    plot_hero_card(record, args.target, plots / "hero.png", online_frames)
+    plot_hero_card(record, args.target, plots / "hero.png", online_frames, subtitle=args.subtitle)
 
     source_rows = ensure_all_source_snapshots(args.record_dir)
     write_readme(args.record_dir,
-                 auto_block(record, args.record_dir, args.target, args.prev, source_rows))
+                 auto_block(record, args.record_dir, args.target, args.prev, source_rows, track=args.track))
     print(f"wrote {plots}/*.png (incl. hero.png) and updated {args.record_dir / 'README.md'}")
 
 

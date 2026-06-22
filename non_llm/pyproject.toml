@@ -1,0 +1,20 @@
+[project]
+name = "sokoban-speedrun-non-llm"
+version = "0.1.0"
+description = "Sokoban Speedrun non-LLM track"
+readme = "../README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "modal>=1.1.0",
+    "numpy>=2.0.0",
+    "pybind11>=2.13.0",
+    "pufferlib @ git+https://github.com/JeanKaddour/PufferLib.git@e90b58e",
+    "rich-argparse>=1.7.0",
+    "torch==2.11.0",
+    "wandb>=0.17.0",
+]
+
+# This repo is a set of standalone scripts (speedrun_non_llm.py, modal_app_non_llm.py),
+# not an installable package: uv only manages the dependency environment.
+[tool.uv]
+package = false

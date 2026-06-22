@@ -1,17 +1,16 @@
 """Modal entrypoint for the non-LLM Sokoban speedrun track (PufferLib boxoban + in-file PuffeRL PPO).
 
-Sibling of `modal_app.py` (which drives the LLM `speedrun.py`) and `modal_verl_app.py`. The non-LLM
-track is a different stack, so it gets its own image: a CUDA-devel base with clang + a cu126 torch,
+The non-LLM track is a different stack, so it gets its own image: a CUDA-devel base with clang + a cu126 torch,
 into which the `boxoban` env extension is built (`--float`) at image
 build time. Records run on a single H100 (Boxoban PPO is GPU-light; a full run is minutes).
 
 Usage (mirrors modal_app.py's env-var local entrypoint):
 
     # train to target + final held-out eval, artifacts -> volume /vol/outputs/<run>/
-    modal run --detach modal_app_non_llm.py
+    uv run modal run --detach modal_app_non_llm.py
 
     # eval an existing checkpoint only
-    EVAL_CHECKPOINT=/vol/outputs/<run>/final.pt modal run modal_app_non_llm.py
+    EVAL_CHECKPOINT=/vol/outputs/<run>/final.pt uv run modal run modal_app_non_llm.py
 """
 
 from __future__ import annotations
@@ -27,10 +26,7 @@ VOLUME_NAME = "nanochat-rl-hf"          # share the LLM track's volume so record
 VOLUME_MOUNT_PATH = "/vol"
 GPU_TYPE = os.environ.get("GPU_TYPE", "H100")
 NUM_GPUS = int(os.environ.get("NUM_GPUS", "1"))
-# H100 = sm_90. The image builds on a CPU builder (no GPU), so build.sh's default `-arch=native`
-# can't probe — pin the arch explicitly (nvcc wants the full `sm_90`, not bare `90`).
-NVCC_ARCH = os.environ.get("NVCC_ARCH", "sm_90")
-PUFFERLIB_IMG_DIR = "/root/pufferlib"
+PUFFERLIB_DEP = "pufferlib @ git+https://github.com/JeanKaddour/PufferLib.git@e90b58e"
 
 app = modal.App(APP_NAME)
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
@@ -39,31 +35,19 @@ _FORWARD_KEYS = ("WANDB_API_KEY", "WANDB_ENTITY")
 _forward = {k: os.environ[k] for k in _FORWARD_KEYS if os.environ.get(k)}
 runtime_secrets = [modal.Secret.from_dict(_forward)] if _forward else []
 
-# Build the native boxoban extension into the fork at image-build time: create the libcudnn.so /
-# libnccl.so dev symlinks the pip nvidia wheels omit, then `build.sh boxoban --float`.
+# PufferLib is an external dependency; the image only supplies CUDA library symlinks needed by its
+# native extension and installs the pinned package.
 _PYLIB = "import nvidia.{m}, os; print(os.path.join(nvidia.{m}.__path__[0], 'lib'))"
 image = (
     modal.Image.from_registry("nvidia/cuda:12.6.2-devel-ubuntu22.04", add_python="3.12")
     .apt_install("clang", "libomp-dev", "git", "build-essential", "curl", "ca-certificates", "unzip")
     .pip_install("torch==2.9.0", index_url="https://download.pytorch.org/whl/cu126")
-    .pip_install("numpy", "rich", "rich_argparse", "pybind11", "scikit-learn", "wandb")
-    .env({"NVCC_ARCH": NVCC_ARCH, "PUFFERLIB_DIR": PUFFERLIB_IMG_DIR, "OMP_NUM_THREADS": "1"})
-    # Upload only the source needed to BUILD the env: skip .git, the ~200MB resources/ map cache
-    # (regenerated/downloaded at runtime), build artifacts, the raylib download (re-fetched by
-    # build.sh), and any local .so (rebuilt for the H100's sm_90 in run_commands below).
-    .add_local_dir("third_party/pufferlib", PUFFERLIB_IMG_DIR, copy=True,
-                   ignore=[".git", "resources", "build", "raylib-*", "*.so", "__pycache__", "*.pyc"])
+    .pip_install("numpy", "rich", "rich_argparse", "pybind11", "scikit-learn", "wandb", PUFFERLIB_DEP)
+    .env({"OMP_NUM_THREADS": "1"})
     .run_commands(
         f"ln -sf libcudnn.so.9 $(python -c \"{_PYLIB.format(m='cudnn')}\")/libcudnn.so",
         f"ln -sf libnccl.so.2 $(python -c \"{_PYLIB.format(m='nccl')}\")/libnccl.so",
-        f"cd {PUFFERLIB_IMG_DIR} && bash build.sh boxoban --float",
     )
-    # Bake the small official held-out splits (valid/test ~18MB) so the eval gates on the real
-    # DeepMind set; the big train splits are excluded (the env downloads them at runtime), as are the
-    # procedural basic/easy tiers.
-    .add_local_dir("third_party/pufferlib/resources/boxoban/levels",
-                   f"{PUFFERLIB_IMG_DIR}/resources/boxoban/levels", copy=True,
-                   ignore=["train", "basic", "easy"])
     .add_local_python_source("speedrun_non_llm")
 )
 
@@ -78,7 +62,6 @@ def _runtime_env() -> dict[str, str]:
     libs = glob.glob(os.path.join(sysconfig.get_paths()["purelib"], "nvidia", "*", "lib"))
     existing = env.get("LD_LIBRARY_PATH", "")
     env["LD_LIBRARY_PATH"] = ":".join(libs + ([existing] if existing else []))
-    env["PUFFERLIB_DIR"] = PUFFERLIB_IMG_DIR
     return env
 
 
