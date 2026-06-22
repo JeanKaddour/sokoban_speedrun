@@ -8,11 +8,10 @@ build time. Records run on a single H100 (Boxoban PPO is GPU-light; a full run i
 Usage (mirrors modal_app.py's env-var local entrypoint):
 
     # train to target + final held-out eval, artifacts -> volume /vol/outputs/<run>/
-    RUN_NAME=ppo-medium DIFFICULTY=2 TOTAL_TIMESTEPS=880000000 TARGET=0.6 \
-        modal run --detach modal_app_non_llm.py
+    modal run --detach modal_app_non_llm.py
 
     # eval an existing checkpoint only
-    EVAL_CHECKPOINT=/vol/outputs/<run>/final.pt DIFFICULTY=2 modal run modal_app_non_llm.py
+    EVAL_CHECKPOINT=/vol/outputs/<run>/final.pt modal run modal_app_non_llm.py
 """
 
 from __future__ import annotations
@@ -93,9 +92,13 @@ def _run(extra_args: list[str]) -> None:
 
 @app.function(image=image, gpu=f"{GPU_TYPE}:{NUM_GPUS}", timeout=24 * 60 * 60,
               volumes={VOLUME_MOUNT_PATH: volume}, secrets=runtime_secrets)
-def train(run_name: str, difficulty: int, total_timesteps: int | None, target: float | None,
+def train(run_name: str | None, difficulty: int | None, total_timesteps: int | None, target: float | None,
           holdout_frac: float | None, extra_args: list[str] | None = None) -> None:
-    args = ["--run", run_name, "--difficulty", str(difficulty)]
+    args = []
+    if run_name is not None:
+        args += ["--run", run_name]
+    if difficulty is not None:
+        args += ["--difficulty", str(difficulty)]
     if total_timesteps is not None:
         args += ["--total-timesteps", str(total_timesteps)]
     if target is not None:
@@ -108,10 +111,15 @@ def train(run_name: str, difficulty: int, total_timesteps: int | None, target: f
 
 @app.function(image=image, gpu=f"{GPU_TYPE}:{NUM_GPUS}", timeout=6 * 60 * 60,
               volumes={VOLUME_MOUNT_PATH: volume}, secrets=runtime_secrets)
-def evaluate(checkpoint: str, run_name: str, difficulty: int, eval_episodes: int,
+def evaluate(checkpoint: str, run_name: str | None, difficulty: int | None, eval_episodes: int | None,
              target: float | None, holdout_frac: float | None) -> None:
-    args = ["--eval-only", "--eval-checkpoint", checkpoint, "--run", run_name,
-            "--difficulty", str(difficulty), "--eval-episodes", str(eval_episodes)]
+    args = ["--eval-only", "--eval-checkpoint", checkpoint]
+    if run_name is not None:
+        args += ["--run", run_name]
+    if difficulty is not None:
+        args += ["--difficulty", str(difficulty)]
+    if eval_episodes is not None:
+        args += ["--eval-episodes", str(eval_episodes)]
     if target is not None:
         args += ["--target", str(target)]
     if holdout_frac is not None:
@@ -127,15 +135,18 @@ def profile(extra_args: list[str]) -> None:
 
 
 @app.function(image=image, gpu=f"{GPU_TYPE}:{NUM_GPUS}", timeout=30 * 60, volumes={VOLUME_MOUNT_PATH: volume})
-def smoke(run_name: str, total_timesteps: int, extra_args: list[str]) -> None:
+def smoke(run_name: str | None, total_timesteps: int, extra_args: list[str]) -> None:
     # short train (no eval) to measure real-loop SPS on the GPU
-    _run(["--run", run_name, "--no-eval", "--total-timesteps", str(total_timesteps), *extra_args])
+    args = ["--no-eval", "--total-timesteps", str(total_timesteps), *extra_args]
+    if run_name is not None:
+        args = ["--run", run_name, *args]
+    _run(args)
 
 
 @app.local_entrypoint()
 def main() -> None:
-    run_name = os.environ.get("RUN_NAME", "boxoban-ppo")
-    difficulty = int(os.environ.get("DIFFICULTY", "2"))
+    run_name = os.environ.get("RUN_NAME")
+    difficulty = int(os.environ["DIFFICULTY"]) if os.environ.get("DIFFICULTY") else None
     holdout_frac = float(os.environ["HOLDOUT_FRAC"]) if os.environ.get("HOLDOUT_FRAC") else None
     target = float(os.environ["TARGET"]) if os.environ.get("TARGET") else None
     extra = os.environ.get("EXTRA_ARGS", "").split() or None
@@ -157,7 +168,8 @@ def main() -> None:
     eval_ckpt = os.environ.get("EVAL_CHECKPOINT")
     if eval_ckpt:
         evaluate.remote(eval_ckpt, run_name, difficulty,
-                        int(os.environ.get("EVAL_EPISODES", "8192")), target, holdout_frac)
+                        int(os.environ["EVAL_EPISODES"]) if os.environ.get("EVAL_EPISODES") else None,
+                        target, holdout_frac)
         return
 
     total = int(os.environ["TOTAL_TIMESTEPS"]) if os.environ.get("TOTAL_TIMESTEPS") else None
