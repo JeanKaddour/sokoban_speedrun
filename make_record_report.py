@@ -520,6 +520,7 @@ TRACKS = {
     "llm": {
         "target": 0.80,
         "script": "speedrun.py",
+        "show_flops": True,
         "reproduce": [
             "# train (recipe defaults live in speedrun.py RECIPE + modal_app.py)",
             "MAX_STEPS=<steps> RUN_NAME=<run> uv run modal run --detach modal_app.py",
@@ -531,13 +532,15 @@ TRACKS = {
     "non-llm": {
         "target": 0.70,
         "script": "speedrun_non_llm.py",
+        "show_flops": False,   # open-architecture track: a FLOPs estimator can't stay faithful across archs
         "reproduce": [
             "# train (recipe defaults live in speedrun_non_llm.py RECIPE)",
             "RUN_NAME=<run> DIFFICULTY=4 TOTAL_TIMESTEPS=<steps> uv run modal run --detach modal_app_non_llm.py",
             "# eval the final checkpoint; reuse the same EXTRA_ARGS when training used non-default config",
             "EVAL_CHECKPOINT=/vol/outputs/<run>/final.pt DIFFICULTY=4 uv run modal run modal_app_non_llm.py",
+            "# verify offline (re-derives pass@1/CI + checks the eval bin); maintainers also rerun at a 2nd seed",
         ],
-        "verify": [],
+        "verify": ["uv run python verify_record.py {record}"],
     },
 }
 
@@ -567,14 +570,16 @@ def auto_block(record: dict, record_dir: Path, target: float, prev_dir: Path | N
     evals, logs = record["evals"], record["logs"]
     clocks = {s: logs[s]["final_time_s"] for s in sorted(logs)}
     flops = {s: logs[s].get("final_flops") for s in sorted(logs)}
-    lines = ["## Results", "", "| seed | held-out eval pass@1 | 95% CI | record clock | FLOPs |",
-             "|---|---|---|---|---|"]
+    show_flops = TRACKS[track].get("show_flops", True)   # non-LLM track has no FLOPs co-metric
+    flops_hdr, flops_sep = (" FLOPs |", "---|") if show_flops else ("", "")
+    lines = ["## Results", "", f"| seed | held-out eval pass@1 | 95% CI | record clock |{flops_hdr}",
+             f"|---|---|---|---|{flops_sep}"]
     for s in sorted(evals):
         ev, clock, fl = evals[s], clocks.get(s), flops.get(s)
         hms = f"{int(clock // 3600)}:{int(clock % 3600 // 60):02d}:{int(clock % 60):02d}" if clock else "—"
-        flo = fmt_flops(fl)
+        flo = f" {fmt_flops(fl)} |" if show_flops else ""
         lines.append(f"| {s} | {ev['pass_at_1']:.4f} | [{ev['ci_low']:.4f}, {ev['ci_high']:.4f}] "
-                     f"| {hms} | {flo} |")
+                     f"| {hms} |{flo}")
     # Single-seed gate: each run independently clears the target via its lower 95% bootstrap CI
     # (no cross-seed averaging — see the leaderboard rules).
     if len(evals) == 1:

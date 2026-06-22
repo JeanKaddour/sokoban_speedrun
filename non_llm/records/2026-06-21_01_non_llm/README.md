@@ -15,9 +15,9 @@ DeepMind `unfiltered/test` 1000-level held-out split by greedy per-level pass@1.
 
 ## Results
 
-| seed | held-out eval pass@1 | 95% CI | record clock | FLOPs |
-|---|---|---|---|---|
-| seed42 | 0.7279 | [0.7010, 0.7545] | 0:19:36 | 1.550943e+16 |
+| seed | held-out eval pass@1 | 95% CI | record clock |
+|---|---|---|---|
+| seed42 | 0.7279 | [0.7010, 0.7545] | 0:19:36 |
 
 **Held-out eval pass@1 0.7279, lower 95% CI 0.7010 vs TARGET 0.7: CLEARS.**
 

@@ -21,8 +21,10 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -49,7 +51,10 @@ def _amp(enabled: bool, device: str):
 
 
 ENV_NAME = "boxoban"
-DEFAULT_RUN_NAME = "boxoban-non-llm"
+DEFAULT_RUN_NAME_PREFIX = "boxoban-non-llm"
+PUFFERLIB_REPO_URL = "https://github.com/JeanKaddour/PufferLib.git"
+PUFFERLIB_COMMIT = "e90b58edef5445d1a3689e2f908f5841ad6a0f23"
+LOCAL_PUFFERLIB_DIR = Path(os.environ.get("PUFFERLIB_SRC_DIR", REPO_DIR / ".pufferlib-src")).expanduser()
 DIFFICULTY_NAMES = {0: "basic", 1: "easy", 2: "medium", 3: "hard", 4: "unfiltered"}
 OBS_CHANNELS, GRID = 4, 10
 NUM_ACTIONS = 5
@@ -113,6 +118,8 @@ RECIPE = {
 
 
 # ============================ eval aggregates (verbatim from eval_speedrun.py) ===============
+# Single source of truth for the record aggregates: verify_record.py imports these so an offline
+# re-derivation of pass@1 / pass@k / CI can never drift from what evaluate() actually computed.
 def _pass_at_k_unbiased(n: int, c: int, k: int) -> float:
     if k > n:
         raise ValueError(f"pass@k requires k<=n, got k={k}, n={n}")
@@ -155,6 +162,19 @@ def _git_commit() -> str | None:
         return None
 
 
+def _file_sha256(path) -> str | None:
+    """sha256 of a file (the held-out level bin), so the record pins the exact eval pool and
+    verify_record.py can confirm it offline. Mirrors eval_speedrun._file_sha256."""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
 class DummyWandb:
     """No-op wandb stand-in (mirrors speedrun.py) so the train loop is wandb-agnostic."""
 
@@ -167,21 +187,159 @@ def pufferlib_root() -> Path:
     return Path(pufferlib.__file__).resolve().parent.parent
 
 
-def ensure_boxoban_extension() -> None:
-    """Validate that the external PufferLib dependency provides the Boxoban native env."""
-    try:
-        from pufferlib import _C
-    except Exception as exc:
+def _default_run_name() -> str:
+    return f"{DEFAULT_RUN_NAME_PREFIX}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+
+
+def _clear_pufferlib_modules() -> None:
+    for name in list(sys.modules):
+        if name == "pufferlib" or name.startswith("pufferlib."):
+            del sys.modules[name]
+
+
+def _pufferlib_extension_env_name() -> str | None:
+    from pufferlib import _C
+    return getattr(_C, "env_name", None)
+
+
+def _pufferlib_source_ready(path: Path) -> bool:
+    return (path / "build.sh").is_file() and (path / "ocean" / ENV_NAME / "binding.c").is_file()
+
+
+def _pufferlib_checkout_matches(path: Path) -> bool:
+    if not _pufferlib_source_ready(path):
+        return False
+    out = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"],
+                         capture_output=True, text=True, timeout=10)
+    return out.returncode == 0 and out.stdout.strip() == PUFFERLIB_COMMIT
+
+
+def _find_cached_pufferlib_checkout() -> Path | None:
+    cache_root = Path(os.environ.get("UV_CACHE_DIR", Path.home() / ".cache" / "uv")) / "git-v0" / "checkouts"
+    if not cache_root.exists():
+        return None
+    for candidate in cache_root.glob("*/*"):
+        if _pufferlib_checkout_matches(candidate):
+            return candidate
+    return None
+
+
+def _patch_pufferlib_float_build(src: Path) -> None:
+    path = src / "src" / "kernels.cu"
+    needle = """inline void cast_dispatch(precision_t* dst, const float* src, int n, cudaStream_t stream) {
+    cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(dst, src, n);
+}
+
+"""
+    guard = "#ifndef PRECISION_FLOAT\n" + needle + "#endif\n\n"
+    text = path.read_text(encoding="utf-8")
+    if guard in text:
+        return
+    if needle not in text:
+        raise SystemExit(f"Could not apply PufferLib float-build patch to {path}")
+    print(f"[setup] patching PufferLib float build in {path}", flush=True)
+    path.write_text(text.replace(needle, guard, 1), encoding="utf-8")
+
+
+def _ensure_local_pufferlib_source() -> Path:
+    src = LOCAL_PUFFERLIB_DIR.resolve()
+    if _pufferlib_checkout_matches(src):
+        _patch_pufferlib_float_build(src)
+        return src
+    if src.exists():
         raise SystemExit(
-            "PufferLib's native extension `pufferlib._C` is unavailable. "
-            "Install a PufferLib build that includes the Boxoban native environment."
-        ) from exc
-    env_name = getattr(_C, "env_name", None)
-    if env_name != ENV_NAME:
-        raise SystemExit(
-            f"PufferLib native extension is built for {env_name!r}, expected {ENV_NAME!r}. "
-            "Install a PufferLib build that includes the Boxoban native environment."
+            f"{src} exists but is not the pinned PufferLib checkout {PUFFERLIB_COMMIT}. "
+            "Remove it, or set PUFFERLIB_SRC_DIR to a checkout of the pinned commit."
         )
+    cached = _find_cached_pufferlib_checkout()
+    if cached is not None:
+        print(f"[setup] cloning cached PufferLib checkout to {src}", flush=True)
+        subprocess.run(["git", "clone", "--no-hardlinks", str(cached), str(src)], check=True)
+    else:
+        print(f"[setup] cloning PufferLib {PUFFERLIB_COMMIT[:7]} to {src}", flush=True)
+        subprocess.run(["git", "clone", PUFFERLIB_REPO_URL, str(src)], check=True)
+    subprocess.run(["git", "-C", str(src), "checkout", "--detach", PUFFERLIB_COMMIT], check=True)
+    _patch_pufferlib_float_build(src)
+    return src
+
+
+def _install_editable_pufferlib(src: Path) -> None:
+    print(f"[setup] installing editable PufferLib from {src}", flush=True)
+    uv = shutil.which("uv")
+    if uv is not None:
+        cmd = [uv, "pip", "install", "--python", sys.executable, "--no-deps", "-e", str(src)]
+    else:
+        cmd = [sys.executable, "-m", "pip", "install", "--no-deps", "-e", str(src)]
+    subprocess.run(cmd, check=True)
+    if str(src) not in sys.path:
+        sys.path.insert(0, str(src))
+    _clear_pufferlib_modules()
+
+
+def _ensure_nvidia_lib_symlink(module_name: str, link_name: str, target_name: str) -> None:
+    try:
+        mod = __import__(module_name, fromlist=["_"])
+        lib_dir = Path(next(iter(mod.__path__))) / "lib"
+    except Exception:
+        return
+    link = lib_dir / link_name
+    target = lib_dir / target_name
+    if target.exists() and not link.exists():
+        link.symlink_to(target.name)
+
+
+def _build_boxoban_extension(src: Path) -> None:
+    print(f"[setup] building PufferLib native extension: bash build.sh {ENV_NAME} --float", flush=True)
+    _ensure_nvidia_lib_symlink("nvidia.cudnn", "libcudnn.so", "libcudnn.so.9")
+    _ensure_nvidia_lib_symlink("nvidia.nccl", "libnccl.so", "libnccl.so.2")
+    env = dict(os.environ)
+    if shutil.which("ccache", path=env.get("PATH")) is None:
+        with tempfile.TemporaryDirectory(prefix="pufferlib-build-") as td:
+            shim = Path(td) / "ccache"
+            shim.write_text("#!/bin/sh\nexec \"$@\"\n", encoding="utf-8")
+            shim.chmod(0o755)
+            env["PATH"] = td + os.pathsep + env.get("PATH", "")
+            subprocess.run(["bash", "build.sh", ENV_NAME, "--float"], cwd=str(src), env=env, check=True)
+    else:
+        subprocess.run(["bash", "build.sh", ENV_NAME, "--float"], cwd=str(src), env=env, check=True)
+    _clear_pufferlib_modules()
+
+
+def ensure_boxoban_extension() -> None:
+    """Validate, and locally build if needed, the PufferLib Boxoban native env."""
+    try:
+        env_name = _pufferlib_extension_env_name()
+        if env_name == ENV_NAME and _pufferlib_source_ready(pufferlib_root()):
+            return
+        reason = f"built for {env_name!r}" if env_name != ENV_NAME else "installed wheel lacks source resources"
+    except Exception as exc:
+        reason = f"`pufferlib._C` unavailable ({exc})"
+
+    print(f"[setup] PufferLib Boxoban extension needs a local build: {reason}", flush=True)
+    src = _ensure_local_pufferlib_source()
+    _install_editable_pufferlib(src)
+    try:
+        env_name = _pufferlib_extension_env_name()
+    except Exception:
+        _build_boxoban_extension(src)
+        try:
+            env_name = _pufferlib_extension_env_name()
+        except Exception as exc:
+            raise SystemExit(
+                "PufferLib's native extension was built, but `pufferlib._C` still cannot be loaded. "
+                "Check the compiler/CUDA library output above."
+            ) from exc
+    if env_name != ENV_NAME:
+        _build_boxoban_extension(src)
+        try:
+            env_name = _pufferlib_extension_env_name()
+        except Exception as exc:
+            raise SystemExit(
+                "PufferLib's native extension was rebuilt, but `pufferlib._C` still cannot be loaded. "
+                "Check the compiler/CUDA library output above."
+            ) from exc
+    if env_name != ENV_NAME:
+        raise SystemExit(f"PufferLib native extension is built for {env_name!r}, expected {ENV_NAME!r}.")
 
 
 # ============================ official DeepMind held-out levels ==============================
@@ -704,14 +862,14 @@ class RunLogger:
     def _write(self, line):
         if self._fh is not None: self._fh.write(line + "\n"); self._fh.flush()
 
-    def log_step(self, step, num_steps, *, reward_mean, solved_frac, loss, grad_norm, cum_flops):
+    def log_step(self, step, num_steps, *, reward_mean, solved_frac, loss, grad_norm):
         rt = self.record_time()
         self._write(f"step:{step + 1}/{num_steps} record_time:{rt:.1f}s step_avg:{rt / (step + 1):.1f}s "
                     f"reward_mean:{max(0.0, reward_mean):.4f} solved_frac:{solved_frac:.4f} "
-                    f"loss:{loss:.4f} grad_norm:{grad_norm:.4f} cum_flops:{cum_flops:.6e}")
+                    f"loss:{loss:.4f} grad_norm:{grad_norm:.4f}")
 
-    def log_final_checkpoint(self, path, cum_flops):
-        self._write(f"final_checkpoint:{path} record_time:{self.record_time():.1f}s cum_flops:{cum_flops:.6e}")
+    def log_final_checkpoint(self, path):
+        self._write(f"final_checkpoint:{path} record_time:{self.record_time():.1f}s")
 
     def close(self):
         if self._fh is not None: self._fh.close(); self._fh = None
@@ -723,10 +881,10 @@ def set_seed(seed: int):
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
 
 
-def flops_per_env_step(num_params: int, replay_ratio: float) -> float:
-    """2*N for the rollout forward + 6*N per gradient pass; each collected step is replayed
-    replay_ratio times (analogous to speedrun.py's dense-model estimator)."""
-    return num_params * (2.0 + 6.0 * float(replay_ratio))
+# NOTE: no FLOPs co-metric on this track. Wall-clock (on the fixed single H100) is the sole metric.
+# A FLOPs estimate would have to be re-derived and re-validated for every new architecture — and this
+# is an OPEN-architecture track, so any estimator silently undercounts layer/op types it doesn't know
+# about, making the number unfair across entries. Env-step throughput (SPS) is logged for diagnostics.
 
 
 def train(cfg: argparse.Namespace) -> Path:
@@ -744,7 +902,6 @@ def train(cfg: argparse.Namespace) -> Path:
     optimizer = Muon(policy.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
                      momentum=cfg.beta1, eps=cfg.muon_eps)
     num_params = sum(p.numel() for p in policy.parameters())
-    fpes = flops_per_env_step(num_params, cfg.replay_ratio)
 
     wandb_run = DummyWandb()
     if cfg.wandb:
@@ -767,10 +924,9 @@ def train(cfg: argparse.Namespace) -> Path:
         stats = puff_train(policy, optimizer, obs, act, val, logp, rew, done, cfg, it, total_iters)
         elog = env.log()
         solved = float(elog.get("perf", 0.0))
-        cum_flops = fpes * global_step
         logger.log_step(it, total_iters, reward_mean=float(elog.get("targets_hit", 0.0)),
                         solved_frac=solved, loss=float(stats["policy"] + cfg.vf_coef * stats["value"]),
-                        grad_norm=float(stats["grad_norm"]), cum_flops=cum_flops)
+                        grad_norm=float(stats["grad_norm"]))
         sps = global_step / max(1e-6, logger.record_time())
         wandb_run.log({
             "train/solved_frac": solved,
@@ -779,7 +935,7 @@ def train(cfg: argparse.Namespace) -> Path:
             "loss/policy": stats["policy"], "loss/value": stats["value"], "loss/entropy": stats["entropy"],
             "loss/approx_kl": stats["approx_kl"], "loss/clipfrac": stats["clipfrac"],
             "opt/grad_norm": stats["grad_norm"], "opt/lr": optimizer.param_groups[0]["lr"],
-            "perf/sps": sps, "perf/cum_flops": cum_flops, "perf/record_time_s": logger.record_time(),
+            "perf/sps": sps, "perf/record_time_s": logger.record_time(),
             "epoch": it + 1,
         }, step=global_step)
         if it % max(1, cfg.print_every) == 0 or it == total_iters - 1:
@@ -791,7 +947,7 @@ def train(cfg: argparse.Namespace) -> Path:
 
     final_ckpt = out_dir / "final.pt"
     torch.save(policy.state_dict(), final_ckpt)
-    logger.log_final_checkpoint(final_ckpt, fpes * global_step)
+    logger.log_final_checkpoint(final_ckpt)
     logger.close(); env.close(); wandb_run.finish()
     print(f"[train] done. final checkpoint: {final_ckpt}")
     return final_ckpt
@@ -800,8 +956,15 @@ def train(cfg: argparse.Namespace) -> Path:
 # ============================ held-out evaluation ===========================================
 def evaluate(cfg: argparse.Namespace, checkpoint: Path) -> dict:
     """Roll the trained policy over the DISJOINT held-out Boxoban split; gate on solve-rate's lower
-    95% CI. The forked boxoban env reserves the last holdout_frac of the level pool for eval (never
-    sampled during training). Each episode is one attempt (k=1) -> pass@1 = solve rate."""
+    95% CI. pass@1 = mean per-level solve rate.
+
+    Disjointness (the crux of a valid record): for the default unfiltered/test the eval pool IS the
+    canonical 1000-level DeepMind *test* split, while training (difficulty=4) draws from the official
+    *train* split — disjoint by DeepMind's construction. We additionally pin the exact eval bin in the
+    record (holdout_bin_sha256 + per_puzzle_level_sha) so verify_record.py can confirm offline that
+    the eval ran on that committed pool. For procedural difficulties the forked boxoban env reserves
+    the last holdout_frac of the pool for eval (never sampled in training); in the official-split path
+    holdout_frac is unused on the eval side (the eval pool comes from the test bin, not the reserve)."""
     ensure_boxoban_extension()
     os.chdir(pufferlib_root())
     set_seed(cfg.eval_seed)
@@ -846,6 +1009,15 @@ def evaluate(cfg: argparse.Namespace, checkpoint: Path) -> dict:
     lvl_solved: dict = defaultdict(int)
     lvl_n: dict = defaultdict(int)
     total_eps = 0
+    # Greedy eval is deterministic (fp32 + recurrent state zeroed at each episode start), so every
+    # replay of a held-out level returns the SAME result: per_puzzle_solve_frac is 0/1 per level and
+    # the replays buy coverage of the level POOL (coupon-collector), not statistical samples. Once the
+    # pool is saturated — no new level for a long dry spell (4x the levels seen so far, a strong tail
+    # margin) — further episodes can change neither pass@1 nor the CI, so stop early and skip the
+    # redundant compute. Sampling eval (eval_greedy=False) keeps the full episode budget because there
+    # the replays ARE independent samples that tighten each per-level estimate.
+    deterministic = bool(cfg.eval_greedy) and not getattr(cfg, "bf16", False)
+    eps_since_new = 0
     while total_eps < cfg.eval_episodes:
         with torch.no_grad(), _amp(getattr(cfg, "bf16", False), device):
             logits, _, state = policy.forward_eval(env.obs().to(device, copy=True), state)
@@ -855,12 +1027,17 @@ def evaluate(cfg: argparse.Namespace, checkpoint: Path) -> dict:
         solved = done & (rew.to(device) > 0.5)
         idx = done.nonzero(as_tuple=True)[0]
         if idx.numel():
+            before = len(lvl_n)
             for b, s in zip(init_board[idx].cpu().numpy(), solved[idx].cpu().numpy()):
                 h = b.tobytes(); lvl_n[h] += 1; lvl_solved[h] += int(s)
-            total_eps += int(idx.numel())
+            ndone = int(idx.numel())
+            total_eps += ndone
+            eps_since_new = 0 if len(lvl_n) > before else eps_since_new + ndone
             for s_ in state:                       # reset recurrent state for finished envs
                 s_[:, idx, :] = 0.0
             init_board[idx] = env.obs().to(device, copy=True)[idx]   # new episode's start board
+            if deterministic and len(lvl_n) and eps_since_new >= max(4096, 4 * len(lvl_n)):
+                break
     env_perf = float(env.log().get("perf", float("nan")))  # PufferLib's C-aggregated solve mean (num_agents-invariant)
     env.close()
 
@@ -868,13 +1045,22 @@ def evaluate(cfg: argparse.Namespace, checkpoint: Path) -> dict:
     per_frac = [lvl_solved[h] / lvl_n[h] for h in keys]
     per_n = [lvl_n[h] for h in keys]
     per_c = [lvl_solved[h] for h in keys]
+    per_level_sha = [hashlib.sha256(h).hexdigest() for h in keys]   # board identity of each held-out level
     n = len(keys)                                  # distinct held-out levels seen
     pass_at_1 = sum(per_frac) / max(1, n)          # mean per-level solve fraction (each level weight 1)
     ci_low, ci_high = _bootstrap_ci(per_frac, seed=cfg.eval_seed)
     se = float(np.std(per_frac) / math.sqrt(max(1, n))) if n else 0.0
+    # Pin the exact eval pool so verify_record.py can confirm offline that these levels ARE the
+    # committed (canonical) test split — and warn if greedy coverage missed levels in the pool.
+    holdout_n_levels = (holdout_bin.stat().st_size // (OBS_CHANNELS * GRID * GRID + 5)) if holdout_bin else None
+    if holdout_n_levels and n < holdout_n_levels:
+        print(f"[eval] WARNING: scored {n}/{holdout_n_levels} held-out levels — pool not fully covered")
     record = {
         "seed": cfg.eval_seed, "run": cfg.run, "step": None, "checkpoint": str(checkpoint),
         "model": f"ppo-{cfg.arch}-h{cfg.hidden_size}-L{cfg.num_layers}", "eval_data": f"boxoban:{split_label}",
+        "holdout_bin": holdout_bin.name if holdout_bin else None,
+        "holdout_bin_sha256": _file_sha256(holdout_bin) if holdout_bin else None,
+        "holdout_n_levels": holdout_n_levels,
         "git_commit": _git_commit(), "n_puzzles": n, "k": int(np.median(per_n)) if n else 1,
         "pass_at_1": pass_at_1, "pass_at_k": {"1": pass_at_1},
         "solve_rate_episode": env_perf,    # PufferLib env.log()['perf'] cross-check (per-episode mean)
@@ -888,6 +1074,7 @@ def evaluate(cfg: argparse.Namespace, checkpoint: Path) -> dict:
         "per_puzzle_solve_frac": per_frac, "per_puzzle_n": per_n,
         "per_puzzle_solved_count": per_c, "per_puzzle_answered_count": per_n,
         "per_puzzle_length_trunc_count": [0] * n,
+        "per_puzzle_level_sha": per_level_sha,
     }
     out_dir = (REPO_DIR / cfg.output_dir / cfg.run).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -955,7 +1142,7 @@ def profile_run(cfg: argparse.Namespace) -> None:
 # ============================ CLI ===========================================================
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Sokoban Speedrun — non-LLM (PufferLib boxoban + in-file PuffeRL PPO)")
-    p.add_argument("--run", type=str, default=DEFAULT_RUN_NAME)
+    p.add_argument("--run", type=str, default=_default_run_name())
     p.add_argument("--output-dir", type=str, default="outputs")
     for key, val in RECIPE.items():
         flag = "--" + key.replace("_", "-")
@@ -991,6 +1178,7 @@ def main(argv: list[str] | None = None) -> None:
     cmd = [sys.executable, str(SOURCE_PATH), "--eval-only", "--eval-checkpoint", str(final_ckpt),
            "--run", cfg.run, "--difficulty", str(cfg.difficulty), "--eval-split", cfg.eval_split,
            "--eval-seed", str(cfg.eval_seed), "--eval-episodes", str(cfg.eval_episodes),
+           "--eval-greedy", "1" if cfg.eval_greedy else "0",
            "--target", str(cfg.target), "--holdout-frac", str(cfg.holdout_frac),
            "--num-agents", str(cfg.num_agents), "--max-episode-steps", str(cfg.max_episode_steps),
            "--arch", cfg.arch, "--hidden-size", str(cfg.hidden_size),

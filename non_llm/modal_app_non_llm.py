@@ -43,6 +43,19 @@ runtime_secrets = [modal.Secret.from_dict(_forward)] if _forward else []
 # clone in the image so the built pufferlib._C extension and resources/boxoban live under the same
 # root that speedrun_non_llm.pufferlib_root() resolves.
 _PYLIB = "import nvidia.{m}, os; print(os.path.join(nvidia.{m}.__path__[0], 'lib'))"
+_FLOAT_BUILD_PATCH = f"""python - <<'PY'
+from pathlib import Path
+path = Path({PUFFERLIB_DIR!r}) / "src" / "kernels.cu"
+needle = '''inline void cast_dispatch(precision_t* dst, const float* src, int n, cudaStream_t stream) {{
+    cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(dst, src, n);
+}}
+
+'''
+guard = "#ifndef PRECISION_FLOAT\\n" + needle + "#endif\\n\\n"
+text = path.read_text(encoding="utf-8")
+if guard not in text:
+    path.write_text(text.replace(needle, guard, 1), encoding="utf-8")
+PY"""
 image = (
     modal.Image.from_registry("nvidia/cuda:12.6.2-devel-ubuntu22.04", add_python="3.12")
     .apt_install("clang", "libomp-dev", "git", "build-essential", "curl", "ca-certificates", "unzip", "ccache")
@@ -55,6 +68,7 @@ image = (
         f"python -m pip install -e {PUFFERLIB_DIR}",
         f"ln -sf libcudnn.so.9 $(python -c \"{_PYLIB.format(m='cudnn')}\")/libcudnn.so",
         f"ln -sf libnccl.so.2 $(python -c \"{_PYLIB.format(m='nccl')}\")/libnccl.so",
+        _FLOAT_BUILD_PATCH,
         f"cd {PUFFERLIB_DIR} && NVCC_ARCH={NVCC_ARCH} bash build.sh boxoban --float",
     )
     .add_local_python_source("speedrun_non_llm")

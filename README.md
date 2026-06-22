@@ -51,9 +51,9 @@ EVAL_CHECKPOINT=latest uv run modal run modal_app.py
 ### World record history
 
 
-| #   | Record time (mm:ss) | FLOPs        | Description     | Date       | Log                                                                     | held-out pass@1         | Contributors |
-| --- | ------------------- | ------------ | --------------- | ---------- | ----------------------------------------------------------------------- | ----------------------- | ------------ |
-| 1   | 19:36               | 1.550943e+16 | cnn-mingru h256 | 2026-06-21 | [non_llm/records/2026-06-21_01](non_llm/records/2026-06-21_01_non_llm/) | 0.728 (CI [0.70, 0.75]) | @JeanKaddour |
+| #   | Record time (mm:ss) | Description     | Date       | Log                                                                     | held-out pass@1         | Contributors |
+| --- | ------------------- | --------------- | ---------- | ----------------------------------------------------------------------- | ----------------------- | ------------ |
+| 1   | 19:36               | cnn-mingru h256 | 2026-06-21 | [non_llm/records/2026-06-21_01](non_llm/records/2026-06-21_01_non_llm/) | 0.728 (CI [0.70, 0.75]) | @JeanKaddour |
 
 
 ### Rules
@@ -61,9 +61,10 @@ EVAL_CHECKPOINT=latest uv run modal run modal_app.py
 Fastest wall-clock run wins: one run on one node, from training step 1 through the first checkpoint whose held-out CI clears the target.
 
 - **Target:** lower 95% CI on held-out Boxoban solve-rate > **0.70**.
-- **Eval:** official [DeepMind Boxoban](https://github.com/google-deepmind/boxoban-levels) held-out splits (per-level scoring); default `unfiltered/test`.
+- **Eval:** official [DeepMind Boxoban](https://github.com/google-deepmind/boxoban-levels) held-out splits (per-level greedy scoring); default `unfiltered/test`.
+- **Disjointness:** training draws only from the official `unfiltered/train` split; eval uses the disjoint `unfiltered/test`. The eval bin's sha256 and every scored level are pinned in the record so `verify_record.py` confirms the eval pool offline.
 - **Open:** policy architecture, RL algorithm, optimizer, schedules, implementation.
-- **Verification:** maintainers rerun at a second seed; both runs must clear the target.
+- **Verification:** `verify_record.py` re-derives pass@1/CI; maintainers also rerun at a second seed. Both runs must clear the target.
 
 ### Running
 

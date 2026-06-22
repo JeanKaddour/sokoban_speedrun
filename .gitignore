@@ -224,6 +224,7 @@ outputs/
 wandb/
 reports/
 /non_llm/resources/
+/non_llm/.pufferlib-src/
 
 # Reference papers / scratch notes (kept locally, not tracked)
 *.pdf
