@@ -25,9 +25,25 @@ import modal
 APP_NAME = "sokoban-non-llm"
 VOLUME_NAME = "nanochat-rl-hf"          # share the LLM track's volume so records sit side by side
 VOLUME_MOUNT_PATH = "/vol"
-GPU_TYPE = os.environ.get("GPU_TYPE", "H100")
+
+
+def _strict_h100_type(raw: str) -> str:
+    # Modal's plain H100 request can auto-upgrade to H200; H100! opts out for benchmark runs.
+    gpu_type = raw.strip()
+    if gpu_type == "H100":
+        return "H100!"
+    if gpu_type != "H100!":
+        raise ValueError(
+            "Non-LLM record runs must use Modal gpu='H100!' so they cannot be auto-upgraded. "
+            f"Got GPU_TYPE={raw!r}."
+        )
+    return gpu_type
+
+
+GPU_TYPE = _strict_h100_type(os.environ.get("GPU_TYPE", "H100!"))
 NUM_GPUS = int(os.environ.get("NUM_GPUS", "1"))
-NVCC_ARCH = os.environ.get("NVCC_ARCH", "sm_90")  # H100; override for other Modal GPU types.
+GPU_CONFIG = f"{GPU_TYPE}:{NUM_GPUS}"
+NVCC_ARCH = os.environ.get("NVCC_ARCH", "sm_90")  # H100.
 PUFFERLIB_REPO = "https://github.com/JeanKaddour/PufferLib.git"
 PUFFERLIB_REF = "e90b58e"
 PUFFERLIB_DIR = "/opt/PufferLib"
@@ -97,7 +113,7 @@ def _run(extra_args: list[str]) -> None:
     volume.commit()
 
 
-@app.function(image=image, gpu=f"{GPU_TYPE}:{NUM_GPUS}", timeout=24 * 60 * 60,
+@app.function(image=image, gpu=GPU_CONFIG, timeout=24 * 60 * 60,
               volumes={VOLUME_MOUNT_PATH: volume}, secrets=runtime_secrets)
 def train(run_name: str | None, difficulty: int | None, total_timesteps: int | None, target: float | None,
           holdout_frac: float | None, extra_args: list[str] | None = None) -> None:
@@ -116,7 +132,7 @@ def train(run_name: str | None, difficulty: int | None, total_timesteps: int | N
     _run(args)
 
 
-@app.function(image=image, gpu=f"{GPU_TYPE}:{NUM_GPUS}", timeout=6 * 60 * 60,
+@app.function(image=image, gpu=GPU_CONFIG, timeout=6 * 60 * 60,
               volumes={VOLUME_MOUNT_PATH: volume}, secrets=runtime_secrets)
 def evaluate(checkpoint: str, run_name: str | None, difficulty: int | None, eval_episodes: int | None,
              target: float | None, holdout_frac: float | None, extra_args: list[str] | None = None) -> None:
@@ -135,14 +151,14 @@ def evaluate(checkpoint: str, run_name: str | None, difficulty: int | None, eval
     _run(args)
 
 
-@app.function(image=image, gpu=f"{GPU_TYPE}:{NUM_GPUS}", timeout=30 * 60, volumes={VOLUME_MOUNT_PATH: volume})
+@app.function(image=image, gpu=GPU_CONFIG, timeout=30 * 60, volumes={VOLUME_MOUNT_PATH: volume})
 def profile(extra_args: list[str]) -> None:
     for bf in ("0", "1"):                                  # fp32(TF32) vs bf16, same container/GPU
         print(f"\n================ PROFILE bf16={bf} ================", flush=True)
         _run(["--profile", "--bf16", bf, *extra_args])
 
 
-@app.function(image=image, gpu=f"{GPU_TYPE}:{NUM_GPUS}", timeout=30 * 60, volumes={VOLUME_MOUNT_PATH: volume})
+@app.function(image=image, gpu=GPU_CONFIG, timeout=30 * 60, volumes={VOLUME_MOUNT_PATH: volume})
 def smoke(run_name: str | None, total_timesteps: int, extra_args: list[str]) -> None:
     # short train (no eval) to measure real-loop SPS on the GPU
     args = ["--no-eval", "--total-timesteps", str(total_timesteps), *extra_args]

@@ -42,8 +42,22 @@ CPU_REQUEST = float(os.environ.get("CPU_REQUEST", "16"))
 # generators) — the confirmed sweet spot (generation keeps the async buffer full at gen-wait ~3s
 # while the trainer is compute-bound at ~35s/step; nt4 drops to 4 generators and goes gen-bound).
 # A smaller NUM_GPUS (e.g. 4) just changes the split and defaults NTRAINERS to 1.
-GPU_TYPE = os.environ.get("GPU_TYPE", "H100")
+def _strict_h100_type(raw: str) -> str:
+    # Modal's plain H100 request can auto-upgrade to H200; H100! opts out for benchmark runs.
+    gpu_type = raw.strip()
+    if gpu_type == "H100":
+        return "H100!"
+    if gpu_type != "H100!":
+        raise ValueError(
+            "LLM record runs must use Modal gpu='H100!' so they cannot be auto-upgraded. "
+            f"Got GPU_TYPE={raw!r}."
+        )
+    return gpu_type
+
+
+GPU_TYPE = _strict_h100_type(os.environ.get("GPU_TYPE", "H100!"))
 NUM_GPUS = int(os.environ.get("NUM_GPUS", os.environ.get("NODE_GPUS", "8")))
+GPU_CONFIG = f"{GPU_TYPE}:{NUM_GPUS}"
 
 # One-hour target recipe. Keep the ScaleRL-ish optimizer hparams, but use a benchmark-defined
 # non-trivial 1-box train/eval split and avoid debug/measurement I/O that slows the sprint.
@@ -256,7 +270,7 @@ def _periodic_volume_commits(interval_s: float):
 
 @app.function(
     image=image,
-    gpu=f"{GPU_TYPE}:{NUM_GPUS}",
+    gpu=GPU_CONFIG,
     cpu=CPU_REQUEST,
     timeout=24 * 60 * 60,
     volumes={VOLUME_MOUNT_PATH: volume},
@@ -402,7 +416,7 @@ def eval_commands(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds
 
 @app.function(
     image=image,
-    gpu=f"{GPU_TYPE}:{NUM_GPUS}",
+    gpu=GPU_CONFIG,
     cpu=CPU_REQUEST,
     timeout=6 * 60 * 60,
     volumes={VOLUME_MOUNT_PATH: volume},
@@ -454,7 +468,7 @@ def evaluate(checkpoint: str, run_name: str, k: int, eval_limit: int, seeds: str
 
 @app.function(
     image=image,
-    gpu=f"{GPU_TYPE}:{NUM_GPUS}",
+    gpu=GPU_CONFIG,
     cpu=CPU_REQUEST,
     timeout=6 * 60 * 60,
     volumes={VOLUME_MOUNT_PATH: volume},
