@@ -869,12 +869,26 @@ async def _drain_prompts(engine, prompt_q, result_q, state, inflight: int):
             await asyncio.sleep(0.02)
 
 
+# The vLLM generator frontend accumulates a large heap (model + per-step request/output objects).
+# Python's gen-2 GC does GIL-held full-heap scans that freeze this process and stall the per-step
+# weight-sync; their cost scales with host memory latency, so on a contended Modal node they reach
+# multiple seconds and dominate the wall-clock variance (vLLM freezes GC in its EngineCore workers
+# but not this frontend). Fix: disable automatic GC here and reclaim cyclic garbage with a manual
+# collect every N weight-syncs, run off the latency-critical path. See
+# reports/modal-wallclock-gc-stall.md. Set to 0 to leave GC untouched.
+GENERATOR_GC_COLLECT_EVERY = int(os.environ.get("GENERATOR_GC_COLLECT_EVERY", "4"))
+
+
 async def _handle_control(engine, control_q, status_q, state):
+    import gc
     from vllm.distributed.weight_transfer.base import WeightTransferInitRequest, WeightTransferUpdateRequest
     from vllm.distributed.weight_transfer.nccl_engine import (
         NCCLWeightTransferInitInfo,
         NCCLWeightTransferUpdateInfo,
     )
+
+    if GENERATOR_GC_COLLECT_EVERY:
+        gc.disable()  # reclaim happens in the MSG_SYNC_WEIGHTS handler below
 
     while not state["stop"]:
         msg = await asyncio.to_thread(_safe_get, control_q)
@@ -918,6 +932,12 @@ async def _handle_control(engine, control_q, status_q, state):
             state["weight_version"] = msg["version"]
             state["paused"] = False
             status_q.put({"type": MSG_WEIGHTS_READY, "version": msg["version"]})
+            if GENERATOR_GC_COLLECT_EVERY and msg["version"] % GENERATOR_GC_COLLECT_EVERY == 0:
+                # Reclaim cyclic garbage off the rendezvous: yield first so the status-queue feeder
+                # thread flushes MSG_WEIGHTS_READY before gc.collect() grabs the GIL (~1.5s); the
+                # collect then lands in the trainer's compute window, absorbed by the rollout buffer.
+                await asyncio.sleep(0.05)
+                gc.collect()
 
 
 async def _child_main_async(cfg, prompt_q, result_q, control_q, status_q):
@@ -1542,6 +1562,11 @@ def trim_generated_with_logprobs_and_text(
         return sequence, behavior_logprobs, loss_mask, full_text, None
     target_text = full_text[:answer_end]
     target_len = len(target_text)
+    if answer_end >= len(full_text):
+        # The answer ends at the decoded text's end, so the binary search below would converge to
+        # the full sequence: trimming is a no-op. Skip it (~45% of samples, behavior-identical).
+        # Avoids ~12 prefix re-decodes per sample. See reports/modal-wallclock-gc-stall.md.
+        return sequence, behavior_logprobs, loss_mask, full_text, moves
 
     # Decode is prefix-preserving on standard tokenizers: len(decode([:end])) is non-decreasing
     # in `end`, so binary-search the smallest token end that covers the answer marker.
