@@ -1,4 +1,0 @@
-1.250837e+18
-# FLOPs for record (seed 43): sum of per-step perf_est/total_flops over all 75 steps to
-# the final checkpoint, from W&B run jeankaddour/nanochat-rl-hf/nl0e8dyy. The dense
-# approximation 6*N*train_tokens + 2*N*rollout_tokens, logged per-step (no inline cum_flops).

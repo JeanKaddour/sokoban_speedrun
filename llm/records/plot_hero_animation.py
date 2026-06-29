@@ -7,7 +7,7 @@ Usage:
         python records/plot_hero_animation.py
 
     # or pin a specific record dir:
-    uv run ... python records/plot_hero_animation.py records/2026-06-17_01_grpo \
+        uv run ... python records/plot_hero_animation.py records/2026-06-29_01_grpo \
         --wandb-runs entity/project/run_id
 
     # dump a single still (for eyeballing the composition) instead of the GIF:

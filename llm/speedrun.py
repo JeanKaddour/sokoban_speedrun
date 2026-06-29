@@ -36,6 +36,7 @@ IGNORE_INDEX = -100
 # the env override supports other box sizes (e.g. NODE_GPUS=8). modal_app.py bakes the launch-time
 # GPU allocation into the container env so this always matches the GPUs actually present.
 NODE_GPUS = int(os.environ.get("NODE_GPUS", "4"))
+GENERATOR_GC_COLLECT_EVERY = 4
 # Interruption-based length control (ScaleRL A.10): appended to a still-thinking rollout that hit the
 # generation cap, to force it to stop reasoning and emit a final answer instead of hard-truncating to 0.
 # Ends with the OPEN <answer> tag: without it, models spend the whole forced-answer budget on a prose
@@ -869,12 +870,28 @@ async def _drain_prompts(engine, prompt_q, result_q, state, inflight: int):
             await asyncio.sleep(0.02)
 
 
+def _has_decoded_trailing_token(tokenizer, generated_ids: list[int], target_len: int) -> bool:
+    """True when the last generated token contributes decoded text beyond target_len.
+
+    tokenizers.decode(..., skip_special_tokens=True) can hide trailing special tokens. In that case
+    the answer may end at the decoded-text boundary while the token sequence still has extra tokens
+    that the old trim path would remove.
+    """
+    if not generated_ids:
+        return False
+    return len(tokenizer.decode(generated_ids[:-1], skip_special_tokens=True)) < target_len
+
+
 async def _handle_control(engine, control_q, status_q, state):
+    import gc
     from vllm.distributed.weight_transfer.base import WeightTransferInitRequest, WeightTransferUpdateRequest
     from vllm.distributed.weight_transfer.nccl_engine import (
         NCCLWeightTransferInitInfo,
         NCCLWeightTransferUpdateInfo,
     )
+
+    if GENERATOR_GC_COLLECT_EVERY:
+        gc.disable()  # reclaim happens in the MSG_SYNC_WEIGHTS handler below
 
     while not state["stop"]:
         msg = await asyncio.to_thread(_safe_get, control_q)
@@ -918,6 +935,12 @@ async def _handle_control(engine, control_q, status_q, state):
             state["weight_version"] = msg["version"]
             state["paused"] = False
             status_q.put({"type": MSG_WEIGHTS_READY, "version": msg["version"]})
+            if GENERATOR_GC_COLLECT_EVERY and msg["version"] % GENERATOR_GC_COLLECT_EVERY == 0:
+                # Reclaim cyclic garbage off the rendezvous: yield first so the status-queue feeder
+                # thread flushes MSG_WEIGHTS_READY before gc.collect() grabs the GIL (~1.5s); the
+                # collect then lands in the trainer's compute window, absorbed by the rollout buffer.
+                await asyncio.sleep(0.05)
+                gc.collect()
 
 
 async def _child_main_async(cfg, prompt_q, result_q, control_q, status_q):
@@ -1542,6 +1565,12 @@ def trim_generated_with_logprobs_and_text(
         return sequence, behavior_logprobs, loss_mask, full_text, None
     target_text = full_text[:answer_end]
     target_len = len(target_text)
+    if answer_end >= len(full_text) and _has_decoded_trailing_token(tokenizer, generated_ids, target_len):
+        # The answer ends at the decoded text's end, so the binary search below would converge to
+        # the full sequence: trimming is a no-op. Skip it (~45% of samples). The trailing-token
+        # guard preserves old behavior when the sequence ends with skip_special_tokens-hidden IDs.
+        # Avoids ~12 prefix re-decodes per sample. See reports/modal-wallclock-gc-stall.md.
+        return sequence, behavior_logprobs, loss_mask, full_text, moves
 
     # Decode is prefix-preserving on standard tokenizers: len(decode([:end])) is non-decreasing
     # in `end`, so binary-search the smallest token end that covers the answer marker.
@@ -2202,6 +2231,7 @@ class RunLogger:
             except Exception:
                 env_lines.append(f"{pkg}: unknown")
         env_lines.append(f"git commit: {_git_commit()}")
+        env_lines.append(f"GENERATOR_GC_COLLECT_EVERY: {GENERATOR_GC_COLLECT_EVERY}")
         if source_sha256:
             env_lines.append(f"source snapshot: source/speedrun.py sha256:{source_sha256}")
         else:
@@ -2556,6 +2586,7 @@ def run_pipeline(
             f"Interruption-based length control ON: marker={len(interrupt_marker_ids)} tok, "
             f"phase-1 budget={phase1_desc}, answer budget={args.interrupt_answer_tokens}"
         )
+    print0(f"Generator GC collect cadence: every {GENERATOR_GC_COLLECT_EVERY} weight-syncs")
     wandb_run = DummyWandb()
     model_perf_info = None
     run_logger = RunLogger(run_dir=run_dir, args=args, enabled=master_process)
