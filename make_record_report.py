@@ -681,6 +681,65 @@ def make_leaderboard() -> None:
         plot_leaderboard(TRACKS[track])
 
 
+def _track_path_prefix(track: str) -> str:
+    """Repo-relative dir for a track ('llm' / 'non_llm') — note the TRACKS key is 'non-llm'."""
+    return "non_llm" if track == "non-llm" else "llm"
+
+
+def update_leaderboard_row(record_dir: Path, track: str) -> None:
+    """Insert (or refresh) this record's row in the README world-record table, then redraw the
+    figures. The derived columns (record time, date, log link, pass@1/CI) are read from the
+    record's own artifacts; Description and Contributors are human-authored, so a new row gets
+    placeholders to fill in and an existing row keeps whatever is already there."""
+    rec = load_record(record_dir)
+    seed = sorted(rec["logs"])[0]
+    s = int(rec["logs"][seed]["final_time_s"])
+    # Match each track's table header: LLM shows h:mm:ss (hour even when 0), non-LLM shows mm:ss.
+    clock = fmt_clock(s) if track == "non-llm" else f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}"
+    ev = rec["evals"][sorted(rec["evals"])[0]]
+    acc = f"{ev['pass_at_1']:.3f} (CI [{ev['ci_low']:.2f}, {ev['ci_high']:.2f}])"
+
+    name = record_dir.name                                     # e.g. 2026-06-29_01_grpo
+    m = re.match(r"(\d{4}-\d{2}-\d{2})_(\d+)", name)
+    date = m.group(1) if m else "<date>"
+    label = f"{m.group(1)}_{m.group(2)}" if m else name        # 2026-06-29_01 (drops the name suffix)
+    prefix = _track_path_prefix(track)
+    link = f"[{prefix}/records/{label}]({prefix}/records/{name}/)"
+
+    section = TRACKS[track]["lb_section"]                       # "LLM Track" / "Non-LLM Track"
+    readme = REPO_ROOT / "README.md"
+    lines = readme.read_text().splitlines()
+
+    # The section's data rows run from its `## <section>` heading to the next `## ` heading.
+    start = next((i for i, ln in enumerate(lines) if ln.strip() == f"## {section}"), None)
+    if start is None:
+        raise SystemExit(f"README.md has no '## {section}' section to update")
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+    data_rows = [i for i in range(start, end) if re.match(r"\|\s*\d+\s*\|", lines[i])]
+    cells = lambda i: [c.strip() for c in lines[i].strip().strip("|").split("|")]
+
+    existing = next((i for i in data_rows if name in cells(i)[4]), None)
+    if existing is not None:
+        c = cells(existing)
+        new = [c[0], clock, c[2], date, link, acc, c[6]]       # keep human-authored Description + Contributors
+        if new == c:
+            print(f"leaderboard: row #{c[0]} for {name} already current")
+        else:
+            lines[existing] = "| " + " | ".join(new) + " |"
+            print(f"leaderboard: refreshed row #{c[0]} for {name}")
+    else:
+        num = max((int(cells(i)[0]) for i in data_rows), default=0) + 1
+        desc, contrib = "<describe: algorithm, key hparams, steps>", "@you"
+        row = f"| {num} | {clock} | {desc} | {date} | {link} | {acc} | {contrib} |"
+        after = data_rows[-1] if data_rows else next(
+            i for i in range(start, end) if re.match(r"\|\s*-+\s*\|", lines[i]))
+        lines.insert(after + 1, row)
+        print(f"leaderboard: added row #{num} for {name} — fill in Description + Contributors in README.md")
+
+    readme.write_text("\n".join(lines) + "\n")
+    make_leaderboard()
+
+
 def source_block(record_dir: Path, source_rows: list[dict], script: str = "speedrun.py") -> list[str]:
     if not source_rows:
         return []
@@ -794,6 +853,9 @@ def main() -> None:
                     help="record dir to report on (omit with --leaderboard)")
     ap.add_argument("--leaderboard", action="store_true",
                     help="regenerate the README world-record figures (assets/*.png) from the leaderboard tables, then exit")
+    ap.add_argument("--update-leaderboard", action="store_true",
+                    help="after writing the per-record report, insert/refresh this record's row in the "
+                         "README world-record table and redraw the figures (Description/Contributors left for you)")
     ap.add_argument("--wandb-runs", default=None,
                     help="comma-separated entity/project/run_id list, one per seed, ordered like the seed files")
     ap.add_argument("--prev", type=Path, default=None, help="previous record dir for the config diff")
@@ -834,6 +896,9 @@ def main() -> None:
     write_readme(args.record_dir,
                  auto_block(record, args.record_dir, target, args.prev, source_rows, track=track))
     print(f"wrote {plots}/*.png (incl. hero.png) and updated {args.record_dir / 'README.md'}")
+
+    if args.update_leaderboard:
+        update_leaderboard_row(args.record_dir, track)
 
 
 if __name__ == "__main__":
