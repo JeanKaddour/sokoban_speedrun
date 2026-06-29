@@ -233,6 +233,10 @@ reports/
 /llm/records/hero_tweet.mp4
 /llm/records/hero_twitter.gif
 
+# Deprecated LLM-track hero animation (kept locally, no longer in the official repo)
+/llm/records/plot_hero_animation.py
+/llm/records/hero.gif
+
 # Reference papers / scratch notes (kept locally, not tracked)
 *.pdf
 scaleRL.md
