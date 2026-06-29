@@ -267,23 +267,11 @@ def main() -> int:
     # lower 95% bootstrap CI (single-seed protocol; no cross-seed averaging).
     print(f"\n=== Gate: each run's lower 95% CI > {args.target} ===")
 
-    def flops_to_target(label: str, sl: str) -> str:
-        # FLOPs-to-target is a node-invariant co-record (ranked, not a pass/fail gate); print it
-        # for the record, parsing the run log if present. Older logs predate cum_flops -> "—".
-        base = args.record_dir / "verification" if label == "verification" else args.record_dir
-        logs = sorted(base.glob(f"train_log_{sl}.txt")) or sorted(base.glob("train_log_seed*.txt"))
-        try:
-            from make_record_report import fmt_flops, parse_train_log
-            return fmt_flops(parse_train_log(logs[0]).get("final_flops")) if logs else "—"
-        except Exception:
-            return "—"
-
     def gate(label: str, runs: list) -> None:
         for sl, r in runs:
             ok = r["ci_low"] > args.target
             print(f"  {label} {sl}: pass@1 {r['pass_at_1']:.4f}, ci_low {r['ci_low']:.4f} "
-                  f"(target {args.target}) — {'CLEARS' if ok else 'DOES NOT CLEAR'} "
-                  f"| FLOPs {flops_to_target(label, sl)}")
+                  f"(target {args.target}) — {'CLEARS' if ok else 'DOES NOT CLEAR'}")
             fails.check(ok, f"{label} {sl} ci_low {r['ci_low']:.4f} does not clear {args.target}")
 
     gate("submission", submission)

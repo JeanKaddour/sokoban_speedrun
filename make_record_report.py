@@ -520,12 +520,18 @@ TRACKS = {
     "llm": {
         "target": 0.80,
         "script": "speedrun.py",
-        "show_flops": True,
+        "show_flops": False,
         "reproduce": [
-            "# train (recipe defaults live in speedrun.py RECIPE + modal_app.py)",
-            "MAX_STEPS=<steps> RUN_NAME=<run> uv run modal run --detach modal_app.py",
+            "# train on one 8xH100 node (recipe defaults live in speedrun.py RECIPE)",
+            "NODE_GPUS=8 uv run torchrun --standalone --nproc_per_node=3 -m speedrun -- "
+            "--run <run> --max-steps 75 --loss-fn grpo --seed <seed> --lr-decay-steps 75",
             "# eval the final checkpoint under the leaderboard protocol, then verify offline",
-            "EVAL_CHECKPOINT=/vol/outputs/<run>/step_<final> uv run modal run modal_app.py",
+            "uv run python -m eval_speedrun --run <run>-final-eval "
+            "--eval-checkpoint outputs/<run>/step_<final> --eval-k 8 --eval-seed 12345 "
+            "--eval-limit 0 --eval-max-tokens 12288 --eval-max-model-len 16384 "
+            "--eval-interruption --eval-interrupt-answer-tokens 512 --eval-vllm-dp 8 "
+            "--eval-gpu-mem-util 0.9 --eval-vllm-max-num-batched-tokens 40960 "
+            "--eval-vllm-max-num-seqs 32 --eval-concurrency 32",
         ],
         "verify": ["uv run python verify_record.py {record}"],
     },
@@ -605,7 +611,7 @@ def auto_block(record: dict, record_dir: Path, target: float, prev_dir: Path | N
     lines += ["## Config", "", "| arg | value |", "|---|---|"]
     lines += [f"| `{k}` | `{args[k]}` |" for k in HEADLINE_ARGS if k in args]
     if prev_dir is not None:
-        prev_logs = sorted(prev_dir.glob("train_log_seed*.txt"))
+        prev_logs = train_log_paths(prev_dir)
         if prev_logs:
             prev_args = parse_train_log(prev_logs[0])["args"]
             diffs = [(k, prev_args.get(k, "—"), args[k]) for k in sorted(args)
