@@ -91,7 +91,7 @@ Each track's `assemble_record.sh` ([`llm/`](llm/assemble_record.sh), [`non_llm/`
 *Optional:* verify it yourself with a second seed (otherwise the maintainers do; either way both seeds must clear the target), assembled into the record's `verification/` subdir:
 
 ```bash
-RUN=<VRUN> TRAIN_SEED=<vseed> VERIFY_OF=records/<date>_01_<name> VERIFIER="@you  PR#<n>" ./assemble_record.sh
+RUN=<VRUN> VERIFY_OF=records/<date>_01_<name> ./assemble_record.sh
 ```
 
 The top-level `speedrun.py` files always hold the current record's recipe.

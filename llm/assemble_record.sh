@@ -16,8 +16,8 @@
 #
 # VERIFICATION (an independent rerun, dropped into the record's verification/ subdir — run a SECOND
 # training+eval with a different seed first, then):
-#   RUN=<VRUN> TRAIN_SEED=<vseed> VERIFY_OF=records/<date>_01_<name> \
-#       VERIFIER="@maintainer  PR#12" ./assemble_record.sh
+#   RUN=<VRUN> VERIFY_OF=records/<date>_01_<name> ./assemble_record.sh
+#   (seed is read from the run log; add VERIFIER="@me  PR#12" to attribute, or TRAIN_SEED= to override)
 #
 # Collects only the record artifacts (not the multi-GB checkpoint), including the source snapshot
 # when present, renames to the seed convention, then regenerates the record report + verifies
@@ -26,7 +26,7 @@
 set -euo pipefail
 
 RUN="${RUN:?set RUN to the run name (local outputs/<RUN>/, or outputs/<RUN>/ on the volume with SOURCE=modal)}"
-TRAIN_SEED="${TRAIN_SEED:-42}"   # labels the record files; the documented command's default seed
+TRAIN_SEED="${TRAIN_SEED:-}"     # file label; auto-derived from the run log's args if unset
 EVAL_SEED="${EVAL_SEED:-12345}"  # pinned eval sampling seed (the JSON's sampling.seed / "seed")
 STEP="${STEP:-}"                 # optional eval checkpoint step; inferred from eval artifacts if unset
 SOURCE="${SOURCE:-local}"        # local | modal — where the run artifacts live
@@ -151,6 +151,18 @@ else
   fi
 fi
 
+# Label files with the run's actual training seed (from the log's args attestation) unless TRAIN_SEED
+# was set explicitly. Verification just needs a different seed than the submission — no flag required.
+if [ -z "$TRAIN_SEED" ]; then
+  TRAIN_SEED="$(grep -m1 '^args: {' "$stage/$log_name" | grep -oE "'seed': *[0-9]+" | grep -oE '[0-9]+' || true)"
+  if [ -n "$TRAIN_SEED" ]; then
+    echo ">> train seed (from log args): $TRAIN_SEED"
+  else
+    TRAIN_SEED=42
+    echo ">> WARN: no seed in $log_name args; labeling files seed $TRAIN_SEED (override with TRAIN_SEED=)"
+  fi
+fi
+
 mkdir -p "$DEST"
 cp "$stage/$log_name"  "$DEST/train_log_seed${TRAIN_SEED}.txt"
 cp "$stage/$eval_json" "$DEST/eval_seed${TRAIN_SEED}.json"
@@ -196,6 +208,6 @@ if [ -n "$VERIFY_OF" ]; then
 else
   echo ">> DONE. Leaderboard row added + figures redrawn. Next:"
   echo "   1) fill in the new row's Description + Contributors in README.md"
-  echo "   2) run a verification rerun (different seed): RUN=<VRUN> TRAIN_SEED=<vseed> VERIFY_OF=$DEST ..."
+  echo "   2) run a verification rerun (different seed): RUN=<VRUN> VERIFY_OF=$DEST ./assemble_record.sh"
   echo "   3) remove any superseded record dir, then open the PR"
 fi
