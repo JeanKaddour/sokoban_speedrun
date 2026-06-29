@@ -17,7 +17,7 @@ dependencies = [
     "wandb>=0.17.0",
 ]
 
-# This repo is a set of standalone scripts (speedrun_non_llm.py, modal_app_non_llm.py),
+# This repo is a set of standalone scripts (speedrun.py, modal_app_non_llm.py),
 # not an installable package: uv only manages the dependency environment.
 [tool.uv]
 package = false

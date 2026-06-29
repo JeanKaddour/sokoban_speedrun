@@ -7,7 +7,7 @@ held-out Sokoban solve-rate whose lower 95% CI clears a threshold.
 Quickstart (local; see README.md):
 
     uv sync
-    uv run python speedrun_non_llm.py
+    uv run python speedrun.py
 
 Boxoban obs is a 4x10x10 byte grid (channels: agent, walls, boxes, targets); actions are
 {noop,down,up,left,right}. Solved == every box on a target. difficulty 0=basic..4=unfiltered.
@@ -623,7 +623,7 @@ class BoxobanVecEnv:
         from pufferlib import pufferl, _C
         assert getattr(_C, "env_name", None) == ENV_NAME, (
             f"_C built for {getattr(_C, 'env_name', None)!r}, not {ENV_NAME!r}. "
-            "Run `uv run python speedrun_non_llm.py` from non_llm/ to rebuild the local extension.")
+            "Run `uv run python speedrun.py` from non_llm/ to rebuild the local extension.")
         saved = sys.argv
         sys.argv = [saved[0]]
         try:
@@ -825,11 +825,12 @@ class RunLogger:
     @staticmethod
     def _save_source_snapshot(run_dir: Path, source: str) -> str:
         sd = run_dir / "source"; sd.mkdir(parents=True, exist_ok=True)
-        (sd / "speedrun_non_llm.py").write_text(source, encoding="utf-8")
+        name = SOURCE_PATH.name  # track the recipe filename so the snapshot can't drift on rename
+        (sd / name).write_text(source, encoding="utf-8")
         sha = hashlib.sha256(source.encode("utf-8")).hexdigest()
         (sd / "manifest.json").write_text(json.dumps(
             {"version": 1, "git_commit": _git_commit(), "source_file": str(SOURCE_PATH),
-             "files": {"speedrun_non_llm.py": {"sha256": sha, "bytes": len(source.encode())}}},
+             "files": {name: {"sha256": sha, "bytes": len(source.encode())}}},
             indent=2) + "\n", encoding="utf-8")
         return sha
 
@@ -842,7 +843,7 @@ class RunLogger:
         except Exception:
             lines.append("pufferlib: unknown")
         lines.append(f"git commit: {_git_commit()}")
-        lines.append(f"source snapshot: source/speedrun_non_llm.py sha256:{sha}")
+        lines.append(f"source snapshot: source/{SOURCE_PATH.name} sha256:{sha}")
         try:
             smi = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=10)
             lines.append(smi.stdout if smi.returncode == 0 else f"nvidia-smi failed: {smi.stderr}")

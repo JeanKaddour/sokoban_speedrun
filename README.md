@@ -12,6 +12,7 @@ Fastest recipes to RL models to solve Sokoban to a held-out target on one node:
 
 ### World record history
 
+![LLM track world records — held-out pass@1 vs wall-clock time to target](assets/llm_records.png)
 
 | #   | Record time (h:mm:ss) | Description                        | Date       | Log                                                          | held-out pass@1         | Contributors |
 | --- | --------------------- | ---------------------------------- | ---------- | ------------------------------------------------------------ | ----------------------- | ------------ |
@@ -48,6 +49,7 @@ EVAL_CHECKPOINT=latest uv run modal run modal_app.py
 
 ### World record history
 
+![Non-LLM track world records — held-out solve-rate vs wall-clock time to target](assets/non_llm_records.png)
 
 | #   | Record time (mm:ss) | Description     | Date       | Log                                                                     | held-out pass@1         | Contributors |
 | --- | ------------------- | --------------- | ---------- | ----------------------------------------------------------------------- | ----------------------- | ------------ |
@@ -69,7 +71,7 @@ Fastest wall-clock run wins: one run on a single **1×H100** node, from training
 ```bash
 cd non_llm
 uv sync
-uv run python speedrun_non_llm.py
+uv run python speedrun.py
 uv run modal run --detach modal_app_non_llm.py
 ```
 
@@ -93,6 +95,9 @@ uv run python ../make_record_report.py records/<your-dir>
 ```
 
 3. Open a PR adding the record dir + a row in the matching track's world record history. CI runs the track's verifier.
+4. Refresh the leaderboard figures (they read the tables above): `python make_record_report.py --leaderboard`.
+
+The top-level recipe files ([`llm/speedrun.py`](llm/speedrun.py) and [`non_llm/speedrun.py`](non_llm/speedrun.py)) always pin the current record's code. Assembling a submission (`assemble_record.sh`) overwrites the matching file with the exact source that produced the run, so the recipe change lands in your PR diff.
 
 ## Credits
 

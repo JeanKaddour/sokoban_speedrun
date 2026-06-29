@@ -95,6 +95,14 @@ cp "$stage/$eval_roll" "$DEST/eval_seed${TRAIN_SEED}.rollouts.jsonl.gz"
 if [ -f "$stage/source/speedrun.py" ]; then
   mkdir -p "$DEST/source"
   cp "$stage/source/speedrun.py" "$DEST/source/speedrun_seed${TRAIN_SEED}.py"
+  if [ -z "$VERIFY_OF" ]; then
+    # Pin the canonical recipe to this submission (modded-nanogpt / slowrun convention):
+    # the top-level speedrun.py always holds the current record's code. Lands in the PR diff.
+    cp "$stage/source/speedrun.py" speedrun.py
+    echo ">> pinned ./speedrun.py to this record's recipe (review the diff — it's part of your PR)"
+  fi
+elif [ -z "$VERIFY_OF" ]; then
+  echo ">> WARN: no source snapshot in run output — ./speedrun.py NOT pinned; commit the recipe you ran by hand"
 fi
 echo ">> assembled $DEST (seed $TRAIN_SEED)"
 
@@ -118,4 +126,5 @@ if [ -n "$VERIFY_OF" ]; then
 else
   echo ">> DONE. Next: run a verification rerun (VERIFY_OF=$DEST ...), then update the README"
   echo "   leaderboard row (date, record time, pass@1/CI) and remove any superseded record dir."
+  echo "   Finally refresh the leaderboard figures: uv run python ../make_record_report.py --leaderboard"
 fi

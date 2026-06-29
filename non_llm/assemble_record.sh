@@ -78,7 +78,7 @@ for f in "$log_name" "$eval_json"; do
   modal volume get "$VOL" "/outputs/$RUN/$f" "$stage/" --force
 done
 mkdir -p "$stage/source"
-if modal volume get "$VOL" "/outputs/$RUN/source/speedrun_non_llm.py" "$stage/source/" --force; then
+if modal volume get "$VOL" "/outputs/$RUN/source/speedrun.py" "$stage/source/" --force; then
   echo ">> pulled source snapshot"
 else
   echo ">> source snapshot not found in run output; report generation will backfill from train log"
@@ -87,9 +87,17 @@ fi
 mkdir -p "$DEST"
 cp "$stage/$log_name"  "$DEST/train_log_seed${TRAIN_SEED}.txt"
 cp "$stage/$eval_json" "$DEST/eval_seed${TRAIN_SEED}.json"
-if [ -f "$stage/source/speedrun_non_llm.py" ]; then
+if [ -f "$stage/source/speedrun.py" ]; then
   mkdir -p "$DEST/source"
-  cp "$stage/source/speedrun_non_llm.py" "$DEST/source/speedrun_seed${TRAIN_SEED}.py"
+  cp "$stage/source/speedrun.py" "$DEST/source/speedrun_seed${TRAIN_SEED}.py"
+  if [ -z "$VERIFY_OF" ]; then
+    # Pin the canonical recipe to this submission (modded-nanogpt / slowrun convention):
+    # the top-level speedrun.py always holds the current record's code. Lands in the PR diff.
+    cp "$stage/source/speedrun.py" speedrun.py
+    echo ">> pinned ./speedrun.py to this record's recipe (review the diff — it's part of your PR)"
+  fi
+elif [ -z "$VERIFY_OF" ]; then
+  echo ">> WARN: no source snapshot in run output — ./speedrun.py NOT pinned; commit the recipe you ran by hand"
 fi
 echo ">> assembled $DEST (seed $TRAIN_SEED)"
 
@@ -111,4 +119,5 @@ if [ -n "$VERIFY_OF" ]; then
 else
   echo ">> DONE. Next: run a verification rerun (VERIFY_OF=$DEST TRAIN_SEED=<vseed> ...), then update"
   echo "   the README leaderboard row (date, record time, pass@1/CI) and remove any superseded dir."
+  echo "   Finally refresh the leaderboard figures: uv run python ../make_record_report.py --leaderboard"
 fi

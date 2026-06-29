@@ -6,7 +6,7 @@ Usage:
 
 For every primary eval (eval_seed<TRAINSEED>.json) in the record directory — and the optional
 verification/ rerun — this re-derives the record's claims WITHOUT a GPU, importing the aggregate
-helpers FROM speedrun_non_llm so verification can never drift from what evaluate() actually computed:
+helpers FROM speedrun so verification can never drift from what evaluate() actually computed:
 
  1. AGGREGATES — pass@1 / pass@k / answer_rate / CI re-derived from the JSON's own per-puzzle arrays.
  2. HELD-OUT  — the committed eval bin's sha256 must match the record, and every scored level
@@ -18,7 +18,7 @@ helpers FROM speedrun_non_llm so verification can never drift from what evaluate
 It then applies the leaderboard gate: each submission run, and each verification rerun when present,
 must have lower 95% CI > target. Exit code: 0 PASS, 1 FAIL.
 
-Heavy imports note: speedrun_non_llm imports torch at module level (no CUDA on import), so run via uv.
+Heavy imports note: speedrun imports torch at module level (no CUDA on import), so run via uv.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
-from speedrun_non_llm import (  # noqa: E402  (single source of truth for eval aggregates)
+from speedrun import (  # noqa: E402  (single source of truth for eval aggregates)
     GRID,
     OBS_CHANNELS,
     _bootstrap_ci,
@@ -89,7 +89,7 @@ def verify_aggregates(record: dict, fails: Failures, tag: str) -> None:
     # Re-derive the CI EXACTLY as evaluate() does: a percentile bootstrap over the per-level solve
     # fractions, seeded by the eval seed. evaluate() always uses the bootstrap (never a Wilson
     # interval), so the verifier must too — mirroring it is the whole point of importing
-    # _bootstrap_ci from speedrun_non_llm, so the CI method can't drift between producer and verifier.
+    # _bootstrap_ci from speedrun, so the CI method can't drift between producer and verifier.
     seed = int(record["sampling"].get("seed") or record.get("seed") or 0)
     lo, hi = _bootstrap_ci(fracs, seed=seed)
     fails.check(_close(record["ci_low"], lo) and _close(record["ci_high"], hi),
