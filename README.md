@@ -28,7 +28,7 @@ Fastest wall-clock run wins: one run on one 8xH100 node, from training step 1 th
 - **Fixed:** model, [train set](llm/datasets/sokoban_train.jsonl), eval set, reward function, hardware.
 - **Open:** RL algorithm, loss, schedules, engine, parallelism, domain-agnostic rewards, prompt.
 - **Not allowed:** Sokoban-specific hints, heuristics, or few-shot examples.
-- **Verification:** maintainers rerun at a second seed; both runs must clear the target.
+- **Verification:** Rerun with a second seed; both runs must clear the target.
 
 ### Running
 
@@ -37,12 +37,6 @@ cd llm
 uv sync
 NODE_GPUS=8 uv run torchrun --standalone --nproc_per_node=3 -m speedrun
 uv run python -m eval_speedrun --eval-checkpoint outputs/<run>/step_000075
-
-# Modal (modal_app.py rents an 8xH100)
-uv run modal volume put nanochat-rl-hf datasets/sokoban_train.jsonl /datasets/sokoban_train.jsonl
-uv run modal volume put nanochat-rl-hf datasets/sokoban_eval.jsonl /datasets/sokoban_eval.jsonl
-uv run modal run --detach modal_app.py
-EVAL_CHECKPOINT=latest uv run modal run modal_app.py
 ```
 
 ## Non-LLM Track
@@ -62,9 +56,9 @@ Fastest wall-clock run wins: one run on a single **1×H100** node, from training
 
 - **Target:** lower 95% CI on held-out Boxoban solve-rate > **0.70**.
 - **Eval:** official [DeepMind Boxoban](https://github.com/google-deepmind/boxoban-levels) held-out splits (per-level greedy scoring); default `unfiltered/test`.
-- **Disjointness:** training draws only from the official `unfiltered/train` split; eval uses the disjoint `unfiltered/test`. The eval bin's sha256 and every scored level are pinned in the record so `verify_record.py` confirms the eval pool offline.
+- **Disjointness:** training draws only from the official `unfiltered/train` split; eval uses the disjoint `unfiltered/test`.
 - **Open:** policy architecture, RL algorithm, optimizer, schedules, implementation.
-- **Verification:** `verify_record.py` re-derives pass@1/CI; maintainers also rerun at a second seed. Both runs must clear the target.
+- **Verification:** Rerun with a second seed; both runs must clear the target.
 
 ### Running
 
@@ -72,32 +66,35 @@ Fastest wall-clock run wins: one run on a single **1×H100** node, from training
 cd non_llm
 uv sync
 uv run python speedrun.py
+
+# Modal rents the 1×H100 for you (handy for this track):
 uv run modal run --detach modal_app_non_llm.py
 ```
 
 ## Submitting a record
 
-1. Train, then eval the final checkpoint — logs, source snapshots, and the eval JSON are written automatically.
-2. Generate the report for the relevant track and fill in the `Idea` section:
+Each track's `assemble_record.sh` ([`llm/`](llm/assemble_record.sh), [`non_llm/`](non_llm/assemble_record.sh)) turns a finished run into a record dir: it collects the log, eval JSON, and source snapshot, builds the report, pins the top-level `speedrun.py`, runs `verify_record.py`, and adds the record's row + redraws the leaderboard figure. It reads a local `outputs/<RUN>/` by default; pass `SOURCE=modal` to pull off the volume.
 
-LLM track:
+1. **Train + eval** with your track's [Running](#running) commands.
+
+2. **Assemble**, seeding the `Idea` from a `reports/` notes file:
+
+   ```bash
+   cd llm        # or: cd non_llm
+   RUN=<RUN> DEST=records/<date>_01_<name> IDEA_FILE=../reports/<your-idea>.md ./assemble_record.sh
+   ```
+
+   Review the pinned `speedrun.py` diff, then fill in the new row's **Description** + **Contributors** in `README.md`.
+
+3. **Open a PR** with the record dir + new row.
+
+*Optional:* verify it yourself with a second seed (otherwise the maintainers do; either way both seeds must clear the target), assembled into the record's `verification/` subdir:
 
 ```bash
-cd llm
-uv run python ../make_record_report.py records/<your-dir>
+RUN=<VRUN> TRAIN_SEED=<vseed> VERIFY_OF=records/<date>_01_<name> VERIFIER="@you  PR#<n>" ./assemble_record.sh
 ```
 
-Non-LLM track:
-
-```bash
-cd non_llm
-uv run python ../make_record_report.py records/<your-dir>
-```
-
-3. Open a PR adding the record dir + a row in the matching track's world record history. CI runs the track's verifier.
-4. Refresh the leaderboard figures (they read the tables above): `python make_record_report.py --leaderboard`.
-
-The top-level recipe files ([`llm/speedrun.py`](llm/speedrun.py) and [`non_llm/speedrun.py`](non_llm/speedrun.py)) always pin the current record's code. Assembling a submission (`assemble_record.sh`) overwrites the matching file with the exact source that produced the run, so the recipe change lands in your PR diff.
+The top-level `speedrun.py` files always hold the current record's recipe.
 
 ## Credits
 
