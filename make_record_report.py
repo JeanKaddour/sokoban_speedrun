@@ -692,7 +692,13 @@ def update_leaderboard_row(record_dir: Path, track: str) -> None:
     seed = sorted(rec["logs"])[0]
     s = int(rec["logs"][seed]["final_time_s"])
     clock = fmt_clock(s)  # mm:ss (both tracks' headers)
-    ev = rec["evals"][sorted(rec["evals"])[0]]
+    # Report the WORST of the required seeds (submission run + verification rerun), not the
+    # submission seed alone. Both seeds must clear the bar, so the binding (lower) one is the
+    # honest, un-cherry-pickable quality signal — it stops a submitter from seed-shopping the
+    # headline. The *ranking* is still wall-clock (the submission run's clock, set above).
+    eval_paths = sorted(record_dir.glob("eval_seed*.json")) + \
+        sorted((record_dir / "verification").glob("eval_seed*.json"))
+    ev = min((json.loads(p.read_text()) for p in eval_paths), key=lambda e: e["pass_at_1"])
     acc = f"{ev['pass_at_1']:.3f} (CI [{ev['ci_low']:.2f}, {ev['ci_high']:.2f}])"
 
     name = record_dir.name                                     # e.g. 2026-06-29_01_grpo
