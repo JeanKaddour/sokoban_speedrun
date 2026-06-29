@@ -49,6 +49,7 @@ uv run python -m eval_speedrun --eval-checkpoint outputs/<run>/step_000075
 | #   | Record time (mm:ss) | Description     | Date       | Log                                                                     | held-out pass@1         | Contributors |
 | --- | ------------------- | --------------- | ---------- | ----------------------------------------------------------------------- | ----------------------- | ------------ |
 | 1   | 22:24               | cnn-mingru h256 | 2026-06-21 | [non_llm/records/2026-06-21_01](non_llm/records/2026-06-21_01_non_llm/) | 0.744 (CI [0.72, 0.77]) | @JeanKaddour |
+| 2 | 21:00 | cnn-mingru h256 — earliest clearing checkpoint (iter 1200, same recipe as #1) | 2026-06-29 | [non_llm/records/2026-06-29_01](non_llm/records/2026-06-29_01_non_llm/) | 0.735 (CI [0.71, 0.76]) | @JeanKaddour |
 
 
 ### Rules
