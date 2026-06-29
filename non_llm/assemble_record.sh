@@ -9,7 +9,8 @@
 #            (re-eval an existing checkpoint: EVAL_CHECKPOINT=/vol/outputs/<RUN>/final.pt RUN_NAME=<RUN> ...)
 #
 # SUBMISSION (the record itself):
-#   RUN=<RUN> DEST=records/<date>_01_<name> IDEA_FILE=../reports/non-llm-idea.md ./assemble_record.sh
+#   RUN=<RUN> DEST=records/<date>_01_<name> ./assemble_record.sh
+# The report is scaffolded with a placeholder "## Idea" section — fill it in by hand afterwards.
 #
 # VERIFICATION (an independent rerun, dropped into the record's verification/ subdir — run a SECOND
 # train+eval with a different seed first (--seed <vseed>), then):
@@ -29,7 +30,6 @@ STEP="${STEP:-}"                 # optional eval checkpoint step; inferred from 
 SOURCE="${SOURCE:-local}"        # local | modal — where the run artifacts live
 LOCAL_OUTPUTS="${LOCAL_OUTPUTS:-outputs}"  # base dir for local runs (SOURCE=local)
 VOL="${VOL:-nanochat-rl-hf}"     # shared with the LLM track (see modal_app_non_llm.VOLUME_NAME)
-IDEA_FILE="${IDEA_FILE:-}"
 VERIFY_OF="${VERIFY_OF:-}"       # if set, assemble as the verification of this record dir
 VERIFIER="${VERIFIER:-}"         # one-line attribution written to verification/verifier.txt
 
@@ -140,9 +140,6 @@ echo ">> assembled $DEST (seed $TRAIN_SEED)"
 if [ -n "$VERIFY_OF" ]; then
   [ -n "$VERIFIER" ] && printf '%s\n' "$VERIFIER" > "$DEST/verifier.txt"
   echo ">> verifier.txt: ${VERIFIER:-<unset — add one before merging>}"
-elif [ -n "$IDEA_FILE" ] && [ ! -f "$DEST/README.md" ]; then
-  { echo "# $(basename "$DEST")"; echo; cat "$IDEA_FILE"; } > "$DEST/README.md"
-  echo ">> seeded $DEST/README.md from $IDEA_FILE (auto block appended by make_record_report)"
 fi
 
 # A submission also writes its README leaderboard row + redraws the figures; a verification doesn't
@@ -158,7 +155,8 @@ if [ -n "$VERIFY_OF" ]; then
   echo ">> DONE. Verification appended to $RECORD; its README now has a ## Verification section."
 else
   echo ">> DONE. Leaderboard row added + figures redrawn. Next:"
-  echo "   1) fill in the new row's Description + Contributors in README.md"
-  echo "   2) run a verification rerun (different seed): RUN=<VRUN> VERIFY_OF=$DEST ./assemble_record.sh"
-  echo "   3) remove any superseded record dir, then open the PR"
+  echo "   1) fill in the placeholder '## Idea' section in $DEST/README.md"
+  echo "   2) fill in the new row's Description + Contributors in README.md"
+  echo "   3) run a verification rerun (different seed): RUN=<VRUN> VERIFY_OF=$DEST ./assemble_record.sh"
+  echo "   4) remove any superseded record dir, then open the PR"
 fi

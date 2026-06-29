@@ -77,14 +77,14 @@ Each track's `assemble_record.sh` ([`llm/`](llm/assemble_record.sh), [`non_llm/`
 
 1. **Train + eval** with your track's [Running](#running) commands.
 
-2. **Assemble**, seeding the `Idea` from a `reports/` notes file:
+2. **Assemble** the record:
 
    ```bash
    cd llm        # or: cd non_llm
-   RUN=<RUN> DEST=records/<date>_01_<name> IDEA_FILE=../reports/<your-idea>.md ./assemble_record.sh
+   RUN=<RUN> DEST=records/<date>_01_<name> ./assemble_record.sh
    ```
 
-   Review the pinned `speedrun.py` diff, then fill in the new row's **Description** + **Contributors** in `README.md`.
+   The record's `README.md` is scaffolded with a placeholder **`## Idea`** section. Review the pinned `speedrun.py` diff, then fill in by hand: the record's `## Idea`, and the new leaderboard row's **Description** + **Contributors** in this top-level `README.md`.
 
 3. **Open a PR** with the record dir + new row.
 
