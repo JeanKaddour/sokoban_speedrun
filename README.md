@@ -14,9 +14,9 @@ Fastest recipes to RL models to solve Sokoban to a held-out target on one node:
 
 ![LLM track world records — held-out pass@1 vs wall-clock time to target](assets/llm_records.png)
 
-| #   | Record time (h:mm:ss) | Description                        | Date       | Log                                                          | held-out pass@1         | Contributors |
-| --- | --------------------- | ---------------------------------- | ---------- | ------------------------------------------------------------ | ----------------------- | ------------ |
-| 1   | 0:48:53               | GRPO, LR 1.6e-6 annealed, 75 steps | 2026-06-29 | [llm/records/2026-06-29_01](llm/records/2026-06-29_01_grpo/) | 0.869 (CI [0.83, 0.90]) | @JeanKaddour |
+| #   | Record time (mm:ss) | Description                        | Date       | Log                                                          | held-out pass@1         | Contributors |
+| --- | ------------------- | ---------------------------------- | ---------- | ------------------------------------------------------------ | ----------------------- | ------------ |
+| 1   | 48:53               | GRPO, LR 1.6e-6 annealed, 75 steps | 2026-06-29 | [llm/records/2026-06-29_01](llm/records/2026-06-29_01_grpo/) | 0.869 (CI [0.83, 0.90]) | @JeanKaddour |
 
 
 ### Rules

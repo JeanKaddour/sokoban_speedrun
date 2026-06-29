@@ -121,9 +121,9 @@ def first_cross(x, y, target: float) -> float | None:
 
 
 def fmt_clock(seconds: float) -> str:
+    """mm:ss — runs are assumed under an hour for now."""
     s = int(seconds)
-    h, m, sec = s // 3600, s % 3600 // 60, s % 60
-    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+    return f"{s // 60}:{s % 60:02d}"
 
 
 def pct_axis(ax) -> None:
@@ -580,12 +580,9 @@ LB_TARGET = "#c0392b"   # target threshold (warm red, dashed)
 
 
 def _lb_minutes(time_str: str) -> float:
-    """'0:48:53' or '22:24' -> minutes."""
-    parts = [int(p) for p in time_str.split(":")]
-    while len(parts) < 3:
-        parts.insert(0, 0)
-    h, m, sec = parts
-    return h * 60 + m + sec / 60.0
+    """'48:53' (mm:ss) -> minutes — runs are assumed under an hour for now."""
+    m, sec = (int(p) for p in time_str.split(":"))
+    return m + sec / 60.0
 
 
 def parse_leaderboard(section: str) -> list[dict]:
@@ -694,8 +691,7 @@ def update_leaderboard_row(record_dir: Path, track: str) -> None:
     rec = load_record(record_dir)
     seed = sorted(rec["logs"])[0]
     s = int(rec["logs"][seed]["final_time_s"])
-    # Match each track's table header: LLM shows h:mm:ss (hour even when 0), non-LLM shows mm:ss.
-    clock = fmt_clock(s) if track == "non-llm" else f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}"
+    clock = fmt_clock(s)  # mm:ss (both tracks' headers)
     ev = rec["evals"][sorted(rec["evals"])[0]]
     acc = f"{ev['pass_at_1']:.3f} (CI [{ev['ci_low']:.2f}, {ev['ci_high']:.2f}])"
 
@@ -771,7 +767,7 @@ def auto_block(record: dict, record_dir: Path, target: float, prev_dir: Path | N
              f"|---|---|---|---|{flops_sep}"]
     for s in sorted(evals):
         ev, clock, fl = evals[s], clocks.get(s), flops.get(s)
-        hms = f"{int(clock // 3600)}:{int(clock % 3600 // 60):02d}:{int(clock % 60):02d}" if clock else "—"
+        hms = fmt_clock(clock) if clock else "—"
         flo = f" {fmt_flops(fl)} |" if show_flops else ""
         lines.append(f"| {s} | {ev['pass_at_1']:.4f} | [{ev['ci_low']:.4f}, {ev['ci_high']:.4f}] "
                      f"| {hms} |{flo}")

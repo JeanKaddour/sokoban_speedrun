@@ -200,8 +200,6 @@ echo ">> generating report + plots for $RECORD"
 uv run python ../make_record_report.py "${report_args[@]}"
 echo ">> verifying $RECORD (submission + verification)"
 uv run python verify_record.py "$RECORD"
-echo ">> regenerating LLM track hero (records/hero.gif)"
-uv run --with pillow python records/plot_hero_animation.py "$RECORD" --out records/hero.gif
 echo
 if [ -n "$VERIFY_OF" ]; then
   echo ">> DONE. Verification appended to $RECORD; its README now has a ## Verification section."

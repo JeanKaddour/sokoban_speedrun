@@ -16,7 +16,7 @@
 
 | seed | held-out eval pass@1 | 95% CI | record clock |
 |---|---|---|---|
-| seed42 | 0.8688 | [0.8337, 0.9012] | 0:48:53 |
+| seed42 | 0.8688 | [0.8337, 0.9012] | 48:53 |
 
 **Held-out eval pass@1 0.8688, lower 95% CI 0.8337 vs TARGET 0.8: CLEARS.**
 
