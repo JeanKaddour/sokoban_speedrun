@@ -29,7 +29,7 @@ Fastest wall-clock run wins: one run on one 8xH100 node, from training step 1 th
 - **Fixed:** model, [train set](llm/datasets/sokoban_train.jsonl), eval set, reward function, hardware.
 - **Open:** RL algorithm, loss, schedules, engine, parallelism, domain-agnostic rewards, prompt.
 - **Not allowed:** Sokoban-specific hints, heuristics, or few-shot examples.
-- **Verification:** Rerun with a second seed; both runs must clear the target. The held-out pass@1 column reports the **worst** of the two seeds (the binding one), so it can't be seed-shopped; records are ranked by wall-clock, not pass@1.
+- **Verification:** Rerun with a second seed; both runs must clear the target. The held-out pass@1 column reports the worst of the two seeds.
 
 ### Running
 
@@ -60,7 +60,7 @@ Fastest wall-clock run wins: one run on a single **1×H100** node, from training
 - **Eval:** official [DeepMind Boxoban](https://github.com/google-deepmind/boxoban-levels) held-out splits (per-level greedy scoring); default `unfiltered/test`.
 - **Disjointness:** training draws only from the official `unfiltered/train` split; eval uses the disjoint `unfiltered/test`.
 - **Open:** policy architecture, RL algorithm, optimizer, schedules, implementation.
-- **Verification:** Rerun with a second seed; both runs must clear the target. The held-out pass@1 column reports the **worst** of the two seeds (the binding one), so it can't be seed-shopped; records are ranked by wall-clock, not pass@1.
+- **Verification:** Rerun with a second seed; both runs must clear the target. The held-out pass@1 column reports the worst of the two seeds.
 
 ### Running
 
