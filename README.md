@@ -17,7 +17,7 @@ Fastest recipes to RL models to solve Sokoban to a held-out target on one node:
 | #   | Record time (mm:ss) | Description                        | Date       | Log                                                          | held-out pass@1         | Contributors |
 | --- | ------------------- | ---------------------------------- | ---------- | ------------------------------------------------------------ | ----------------------- | ------------ |
 | 1   | 48:53               | GRPO, LR 1.6e-6 annealed, 75 steps | 2026-06-29 | [llm/records/2026-06-29_01](llm/records/2026-06-29_01_grpo/) | 0.869 (CI [0.83, 0.90]) | @JeanKaddour |
-| 2   | 36:53               | GRPO, LR 1.6e-6 annealed, 60 steps | 2026-06-29 | [llm/records/2026-06-29_02](llm/records/2026-06-29_02_grpo_60step/) | 0.884 (CI [0.86, 0.91]) | @dexhunter   |
+| 2   | 36:53               | GRPO, LR 1.6e-6 annealed, 60 steps | 2026-06-29 | [llm/records/2026-06-29_02](llm/records/2026-06-29_02_grpo_60step/) | 0.843 (CI [0.81, 0.88]) | @dexhunter   |
 
 
 ### Rules
@@ -29,7 +29,7 @@ Fastest wall-clock run wins: one run on one 8xH100 node, from training step 1 th
 - **Fixed:** model, [train set](llm/datasets/sokoban_train.jsonl), eval set, reward function, hardware.
 - **Open:** RL algorithm, loss, schedules, engine, parallelism, domain-agnostic rewards, prompt.
 - **Not allowed:** Sokoban-specific hints, heuristics, or few-shot examples.
-- **Verification:** Rerun with a second seed; both runs must clear the target.
+- **Verification:** Rerun with a second seed; both runs must clear the target. The held-out pass@1 column reports the **worst** of the two seeds (the binding one), so it can't be seed-shopped; records are ranked by wall-clock, not pass@1.
 
 ### Running
 
@@ -59,7 +59,7 @@ Fastest wall-clock run wins: one run on a single **1×H100** node, from training
 - **Eval:** official [DeepMind Boxoban](https://github.com/google-deepmind/boxoban-levels) held-out splits (per-level greedy scoring); default `unfiltered/test`.
 - **Disjointness:** training draws only from the official `unfiltered/train` split; eval uses the disjoint `unfiltered/test`.
 - **Open:** policy architecture, RL algorithm, optimizer, schedules, implementation.
-- **Verification:** Rerun with a second seed; both runs must clear the target.
+- **Verification:** Rerun with a second seed; both runs must clear the target. The held-out pass@1 column reports the **worst** of the two seeds (the binding one), so it can't be seed-shopped; records are ranked by wall-clock, not pass@1.
 
 ### Running
 
