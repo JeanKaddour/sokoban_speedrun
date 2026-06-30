@@ -1,1 +1,1 @@
-@JeanKaddour — torch.compile + matched-anneal recipe, independent second seed
+@JeanKaddour — corrected compile-warmup rerun, independent second seed

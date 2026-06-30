@@ -14,9 +14,9 @@
 
 | seed | held-out eval pass@1 | 95% CI | record clock |
 |---|---|---|---|
-| seed42 | 0.7420 | [0.7152, 0.7688] | 15:42 |
+| seed42 | 0.7478 | [0.7216, 0.7737] | 15:55 |
 
-**Held-out eval pass@1 0.7420, lower 95% CI 0.7152 vs TARGET 0.7: CLEARS.**
+**Held-out eval pass@1 0.7478, lower 95% CI 0.7216 vs TARGET 0.7: CLEARS.**
 
 ![hero](plots/hero.png)
 
@@ -32,9 +32,9 @@
 
 ## Verification
 
-@JeanKaddour — torch.compile + matched-anneal recipe, independent second seed:
+@JeanKaddour — corrected compile-warmup rerun, independent second seed:
 
-- re-ran at seed123 → pass@1 **0.7530** (95% CI [0.7274, 0.7790]) — **CLEARS 0.7** ✓
+- re-ran at seed123 → pass@1 **0.7329** (95% CI [0.7058, 0.7594]) — **CLEARS 0.7** ✓
 
 Confirms the recipe reproduces independently; the record time above is the submission run's, not this rerun's. Artifacts: [`verification/`](verification/).
 
@@ -44,8 +44,8 @@ Standalone `speedrun.py` snapshots are saved per run and checked against the emb
 
 | run | seed | snapshot | sha256 |
 |---|---|---|---|
-| submission | seed42 | [source/speedrun_seed42.py](source/speedrun_seed42.py) | `790da4a007d3` |
-| verification | seed123 | [verification/source/speedrun_seed123.py](verification/source/speedrun_seed123.py) | `790da4a007d3` |
+| submission | seed42 | [source/speedrun_seed42.py](source/speedrun_seed42.py) | `268a7fd4a3b5` |
+| verification | seed123 | [verification/source/speedrun_seed123.py](verification/source/speedrun_seed123.py) | `268a7fd4a3b5` |
 
 ## Config
 
@@ -95,7 +95,7 @@ Standalone `speedrun.py` snapshots are saved per run and checked against the emb
   "profile": "False",
   "replay_ratio": "1.6234",
   "rollout_horizon": "64",
-  "run": "nonllm-baked-s42-r1",
+  "run": "nonllm-baked-s42-fresh-warmup-r6",
   "seed": "42",
   "target": "0.7",
   "total_timesteps": "681574400",
@@ -122,8 +122,3 @@ uv run python verify_record.py records/2026-06-30_01_non_llm
 ```
 
 <!-- END AUTO-GENERATED -->
-
-
-
-
-
