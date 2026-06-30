@@ -527,8 +527,8 @@ TRACKS = {
         "script": "speedrun.py",
         "show_flops": False,
         "lb_section": "LLM Track",          # README world-record table heading
-        "lb_title": "LLM track  ·  world records",
-        "lb_metric": "held-out pass@1",
+        "lb_title": "Sokoban Speedrun  ·  LLM Track",
+        "lb_metric": "Held-out pass@1",
         "lb_out": "assets/llm_records.png",
         "reproduce": [
             "# train on one 8xH100 node (recipe defaults live in speedrun.py RECIPE)",
@@ -549,8 +549,8 @@ TRACKS = {
         "script": "speedrun.py",
         "show_flops": False,   # open-architecture track: a FLOPs estimator can't stay faithful across archs
         "lb_section": "Non-LLM Track",      # README world-record table heading
-        "lb_title": "Non-LLM track  ·  world records",
-        "lb_metric": "held-out solve-rate",
+        "lb_title": "Sokoban Speedrun  ·  Non-LLM Track",
+        "lb_metric": "Held-out solve rate",
         "lb_out": "assets/non_llm_records.png",
         "reproduce": [
             "# train (recipe defaults live in speedrun.py RECIPE)",
@@ -567,8 +567,8 @@ TRACKS = {
 # --- Leaderboard figure (README world-record tables -> assets/*.png) ---------
 # One light, academic plot per track: each accepted record is a point at
 # (wall-clock time to target, held-out accuracy), with the fixed target dashed.
-# Faster is left, more accurate is up, so successive records march toward the
-# top-left — the same spirit as modded-nanoGPT's `figure_wr_vs_base`. The data is
+# Faster is right, more accurate is up, so successive records march toward the
+# top-right — the same spirit as modded-nanoGPT's `figure_wr_vs_base`. The data is
 # read straight from the README leaderboard tables, so the figure fills in as
 # faster records land. Regenerate after editing a row: `--leaderboard`.
 LB_INK = "#1b1f24"      # titles / record labels
@@ -635,24 +635,25 @@ def plot_leaderboard(cfg: dict) -> None:
     fig, ax = plt.subplots(figsize=(7.8, 4.7))
     ax.set_title(cfg["lb_title"])
     # target near the bottom (thin "below target" strip), records near the top
-    ax.set_xlim(0, x_max * 1.28)
+    ax.set_xlim(x_max * 1.28, 0)
     ax.set_ylim(max(0.0, target - 0.02), min(1.0, max(accs) + 0.025))
 
     ax.axhspan(ax.get_ylim()[0], target, color=LB_TARGET, alpha=0.05, zorder=0)
     ax.axhline(target, color=LB_TARGET, lw=1.8, ls=(0, (6, 4)), zorder=2)
-    ax.text(ax.get_xlim()[1], target, f" target {target:.2f}", va="center", ha="left",
-            color=LB_TARGET, fontsize=10.5, fontweight="bold", clip_on=False)
+    ax.annotate(f"target {target:.0%}", xy=(0.985, target), xycoords=ax.get_yaxis_transform(),
+                xytext=(0, 5), textcoords="offset points", va="bottom", ha="right",
+                color=LB_TARGET, fontsize=10.5, fontweight="bold")
 
     # connect successive records (only meaningful with >= 2); each clears the target
     order = sorted(range(len(recs)), key=lambda i: recs[i]["num"])
     if len(recs) > 1:
         ax.plot([recs[i]["minutes"] for i in order], [recs[i]["acc"] for i in order],
-                color=LB_ACCENT, lw=1.6, alpha=0.5, zorder=3)
+                color=LB_ACCENT, lw=1.35, alpha=0.38, zorder=3)
 
     for i, r in enumerate(recs):
         if i == best:
             ax.scatter([r["minutes"]], [r["acc"]], marker="*", s=380, color=LB_RECORD,
-                       edgecolors=LB_INK, linewidths=0.8, zorder=6, label="current record")
+                       edgecolors=LB_INK, linewidths=0.8, zorder=6)
         else:
             ax.scatter([r["minutes"]], [r["acc"]], s=70, color=LB_ACCENT,
                        edgecolors="white", linewidths=1.0, zorder=5)
@@ -660,10 +661,10 @@ def plot_leaderboard(cfg: dict) -> None:
                     textcoords="offset points", ha="left", va="center",
                     color=LB_INK, fontsize=11, fontweight="bold")
 
-    ax.set_xlabel("wall-clock to target  (minutes)")
+    ax.set_xlabel("wall-clock minutes to target")
     ax.set_ylabel(cfg["lb_metric"])
+    pct_axis(ax)
     ax.margins(x=0)
-    ax.legend(loc="upper left", borderaxespad=0.6)
     fig.tight_layout()
     out.parent.mkdir(exist_ok=True)
     fig.savefig(out)
