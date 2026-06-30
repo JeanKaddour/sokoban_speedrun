@@ -593,17 +593,18 @@ def build_policy(cfg: argparse.Namespace, env: "BoxobanVecEnv", device: str) -> 
       cnn-{mingru,lstm,gru} - spatial conv encoder + that recurrent core (conv perception + planning)
     All expose forward()/forward_eval()/initial_state() the matched train step needs."""
     if cfg.arch == "cnn":
-        return ActorCritic(cfg.hidden_size).to(device)
-    import pufferlib.models as pm
-    nets = {"mingru": pm.MinGRU, "lstm": pm.LSTM, "gru": pm.GRU, "mlp": pm.MLP}
-    enc_name, net_name = cfg.arch.split("-", 1) if "-" in cfg.arch else ("linear", cfg.arch)
-    if net_name not in nets or enc_name not in ("linear", "cnn"):
-        raise SystemExit(f"unknown --arch {cfg.arch!r} (cnn | {'|'.join(nets)} | cnn-{{mingru,lstm,gru}})")
-    encoder = (ConvEncoder(env.obs_size, cfg.hidden_size) if enc_name == "cnn"
-               else pm.DefaultEncoder(env.obs_size, cfg.hidden_size))
-    decoder = pm.DefaultDecoder(env.act_sizes, cfg.hidden_size)
-    network = nets[net_name](cfg.hidden_size, num_layers=int(cfg.num_layers))
-    policy = pm.Policy(encoder, decoder, network).to(device)
+        policy = ActorCritic(cfg.hidden_size).to(device)
+    else:
+        import pufferlib.models as pm
+        nets = {"mingru": pm.MinGRU, "lstm": pm.LSTM, "gru": pm.GRU, "mlp": pm.MLP}
+        enc_name, net_name = cfg.arch.split("-", 1) if "-" in cfg.arch else ("linear", cfg.arch)
+        if net_name not in nets or enc_name not in ("linear", "cnn"):
+            raise SystemExit(f"unknown --arch {cfg.arch!r} (cnn | {'|'.join(nets)} | cnn-{{mingru,lstm,gru}})")
+        encoder = (ConvEncoder(env.obs_size, cfg.hidden_size) if enc_name == "cnn"
+                   else pm.DefaultEncoder(env.obs_size, cfg.hidden_size))
+        decoder = pm.DefaultDecoder(env.act_sizes, cfg.hidden_size)
+        network = nets[net_name](cfg.hidden_size, num_layers=int(cfg.num_layers))
+        policy = pm.Policy(encoder, decoder, network).to(device)
     return torch.compile(policy) if getattr(cfg, "compile", False) else policy
 
 
@@ -882,6 +883,24 @@ def set_seed(seed: int):
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
 
 
+def _capture_rng_state() -> dict:
+    np_state = np.random.get_state()
+    state = {
+        "torch": torch.get_rng_state().clone(),
+        "numpy": (np_state[0], np_state[1].copy(), *np_state[2:]),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = [s.clone() for s in torch.cuda.get_rng_state_all()]
+    return state
+
+
+def _restore_rng_state(state: dict) -> None:
+    torch.set_rng_state(state["torch"])
+    np.random.set_state(state["numpy"])
+    if torch.cuda.is_available() and "cuda" in state:
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
 # NOTE: no FLOPs co-metric on this track. Wall-clock (on the fixed single H100) is the sole metric.
 # A FLOPs estimate would have to be re-derived and re-validated for every new architecture — and this
 # is an OPEN-architecture track, so any estimator silently undercounts layer/op types it doesn't know
@@ -895,9 +914,12 @@ def train(cfg: argparse.Namespace) -> Path:
     os.chdir(pufferlib_root())  # boxoban C env caches level files under a cwd-relative resources/
     set_seed(cfg.seed)
 
-    env = BoxobanVecEnv(difficulty=cfg.difficulty, num_agents=cfg.num_agents,
-                        max_steps=cfg.max_episode_steps, seed=cfg.seed,
-                        eval_mode=False, holdout_frac=cfg.holdout_frac)
+    def make_train_env() -> BoxobanVecEnv:
+        return BoxobanVecEnv(difficulty=cfg.difficulty, num_agents=cfg.num_agents,
+                             max_steps=cfg.max_episode_steps, seed=cfg.seed,
+                             eval_mode=False, holdout_frac=cfg.holdout_frac)
+
+    env = make_train_env()
     device = env.device
     policy = build_policy(cfg, env, device)
     optimizer = Muon(policy.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
@@ -924,14 +946,22 @@ def train(cfg: argparse.Namespace) -> Path:
         # the FULL schedule from scratch at compiled speed. No compile in the clock and no free training
         # steps, leaving it directly comparable to the (uncompiled) fp32 records #1/#2, which time their
         # whole run from step 1. The 2 warmup iters use the real loop, so nothing recompiles once timed.
+        # Then restore every mutable training input: weights, optimizer, RNG, and a freshly seeded env.
         _orig = getattr(policy, "_orig_mod", policy)
         init_model = copy.deepcopy(_orig.state_dict())
         init_opt = copy.deepcopy(optimizer.state_dict())
+        init_rng = _capture_rng_state()
         for _ in range(2):
             wo, wa, wv, wl, wr, wd = collect_rollout(env, policy, cfg.rollout_horizon, device, amp=cfg.bf16)
             puff_train(policy, optimizer, wo, wa, wv, wl, wr, wd, cfg, 0, total_iters)
         _orig.load_state_dict(init_model)
         optimizer.load_state_dict(init_opt)
+        env.close()
+        set_seed(cfg.seed)
+        env = make_train_env()
+        _restore_rng_state(init_rng)
+        if env.device != device:
+            raise RuntimeError(f"fresh env device changed after compile warmup: {device!r} -> {env.device!r}")
 
     # Time the full schedule from step 1, every iter included — same convention as records #1/#2.
     logger.start_clock(time.monotonic())

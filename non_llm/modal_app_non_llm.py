@@ -106,7 +106,7 @@ def _runtime_env() -> dict[str, str]:
 
 
 def _run(extra_args: list[str]) -> None:
-    cmd = [sys.executable, "-m", "speedrun", "--output-dir", f"{VOLUME_MOUNT_PATH}/outputs",
+    cmd = [sys.executable, "-u", "-m", "speedrun", "--output-dir", f"{VOLUME_MOUNT_PATH}/outputs",
            *extra_args]
     print(f"Launching: {' '.join(cmd)}", flush=True)
     subprocess.run(cmd, check=True, env=_runtime_env())
@@ -197,4 +197,12 @@ def main() -> None:
         return
 
     total = int(os.environ["TOTAL_TIMESTEPS"]) if os.environ.get("TOTAL_TIMESTEPS") else None
-    train.remote(run_name, difficulty, total, target, holdout_frac, extra)
+    call = train.spawn(run_name, difficulty, total, target, holdout_frac, extra)
+    total_desc = str(total) if total is not None else "RECIPE"
+    print(f"Spawned Modal function call: {call.object_id} "
+          f"(run={run_name or 'default'}, difficulty={difficulty}, total_timesteps={total_desc}, "
+          f"target={target}, holdout_frac={holdout_frac}, extra_args={extra})", flush=True)
+    try:
+        print(f"Function call dashboard: {call.get_dashboard_url()}", flush=True)
+    except Exception:
+        pass
