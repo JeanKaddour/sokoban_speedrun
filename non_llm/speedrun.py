@@ -75,7 +75,7 @@ RECIPE = {
     "max_episode_steps": 120,   # 120 > the recipe's 150 on held-out (ablation: 150 cost ~0.04 solve-rate)
     "holdout_frac": 0.1,        # fraction of the level pool held out (disjoint) for the eval gate
     # --- PPO rollout / optimization (PuffeRL) ---
-    "total_timesteps": 200_000_000,
+    "total_timesteps": 681_574_400,  # 1300 iters — record #3's matched-anneal horizon (cosine LR anneals over the run)
     "rollout_horizon": 64,
     "minibatch_size": 32768,    # segment minibatch: minibatch_segments = minibatch_size / horizon
     "replay_ratio": 1.6234,     # num_minibatches = replay_ratio * batch_size / minibatch_size
@@ -104,8 +104,8 @@ RECIPE = {
     "num_layers": 3,            # recurrent (planning) depth — deeper generalizes better on official sets
     "bf16": False,              # fp32 by default: bf16 autocast is ~1.3x faster but costs ~0.09 held-out
                                 # solve-rate on unfiltered (ablation) — accuracy beats speed for records.
-    "compile": False,           # torch.compile the policy: lossless (same fp32 math) kernel fusion for the
-                                # train-bound forward/backward — fewer launches on our small (2.25M) net.
+    "compile": True,            # torch.compile the policy — lossless (same fp32 math) kernel fusion on the
+                                # train-bound fwd/bwd, ~30% faster on our small (2.25M) net. Record #3's recipe.
     # --- bookkeeping ---
     "seed": 42,
     "wandb": False,             # --wandb 1 to enable; logs train/loss/opt/perf metrics per iter
