@@ -32,7 +32,7 @@
 
 ## Verification
 
-@JeanKaddour — corrected compile-warmup rerun, independent second seed:
+@JeanKaddour — independent second seed:
 
 - re-ran at seed123 → pass@1 **0.7329** (95% CI [0.7058, 0.7594]) — **CLEARS 0.7** ✓
 
@@ -95,7 +95,7 @@ Standalone `speedrun.py` snapshots are saved per run and checked against the emb
   "profile": "False",
   "replay_ratio": "1.6234",
   "rollout_horizon": "64",
-  "run": "nonllm-baked-s42-fresh-warmup-r6",
+  "run": "<record-run>",
   "seed": "42",
   "target": "0.7",
   "total_timesteps": "681574400",
