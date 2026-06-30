@@ -50,6 +50,7 @@ uv run python -m eval_speedrun --eval-checkpoint outputs/<run>/step_000075
 | --- | ------------------- | --------------- | ---------- | ----------------------------------------------------------------------- | ----------------------- | ------------ |
 | 1   | 22:24               | cnn-mingru h256 | 2026-06-21 | [non_llm/records/2026-06-21_01](non_llm/records/2026-06-21_01_non_llm/) | 0.744 (CI [0.72, 0.77]) | @JeanKaddour |
 | 2 | 21:00 | same recipe as #1, earliest clearing checkpoint | 2026-06-29 | [non_llm/records/2026-06-29_01](non_llm/records/2026-06-29_01_non_llm/) | 0.727 (CI [0.70, 0.75]) | @JeanKaddour |
+| 3 | 15:55 | torch.compile + steps-matched-anneal | 2026-06-30 | [non_llm/records/2026-06-30_01](non_llm/records/2026-06-30_01_non_llm/) | 0.748 (CI [0.72, 0.77]) | @JeanKaddour |
 
 
 ### Rules
