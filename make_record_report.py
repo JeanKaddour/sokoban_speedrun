@@ -635,7 +635,8 @@ def plot_leaderboard(cfg: dict) -> None:
     fig, ax = plt.subplots(figsize=(7.8, 4.7))
     ax.set_title(cfg["lb_title"])
     # target near the bottom (thin "below target" strip), records near the top
-    ax.set_xlim(x_max * 1.28, 0)
+    # only a little headroom past the slowest record — keep the left whitespace tight
+    ax.set_xlim(x_max * 1.08, 0)
     ax.set_ylim(max(0.0, target - 0.02), min(1.0, max(accs) + 0.025))
 
     ax.axhspan(ax.get_ylim()[0], target, color=LB_TARGET, alpha=0.05, zorder=0)
