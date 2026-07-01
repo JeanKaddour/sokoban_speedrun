@@ -22,7 +22,7 @@ Fastest recipes to RL models to solve Sokoban to a held-out target on one node:
 
 ### Rules
 
-Fastest wall-clock run wins: one run on one 8xH100 node, from training step 1 through the final checkpoint, which must clear the target.
+Fastest wall-clock run wins: one run on one 8xH100 node, from training step 1 through the first checkpoint, which must clear the target.
 
 - **Target:** lower 95% bootstrap CI > 0.80 on [llm/datasets/sokoban_eval.jsonl](llm/datasets/sokoban_eval.jsonl).
 - **Eval:** 8 completions/puzzle, 12,288 tokens, temperature 0.8, top-p 0.95, seed 12345.
@@ -55,11 +55,10 @@ uv run python -m eval_speedrun --eval-checkpoint outputs/<run>/step_000075
 
 ### Rules
 
-Fastest wall-clock run wins: one run on a single **1×H100** node, from training step 1 through the first checkpoint whose held-out CI clears the target.
+Fastest wall-clock run wins: one run on a single H100, from training step 1 through the first checkpoint, which must clear the target.
 
 - **Target:** lower 95% CI on held-out Boxoban solve-rate > **0.70**.
-- **Eval:** official [DeepMind Boxoban](https://github.com/google-deepmind/boxoban-levels) held-out splits (per-level greedy scoring); default `unfiltered/test`.
-- **Disjointness:** training draws only from the official `unfiltered/train` split; eval uses the disjoint `unfiltered/test`.
+- **Eval:** official [DeepMind Boxoban](https://github.com/google-deepmind/boxoban-levels) test split `unfiltered/test`.
 - **Open:** policy architecture, RL algorithm, optimizer, schedules, implementation.
 - **Verification:** Rerun with a second seed; both runs must clear the target. The held-out pass@1 column reports the worst of the two seeds.
 
@@ -69,9 +68,6 @@ Fastest wall-clock run wins: one run on a single **1×H100** node, from training
 cd non_llm
 uv sync
 uv run python speedrun.py
-
-# Modal rents the 1×H100 for you (handy for this track):
-uv run modal run --detach modal_app_non_llm.py
 ```
 
 ## Submitting a record
