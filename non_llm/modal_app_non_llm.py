@@ -1,4 +1,4 @@
-"""Modal entrypoint for the non-LLM Sokoban speedrun track (PufferLib boxoban + in-file PuffeRL PPO).
+"""Modal entrypoint for the non-LLM Sokoban speedrun track (PufferLib boxoban + in-file PPO).
 
 The non-LLM track is a different stack, so it gets its own image: a CUDA-devel base with clang + a cu126 torch,
 into which the `boxoban` env extension is built (`--float`) at image
@@ -152,13 +152,6 @@ def evaluate(checkpoint: str, run_name: str | None, difficulty: int | None, eval
 
 
 @app.function(image=image, gpu=GPU_CONFIG, timeout=30 * 60, volumes={VOLUME_MOUNT_PATH: volume})
-def profile(extra_args: list[str]) -> None:
-    for bf in ("0", "1"):                                  # fp32(TF32) vs bf16, same container/GPU
-        print(f"\n================ PROFILE bf16={bf} ================", flush=True)
-        _run(["--profile", "--bf16", bf, *extra_args])
-
-
-@app.function(image=image, gpu=GPU_CONFIG, timeout=30 * 60, volumes={VOLUME_MOUNT_PATH: volume})
 def smoke(run_name: str | None, total_timesteps: int, extra_args: list[str]) -> None:
     # short train (no eval) to measure real-loop SPS on the GPU
     args = ["--no-eval", "--total-timesteps", str(total_timesteps), *extra_args]
@@ -175,16 +168,13 @@ def main() -> None:
     target = float(os.environ["TARGET"]) if os.environ.get("TARGET") else None
     extra = shlex.split(os.environ.get("EXTRA_ARGS", "")) or None
 
-    # PROFILE/SMOKE: measure H100 speed. Default to the winning config on difficulty 0 (basic = procedural,
+    # SMOKE: measure H100 speed. Default to the winning config on difficulty 0 (basic = procedural,
     # no big download), 8192 agents — directly comparable to the 3090's 172k env-steps/s.
     cfg_args = ["--difficulty", os.environ.get("DIFFICULTY", "0"),
                 "--arch", os.environ.get("ARCH", "cnn-mingru"),
                 "--num-layers", os.environ.get("NUM_LAYERS", "3"),
                 "--hidden-size", os.environ.get("HIDDEN_SIZE", "256"),
                 "--num-agents", os.environ.get("NUM_AGENTS", "8192")]
-    if os.environ.get("PROFILE"):
-        profile.remote(cfg_args)
-        return
     if os.environ.get("SMOKE"):
         smoke.remote(run_name, int(os.environ.get("SMOKE_STEPS", "60000000")), cfg_args)
         return

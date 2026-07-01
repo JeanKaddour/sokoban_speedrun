@@ -42,6 +42,8 @@ uv run python -m eval_speedrun --eval-checkpoint outputs/<run>/step_000075
 
 ## Non-LLM Track
 
+This track uses [PufferLib's](https://github.com/pufferai/pufferlib) Boxoban environment; the initial PPO implementation was forked from [pufferlib/torch_pufferl.py](https://github.com/PufferAI/PufferLib/blob/4.0/pufferlib/torch_pufferl.py).
+
 ### World record history
 
 ![Non-LLM track world records — held-out solve-rate vs wall-clock time to target](assets/non_llm_records.png)

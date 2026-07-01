@@ -1,4 +1,4 @@
-"""Sokoban Speedrun — non-LLM track.
+"""Sokoban Speedrun — non-LLM track, using Pufferlib's Boxoban environment.
 
 A from-scratch deep-RL agent that learns to solve Sokoban, racing the SAME metric as the LLM
 track in ``speedrun.py``: wall-clock-to-target (and FLOPs-to-target), where the target is a
@@ -74,7 +74,7 @@ RECIPE = {
     "num_agents": 8192,         # proven-best on unfiltered (h256); the recipe's 32768 didn't help here
     "max_episode_steps": 120,   # 120 > the recipe's 150 on held-out (ablation: 150 cost ~0.04 solve-rate)
     "holdout_frac": 0.1,        # fraction of the level pool held out (disjoint) for the eval gate
-    # --- PPO rollout / optimization (PuffeRL) ---
+    # --- PPO rollout / optimization ---
     "total_timesteps": 681_574_400,  # 1300 iters — record #3's matched-anneal horizon (cosine LR anneals over the run)
     "rollout_horizon": 64,
     "minibatch_size": 32768,    # segment minibatch: minibatch_segments = minibatch_size / horizon
@@ -409,8 +409,7 @@ def ensure_holdout_bin(difficulty_name: str | None, split: str) -> Path | None:
     return out
 
 
-# ============================ action sampling (ported from pufferlib.torch_pufferl) ==========
-# Faithful copies so logprob/entropy match PuffeRL bit-for-bit.
+# ============================ action sampling ===============================================
 from torch.distributions.utils import logits_to_probs  # noqa: E402
 
 
@@ -429,7 +428,7 @@ def _entropy(logits):
 
 
 def sample_logits(logits, action=None):
-    """Discrete (single-head) action sampling, matching PuffeRL. logits: (N, num_actions)."""
+    """Discrete (single-head) action sampling. logits: (N, num_actions)."""
     logits = logits.unsqueeze(0)
     normalized_logits = logits - logits.logsumexp(dim=-1, keepdim=True)
     probs = logits_to_probs(logits)
@@ -445,7 +444,7 @@ def sample_logits(logits, action=None):
     return action.T, logprob.squeeze(0), logits_entropy.squeeze(0)
 
 
-# ============================ Muon optimizer (ported from pufferlib.muon) ====================
+# ============================ Muon optimizer =================================================
 _NS_COEFS = [(4.0848, -6.8946, 2.9270), (3.9505, -6.3029, 2.6377), (3.7418, -5.5913, 2.3037),
              (2.8769, -3.1427, 1.2046), (2.8366, -3.0525, 1.2012)]
 
@@ -468,8 +467,7 @@ def _zeropower_via_newtonschulz5(G, eps=1e-7):
 
 
 class Muon(torch.optim.Optimizer):
-    """Muon (Newton-Schulz orthogonalized momentum). Ported from pufferlib.muon.Muon; the only
-    change is dropping the torch>=2.9 ``_to_scalar`` import (we float() the lr instead)."""
+    """Muon (Newton-Schulz orthogonalized momentum)."""
 
     def __init__(self, params, lr=0.0025, weight_decay=0.0, momentum=0.9, eps=1e-8):
         super().__init__(params, {"lr": lr, "weight_decay": weight_decay, "momentum": momentum,
@@ -501,11 +499,10 @@ class Muon(torch.optim.Optimizer):
         return loss
 
 
-# ============================ VTrace+GAE advantage (ported from src/ kernels) ================
-def puff_advantage(values, rewards, terminals, importance, gamma, gae_lambda, rho_clip, c_clip):
-    """VTrace-corrected GAE advantage. Faithful torch port of the kernel that PuffeRL actually
-    runs: `puff_advantage_row_vec` in src/pufferlib.cu (the vectorized path, selected whenever
-    horizon % (16/precision_bytes) == 0, which holds for horizon 64 / float32). Note rho_t scales
+# ============================ VTrace+GAE advantage ===========================================
+def compute_advantages(values, rewards, terminals, importance, gamma, gae_lambda, rho_clip, c_clip):
+    """VTrace-corrected GAE advantage. Matches the vectorized kernel path selected whenever
+    horizon % (16/precision_bytes) == 0, which holds for horizon 64 / float32. Note rho_t scales
     the WHOLE TD residual here — the scalar/CPU variant `rho_t*r + ...` differs and is unused.
     All tensors are (rows, horizon); advantages[:, -1] stays 0."""
     rows, horizon = values.shape
@@ -525,7 +522,7 @@ def puff_advantage(values, rewards, terminals, importance, gamma, gae_lambda, rh
 # ============================ policy network (hackable) =====================================
 class ActorCritic(nn.Module):
     """Small conv actor-critic over the 4x10x10 Sokoban board. forward()/forward_eval() return the
-    same shapes as pufferlib.models.Policy so this plugs into the ported PuffeRL train step."""
+    same shapes as pufferlib.models.Policy so this plugs into the train step."""
 
     def __init__(self, hidden_size: int = 256):
         super().__init__()
@@ -686,9 +683,9 @@ class BoxobanVecEnv:
         self._vec.close()
 
 
-# ============================ rollout (PuffeRL convention) ===================================
+# ============================ rollout buffers ===============================================
 def collect_rollout(env: BoxobanVecEnv, policy: ActorCritic, horizon: int, device: str, amp: bool = False):
-    """Collect `horizon` steps for all agents, matching PuffeRL.rollouts: stored rewards[t]/terminals[t]
+    """Collect `horizon` steps for all agents. Stored rewards[t]/terminals[t]
     are those *received arriving at* obs[t] (i.e. for action[t-1]); the advantage uses rewards[t+1]."""
     A, S = env.num_agents, env.obs_size
     obs = torch.empty(horizon, A, S, dtype=torch.uint8, device=device)
@@ -718,11 +715,10 @@ def collect_rollout(env: BoxobanVecEnv, policy: ActorCritic, horizon: int, devic
     return obs, act, val, logp, rew, done
 
 
-# ============================ PuffeRL train step (faithful port) =============================
-def puff_train(policy: nn.Module, optimizer: torch.optim.Optimizer, obs, act, val, logp, rew, ter,
+# ============================ PPO train step =================================================
+def train_step(policy: nn.Module, optimizer: torch.optim.Optimizer, obs, act, val, logp, rew, ter,
                cfg, epoch: int, total_epochs: int) -> dict:
-    """One PuffeRL training pass over a rollout. Faithful port of
-    pufferlib.torch_pufferl.PuffeRL.train(): reward clamp, prioritized segment replay, VTrace+GAE
+    """One PPO training pass over a rollout: reward clamp, prioritized segment replay, VTrace+GAE
     advantage recomputed per minibatch with refreshed values, clipped policy+value loss, Muon step,
     cosine LR. Buffers are (horizon, agents[, obs]); updates `policy` in place. Returns mean losses."""
     device = val.device
@@ -732,9 +728,8 @@ def puff_train(policy: nn.Module, optimizer: torch.optim.Optimizer, obs, act, va
 
     b0, a = cfg.prio_beta0, cfg.prio_alpha
     clip_coef, vf_clip = cfg.clip_coef, cfg.vf_clip_coef
-    # Prioritized-replay IS-bias anneal. The `* a` (prio_alpha) factor is intentional — this is a
-    # verbatim port of PuffeRL (pufferlib.torch_pufferl.PuffeRL.train: `anneal_beta = b0 +
-    # (1-b0)*a*epoch/total_epochs`), NOT the textbook `b0 + (1-b0)*epoch/total`. Do not "fix" it.
+    # Prioritized-replay IS-bias anneal. The `* a` (prio_alpha) factor is intentional: it matches
+    # Pufferlib's trainer code, NOT the textbook `b0 + (1-b0)*epoch/total`.
     anneal_beta = b0 + (1 - b0) * a * epoch / total_epochs
     ratio_buf = torch.ones(total_agents, horizon, device=device)
 
@@ -756,8 +751,8 @@ def puff_train(policy: nn.Module, optimizer: torch.optim.Optimizer, obs, act, va
     sums = {k: 0.0 for k in ("policy", "value", "entropy", "approx_kl", "clipfrac", "grad_norm")}
     advantages = torch.zeros_like(val_t)
     for _ in range(num_minibatches):
-        advantages = puff_advantage(val_t, rew_t, ter_t, ratio_buf, cfg.gamma, cfg.gae_lambda,
-                                    cfg.vtrace_rho_clip, cfg.vtrace_c_clip)
+        advantages = compute_advantages(val_t, rew_t, ter_t, ratio_buf, cfg.gamma, cfg.gae_lambda,
+                                        cfg.vtrace_rho_clip, cfg.vtrace_c_clip)
         seg_adv = advantages.abs().sum(axis=1)
         prio_weights = torch.nan_to_num(seg_adv ** a, 0, 0, 0)
         prio_probs = (prio_weights + 1e-6) / (prio_weights.sum() + 1e-6)
@@ -953,7 +948,7 @@ def train(cfg: argparse.Namespace) -> Path:
         init_rng = _capture_rng_state()
         for _ in range(2):
             wo, wa, wv, wl, wr, wd = collect_rollout(env, policy, cfg.rollout_horizon, device, amp=cfg.bf16)
-            puff_train(policy, optimizer, wo, wa, wv, wl, wr, wd, cfg, 0, total_iters)
+            train_step(policy, optimizer, wo, wa, wv, wl, wr, wd, cfg, 0, total_iters)
         _orig.load_state_dict(init_model)
         optimizer.load_state_dict(init_opt)
         env.close()
@@ -969,7 +964,7 @@ def train(cfg: argparse.Namespace) -> Path:
     for it in range(total_iters):
         obs, act, val, logp, rew, done = collect_rollout(env, policy, cfg.rollout_horizon, device, amp=cfg.bf16)
         global_step += steps_per_iter
-        stats = puff_train(policy, optimizer, obs, act, val, logp, rew, done, cfg, it, total_iters)
+        stats = train_step(policy, optimizer, obs, act, val, logp, rew, done, cfg, it, total_iters)
         elog = env.log()
         solved = float(elog.get("perf", 0.0))
         logger.log_step(it, total_iters, reward_mean=float(elog.get("targets_hit", 0.0)),
@@ -1141,59 +1136,9 @@ def evaluate(cfg: argparse.Namespace, checkpoint: Path) -> dict:
     return record
 
 
-# ============================ throughput profile ============================================
-def profile_run(cfg: argparse.Namespace) -> None:
-    """Time per-iteration cost split into env-step / policy-inference (rollout) / train (fwd+bwd+Muon),
-    so we can reason about where wall-clock goes and how it scales to other GPUs."""
-    ensure_boxoban_extension()
-    os.chdir(pufferlib_root())
-    set_seed(cfg.seed)
-    env = BoxobanVecEnv(difficulty=cfg.difficulty, num_agents=cfg.num_agents,
-                        max_steps=cfg.max_episode_steps, seed=cfg.seed)
-    device = env.device
-    policy = build_policy(cfg, env, device)
-    optimizer = Muon(policy.parameters(), lr=cfg.learning_rate, momentum=cfg.beta1, eps=cfg.muon_eps)
-    H, A = cfg.rollout_horizon, env.num_agents
-
-    def sync():
-        if device == "cuda":
-            torch.cuda.synchronize()
-
-    roll = collect_rollout(env, policy, H, device, amp=cfg.bf16)            # warmup
-    puff_train(policy, optimizer, *roll, cfg, 1, 100); sync()
-    N = 10
-    sync(); t0 = time.perf_counter()
-    for _ in range(N * H):
-        env.step(torch.randint(0, NUM_ACTIONS, (A,), device=device))
-    sync(); t_env = (time.perf_counter() - t0) / N
-    sync(); t0 = time.perf_counter()
-    for _ in range(N):
-        roll = collect_rollout(env, policy, H, device, amp=cfg.bf16)
-    sync(); t_roll = (time.perf_counter() - t0) / N
-    sync(); t0 = time.perf_counter()
-    for _ in range(N):
-        puff_train(policy, optimizer, *roll, cfg, 1, 100)
-    sync(); t_train = (time.perf_counter() - t0) / N
-
-    steps = A * H
-    t_pol = max(0.0, t_roll - t_env)
-    t_iter = t_roll + t_train
-    nparams = sum(p.numel() for p in policy.parameters())
-    print(f"[profile] arch={cfg.arch} h{cfg.hidden_size} L{cfg.num_layers} params={nparams:,} "
-          f"agents={A} horizon={H} minibatches/iter={int(cfg.replay_ratio * steps / cfg.minibatch_size)} device={device}")
-    print(f"[profile] per-iter ({steps:,} env-steps):")
-    print(f"  env step (C/GPU env)       {t_env*1e3:7.1f} ms  ({100*t_env/t_iter:4.1f}%)")
-    print(f"  policy inference (rollout) {t_pol*1e3:7.1f} ms  ({100*t_pol/t_iter:4.1f}%)")
-    print(f"  train (fwd+bwd+Muon)       {t_train*1e3:7.1f} ms  ({100*t_train/t_iter:4.1f}%)")
-    print(f"  TOTAL                      {t_iter*1e3:7.1f} ms  -> {steps/t_iter:,.0f} env-steps/s")
-    print(f"[profile] GPU policy work (inference+train) = {100*(t_pol+t_train)/t_iter:.0f}% of wall-clock "
-          f"-> faster GPUs scale most of it; env step = {100*t_env/t_iter:.0f}%")
-    env.close()
-
-
 # ============================ CLI ===========================================================
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Sokoban Speedrun — non-LLM (PufferLib boxoban + in-file PuffeRL PPO)")
+    p = argparse.ArgumentParser(description="Sokoban Speedrun — non-LLM (PufferLib boxoban + in-file PPO)")
     p.add_argument("--run", type=str, default=_default_run_name())
     p.add_argument("--output-dir", type=str, default="outputs")
     for key, val in RECIPE.items():
@@ -1207,15 +1152,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--eval-only", action="store_true")
     p.add_argument("--eval-checkpoint", type=str, default=None)
     p.add_argument("--no-eval", action="store_true")
-    p.add_argument("--profile", action="store_true", help="time env/policy/train per iter and exit")
     return p
 
 
 def main(argv: list[str] | None = None) -> None:
     cfg = build_parser().parse_args(argv)
-    if cfg.profile:
-        profile_run(cfg)
-        return
     if cfg.eval_only:
         ckpt = Path(cfg.eval_checkpoint).resolve() if cfg.eval_checkpoint else None
         if ckpt is None or not ckpt.exists():
