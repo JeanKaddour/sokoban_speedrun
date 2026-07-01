@@ -1,17 +1,4 @@
-"""Modal entrypoint for the non-LLM Sokoban speedrun track (PufferLib boxoban + in-file PPO).
-
-The non-LLM track is a different stack, so it gets its own image: a CUDA-devel base with clang + a cu126 torch,
-into which the `boxoban` env extension is built (`--float`) at image
-build time. Records run on a single H100 (Boxoban PPO is GPU-light; a full run is minutes).
-
-Usage (mirrors modal_app.py's env-var local entrypoint):
-
-    # train to target + final held-out eval, artifacts -> volume /vol/outputs/<run>/
-    uv run modal run --detach modal_app_non_llm.py
-
-    # eval an existing checkpoint only
-    EVAL_CHECKPOINT=/vol/outputs/<run>/final.pt uv run modal run modal_app_non_llm.py
-"""
+"""Modal entrypoint for the non-LLM Sokoban speedrun track (PufferLib boxoban + in-file PPO)."""
 
 from __future__ import annotations
 
@@ -115,7 +102,7 @@ def _run(extra_args: list[str]) -> None:
 
 @app.function(image=image, gpu=GPU_CONFIG, timeout=24 * 60 * 60,
               volumes={VOLUME_MOUNT_PATH: volume}, secrets=runtime_secrets)
-def train(run_name: str | None, difficulty: int | None, total_timesteps: int | None, target: float | None,
+def train(run_name: str | None, difficulty: int | None, total_timesteps: int | None,
           holdout_frac: float | None, extra_args: list[str] | None = None) -> None:
     args = []
     if run_name is not None:
@@ -124,8 +111,6 @@ def train(run_name: str | None, difficulty: int | None, total_timesteps: int | N
         args += ["--difficulty", str(difficulty)]
     if total_timesteps is not None:
         args += ["--total-timesteps", str(total_timesteps)]
-    if target is not None:
-        args += ["--target", str(target)]
     if holdout_frac is not None:
         args += ["--holdout-frac", str(holdout_frac)]
     args += [*(extra_args or [])]
@@ -134,19 +119,10 @@ def train(run_name: str | None, difficulty: int | None, total_timesteps: int | N
 
 @app.function(image=image, gpu=GPU_CONFIG, timeout=6 * 60 * 60,
               volumes={VOLUME_MOUNT_PATH: volume}, secrets=runtime_secrets)
-def evaluate(checkpoint: str, run_name: str | None, difficulty: int | None, eval_episodes: int | None,
-             target: float | None, holdout_frac: float | None, extra_args: list[str] | None = None) -> None:
+def evaluate(checkpoint: str, run_name: str | None, extra_args: list[str] | None = None) -> None:
     args = ["--eval-only", "--eval-checkpoint", checkpoint]
     if run_name is not None:
         args += ["--run", run_name]
-    if difficulty is not None:
-        args += ["--difficulty", str(difficulty)]
-    if eval_episodes is not None:
-        args += ["--eval-episodes", str(eval_episodes)]
-    if target is not None:
-        args += ["--target", str(target)]
-    if holdout_frac is not None:
-        args += ["--holdout-frac", str(holdout_frac)]
     args += [*(extra_args or [])]
     _run(args)
 
@@ -165,7 +141,6 @@ def main() -> None:
     run_name = os.environ.get("RUN_NAME")
     difficulty = int(os.environ["DIFFICULTY"]) if os.environ.get("DIFFICULTY") else None
     holdout_frac = float(os.environ["HOLDOUT_FRAC"]) if os.environ.get("HOLDOUT_FRAC") else None
-    target = float(os.environ["TARGET"]) if os.environ.get("TARGET") else None
     extra = shlex.split(os.environ.get("EXTRA_ARGS", "")) or None
 
     # SMOKE: measure H100 speed. Default to the winning config on difficulty 0 (basic = procedural,
@@ -181,17 +156,15 @@ def main() -> None:
 
     eval_ckpt = os.environ.get("EVAL_CHECKPOINT")
     if eval_ckpt:
-        evaluate.remote(eval_ckpt, run_name, difficulty,
-                        int(os.environ["EVAL_EPISODES"]) if os.environ.get("EVAL_EPISODES") else None,
-                        target, holdout_frac, extra)
+        evaluate.remote(eval_ckpt, run_name, extra)
         return
 
     total = int(os.environ["TOTAL_TIMESTEPS"]) if os.environ.get("TOTAL_TIMESTEPS") else None
-    call = train.spawn(run_name, difficulty, total, target, holdout_frac, extra)
+    call = train.spawn(run_name, difficulty, total, holdout_frac, extra)
     total_desc = str(total) if total is not None else "RECIPE"
     print(f"Spawned Modal function call: {call.object_id} "
           f"(run={run_name or 'default'}, difficulty={difficulty}, total_timesteps={total_desc}, "
-          f"target={target}, holdout_frac={holdout_frac}, extra_args={extra})", flush=True)
+          f"holdout_frac={holdout_frac}, extra_args={extra})", flush=True)
     try:
         print(f"Function call dashboard: {call.get_dashboard_url()}", flush=True)
     except Exception:

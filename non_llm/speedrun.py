@@ -1,13 +1,6 @@
 """Sokoban Speedrun — non-LLM track, using Pufferlib's Boxoban environment.
 
-A from-scratch deep-RL agent that learns to solve Sokoban, racing the SAME metric as the LLM
-track in ``speedrun.py``: wall-clock-to-target (and FLOPs-to-target), where the target is a
-held-out Sokoban solve-rate whose lower 95% CI clears a threshold.
-
-Quickstart (local; see README.md):
-
-    uv sync
-    uv run python speedrun.py
+A from-scratch deep-RL agent that learns to solve Sokoban.
 
 Boxoban obs is a 4x10x10 byte grid (channels: agent, walls, boxes, targets); actions are
 {noop,down,up,left,right}. Solved == every box on a target. difficulty 0=basic..4=unfiltered.
@@ -16,6 +9,7 @@ Boxoban obs is a 4x10x10 byte grid (channels: agent, walls, boxes, targets); act
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
 import hashlib
 import json
@@ -34,7 +28,6 @@ import numpy as np
 SOURCE_PATH = Path(__file__).resolve()
 REPO_DIR = SOURCE_PATH.parent
 
-import contextlib  # noqa: E402
 import torch  # noqa: E402
 import torch.nn as nn  # noqa: E402
 
@@ -58,22 +51,22 @@ PUFFERLIB_COMMIT = "e90b58edef5445d1a3689e2f908f5841ad6a0f23"
 LOCAL_PUFFERLIB_DIR = Path(os.environ.get("PUFFERLIB_SRC_DIR", REPO_DIR / ".pufferlib-src")).expanduser()
 DIFFICULTY_NAMES = {0: "basic", 1: "easy", 2: "medium", 3: "hard", 4: "unfiltered"}
 OBS_CHANNELS, GRID = 4, 10
+GRID_CELLS = GRID * GRID
+BOXOBAN_META_BYTES = 5
+BOXOBAN_PUZZLE_BYTES = OBS_CHANNELS * GRID_CELLS + BOXOBAN_META_BYTES
 NUM_ACTIONS = 5
 
 
 # ============================ RUN RECIPE (single source of truth) ============================
-# PufferLib's tuned boxoban PPO hyperparameters (config/boxoban.ini) + speedrun knobs. Every value
-# is CLI-overridable (argparse defaults come from here). This is the hackable core — edit freely.
+# PufferLib's tuned boxoban PPO hyperparameters (config/boxoban.ini) + speedrun knobs. These are the
+# train-time defaults; argparse exposes them for experimentation without changing the eval contract.
 RECIPE = {
-    # --- environment (the one piece we don't own) ---
-    # Default = UNFILTERED: the official DeepMind Boxoban set with the canonical 1000-level test split
-    # (non-leaky). It's the *easiest* official set (medium/hard are filtered to be harder); from-scratch
-    # RL reaches a meaningful solve-rate here with the conv+recurrent arch, whereas medium/hard stay ~0
-    # full-solve even for PufferLib's own recipe. basic/easy are PufferLib's procedural tiers (leaky).
+    # --- environment ---
+    # Default = official DeepMind unfiltered levels with the canonical 1000-level test split.
     "difficulty": 4,            # 0=basic 1=easy 2=medium 3=hard 4=unfiltered
-    "num_agents": 8192,         # proven-best on unfiltered (h256); the recipe's 32768 didn't help here
-    "max_episode_steps": 120,   # 120 > the recipe's 150 on held-out (ablation: 150 cost ~0.04 solve-rate)
-    "holdout_frac": 0.1,        # fraction of the level pool held out (disjoint) for the eval gate
+    "num_agents": 8192,
+    "max_episode_steps": 120,
+    "holdout_frac": 0.1,        # procedural/index-partition holdout knob; canonical eval ignores it
     # --- PPO rollout / optimization ---
     "total_timesteps": 681_574_400,  # 1300 iters — record #3's matched-anneal horizon (cosine LR anneals over the run)
     "rollout_horizon": 64,
@@ -97,35 +90,23 @@ RECIPE = {
     "weight_decay": 0.0,
     "muon_eps": 1e-14,
     # --- model ---
-    # cnn-mingru (spatial conv encoder + recurrent core) is the winning arch: it cracks the official
-    # 4-box sets where the feedforward cnn and PufferLib's linear-encoder recurrent recipe both stall.
+    # cnn-mingru = spatial conv encoder + recurrent core.
     "arch": "cnn-mingru",       # cnn | mingru|lstm|gru|mlp | cnn-{mingru,lstm,gru}
     "hidden_size": 256,
     "num_layers": 3,            # recurrent (planning) depth — deeper generalizes better on official sets
-    "bf16": False,              # fp32 by default: bf16 autocast is ~1.3x faster but costs ~0.09 held-out
-                                # solve-rate on unfiltered (ablation) — accuracy beats speed for records.
-    "compile": True,            # torch.compile the policy — lossless (same fp32 math) kernel fusion on the
-                                # train-bound fwd/bwd, ~30% faster on our small (2.25M) net. Record #3's recipe.
+    "bf16": False,              # fp32 by default
+    "compile": True,            # torch.compile the policy for train-bound fwd/bwd kernel fusion.
     # --- bookkeeping ---
     "seed": 42,
     "wandb": False,             # --wandb 1 to enable; logs train/loss/opt/perf metrics per iter
     "wandb_project": "sokoban-speedrun-non-llm",
-    # --- held-out eval / gate ---
-    "eval_episodes": 16384,     # total held-out episodes; grouped per-level (~16/level for the 1000-level test)
-    "eval_seed": 12345,
-    "eval_greedy": True,
-    "eval_split": "test",       # official DeepMind held-out split (unfiltered/test = canonical 1000;
-                                # medium/valid for difficulty 2); falls back to index-partition if absent
-    "target": 0.70,             # leaderboard gate: lower 95% CI on per-level held-out solve-rate > this
 }
 
 
 # ============================ eval aggregates (verbatim from eval_speedrun.py) ===============
 # Single source of truth for the record aggregates: verify_record.py imports these so an offline
 # re-derivation of pass@1 / pass@k / CI can never drift from what evaluate() actually computed.
-# NOTE: this track's CI is ALWAYS the percentile bootstrap over per-level solve fractions (see
-# evaluate()); unlike the LLM track's eval_speedrun.py there is no Wilson (k==1) path, so none is
-# defined here — the verifier must not introduce one either.
+# This track always uses percentile bootstrap CIs over per-level solve fractions.
 def _pass_at_k_unbiased(n: int, c: int, k: int) -> float:
     if k > n:
         raise ValueError(f"pass@k requires k<=n, got k={k}, n={n}")
@@ -151,8 +132,13 @@ def _bootstrap_ci(values: list[float], *, n_boot: int = 10000, seed: int = 0,
 
 def _git_commit() -> str | None:
     try:
-        out = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True,
-                             cwd=str(REPO_DIR), timeout=10)
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_DIR),
+            timeout=10,
+        )
         return out.stdout.strip() if out.returncode == 0 else None
     except Exception:
         return None
@@ -174,8 +160,11 @@ def _file_sha256(path) -> str | None:
 class DummyWandb:
     """No-op wandb stand-in (mirrors speedrun.py) so the train loop is wandb-agnostic."""
 
-    def log(self, *a, **k): pass
-    def finish(self, *a, **k): pass
+    def log(self, *a, **k):
+        pass
+
+    def finish(self, *a, **k):
+        pass
 
 
 def pufferlib_root() -> Path:
@@ -205,8 +194,12 @@ def _pufferlib_source_ready(path: Path) -> bool:
 def _pufferlib_checkout_matches(path: Path) -> bool:
     if not _pufferlib_source_ready(path):
         return False
-    out = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"],
-                         capture_output=True, text=True, timeout=10)
+    out = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
     return out.returncode == 0 and out.stdout.strip() == PUFFERLIB_COMMIT
 
 
@@ -340,25 +333,36 @@ def ensure_boxoban_extension() -> None:
 
 # ============================ official DeepMind held-out levels ==============================
 # The boxoban env's bin format is [agent(100), walls(100), boxes(100), targets(100), meta(5)] per
-# 10x10 puzzle (= PUZZLE_SIZE 405). This encoder is byte-identical to the env's own C parser (verified
-# against the generated medium bin), so we can build a held-out pool from the OFFICIAL DeepMind
-# train/valid/test splits and point the eval env at it via the BOXOBAN_MAP_BIN env var (the env loads
-# it directly when difficulty_id == -1). Clean disjoint held-out, no engine changes.
+# 10x10 puzzle. BOXOBAN_MAP_BIN lets eval load the official held-out split directly.
 _BOX_CHARS = {"agent": ("@", "+"), "wall": ("#",), "box": ("$", "*"), "target": (".", "*", "+")}
 
 
 def _encode_boxoban_puzzle(rows: list[str]) -> bytes:
-    agent = bytearray(100); walls = bytearray(100); boxes = bytearray(100); targets = bytearray(100)
-    ax = ay = -1; nb = nt = ot = 0
-    for r in range(10):
-        for c in range(10):
+    agent = bytearray(GRID_CELLS)
+    walls = bytearray(GRID_CELLS)
+    boxes = bytearray(GRID_CELLS)
+    targets = bytearray(GRID_CELLS)
+    ax = ay = -1
+    nb = nt = ot = 0
+
+    for r in range(GRID):
+        for c in range(GRID):
             ch = rows[r][c]
-            is_a = ch in _BOX_CHARS["agent"]; is_w = ch in _BOX_CHARS["wall"]
-            is_b = ch in _BOX_CHARS["box"]; is_t = ch in _BOX_CHARS["target"]
-            i = r * 10 + c
-            agent[i] = is_a; walls[i] = is_w; boxes[i] = is_b; targets[i] = is_t
-            if is_a: ax, ay = c, r
-            nb += is_b; nt += is_t; ot += (is_b and is_t)
+            is_a = ch in _BOX_CHARS["agent"]
+            is_w = ch in _BOX_CHARS["wall"]
+            is_b = ch in _BOX_CHARS["box"]
+            is_t = ch in _BOX_CHARS["target"]
+            i = r * GRID + c
+            agent[i] = is_a
+            walls[i] = is_w
+            boxes[i] = is_b
+            targets[i] = is_t
+            if is_a:
+                ax, ay = c, r
+            nb += is_b
+            nt += is_t
+            ot += is_b and is_t
+
     meta = bytes([ax & 0xFF, ay & 0xFF, nb, nt, ot])
     return bytes(agent) + bytes(walls) + bytes(boxes) + bytes(targets) + meta
 
@@ -374,14 +378,18 @@ def build_boxoban_bin(level_dir: Path, out_path: Path) -> int:
                     line = line.rstrip("\n")
                     if line.startswith(";"):
                         if rows:
-                            out.write(_encode_boxoban_puzzle(rows)); rows = []; n += 1
+                            out.write(_encode_boxoban_puzzle(rows))
+                            rows = []
+                            n += 1
                         continue
                     if not line.strip():
                         continue
-                    if len(rows) < 10:
-                        rows.append(line[:10])
-                    if len(rows) == 10:
-                        out.write(_encode_boxoban_puzzle(rows)); rows = []; n += 1
+                    if len(rows) < GRID:
+                        rows.append(line[:GRID])
+                    if len(rows) == GRID:
+                        out.write(_encode_boxoban_puzzle(rows))
+                        rows = []
+                        n += 1
     return n
 
 
@@ -413,21 +421,21 @@ def ensure_holdout_bin(difficulty_name: str | None, split: str) -> Path | None:
 from torch.distributions.utils import logits_to_probs  # noqa: E402
 
 
-def _log_prob(logits, value):
+def _log_prob(logits: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
     value = value.long().unsqueeze(-1)
     value, log_pmf = torch.broadcast_tensors(value, logits)
     value = value[..., :1]
     return log_pmf.gather(-1, value).squeeze(-1)
 
 
-def _entropy(logits):
+def _entropy(logits: torch.Tensor) -> torch.Tensor:
     min_real = torch.finfo(logits.dtype).min
     logits = torch.clamp(logits, min=min_real)
     p_log_p = logits * logits_to_probs(logits)
     return -p_log_p.sum(-1)
 
 
-def sample_logits(logits, action=None):
+def sample_logits(logits: torch.Tensor, action: torch.Tensor | None = None):
     """Discrete (single-head) action sampling. logits: (N, num_actions)."""
     logits = logits.unsqueeze(0)
     normalized_logits = logits - logits.logsumexp(dim=-1, keepdim=True)
@@ -445,11 +453,16 @@ def sample_logits(logits, action=None):
 
 
 # ============================ Muon optimizer =================================================
-_NS_COEFS = [(4.0848, -6.8946, 2.9270), (3.9505, -6.3029, 2.6377), (3.7418, -5.5913, 2.3037),
-             (2.8769, -3.1427, 1.2046), (2.8366, -3.0525, 1.2012)]
+_NS_COEFS = [
+    (4.0848, -6.8946, 2.9270),
+    (3.9505, -6.3029, 2.6377),
+    (3.7418, -5.5913, 2.3037),
+    (2.8769, -3.1427, 1.2046),
+    (2.8366, -3.0525, 1.2012),
+]
 
 
-def _zeropower_via_newtonschulz5(G, eps=1e-7):
+def _zeropower_via_newtonschulz5(G: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     x = G.clone()
     if G.size(-2) > G.size(-1):
         x = x.mT
@@ -470,14 +483,21 @@ class Muon(torch.optim.Optimizer):
     """Muon (Newton-Schulz orthogonalized momentum)."""
 
     def __init__(self, params, lr=0.0025, weight_decay=0.0, momentum=0.9, eps=1e-8):
-        super().__init__(params, {"lr": lr, "weight_decay": weight_decay, "momentum": momentum,
-                                  "eps": eps})
+        defaults = {
+            "lr": lr,
+            "weight_decay": weight_decay,
+            "momentum": momentum,
+            "eps": eps,
+        }
+        super().__init__(params, defaults)
 
     @torch.no_grad()
     def step(self, closure=None):
         loss = closure() if closure is not None else None
         for group in self.param_groups:
-            lr = float(group["lr"]); wd = group["weight_decay"]; momentum = group["momentum"]
+            lr = float(group["lr"])
+            wd = group["weight_decay"]
+            momentum = group["momentum"]
             for p in group["params"]:
                 if p.grad is None:
                     continue
@@ -527,21 +547,27 @@ class ActorCritic(nn.Module):
     def __init__(self, hidden_size: int = 256):
         super().__init__()
         self.encoder = nn.Sequential(
-            nn.Conv2d(OBS_CHANNELS, 32, 3, padding=1), nn.ReLU(),
-            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(OBS_CHANNELS, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.ReLU(),
             nn.Flatten(),
-            nn.Linear(64 * GRID * GRID, hidden_size), nn.ReLU(),
+            nn.Linear(64 * GRID_CELLS, hidden_size),
+            nn.ReLU(),
         )
         self.actor = nn.Linear(hidden_size, NUM_ACTIONS)
         self.critic = nn.Linear(hidden_size, 1)
         self.apply(self._init)
-        nn.init.orthogonal_(self.actor.weight, 0.01); nn.init.zeros_(self.actor.bias)
-        nn.init.orthogonal_(self.critic.weight, 1.0); nn.init.zeros_(self.critic.bias)
+        nn.init.orthogonal_(self.actor.weight, 0.01)
+        nn.init.zeros_(self.actor.bias)
+        nn.init.orthogonal_(self.critic.weight, 1.0)
+        nn.init.zeros_(self.critic.bias)
 
     @staticmethod
     def _init(m: nn.Module) -> None:
         if isinstance(m, (nn.Conv2d, nn.Linear)):
-            nn.init.orthogonal_(m.weight, math.sqrt(2)); nn.init.zeros_(m.bias)
+            nn.init.orthogonal_(m.weight, math.sqrt(2))
+            nn.init.zeros_(m.bias)
 
     def _encode(self, obs_flat: torch.Tensor) -> torch.Tensor:
         return self.encoder(obs_flat.view(-1, OBS_CHANNELS, GRID, GRID).float())
@@ -569,14 +595,18 @@ class ConvEncoder(nn.Module):
     def __init__(self, obs_size: int, hidden_size: int):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(OBS_CHANNELS, 32, 3, padding=1), nn.ReLU(),
-            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(OBS_CHANNELS, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.ReLU(),
             nn.Flatten(),
-            nn.Linear(64 * GRID * GRID, hidden_size), nn.ReLU(),
+            nn.Linear(64 * GRID_CELLS, hidden_size),
+            nn.ReLU(),
         )
         for m in self.modules():
             if isinstance(m, (nn.Conv2d, nn.Linear)):
-                nn.init.orthogonal_(m.weight, math.sqrt(2)); nn.init.zeros_(m.bias)
+                nn.init.orthogonal_(m.weight, math.sqrt(2))
+                nn.init.zeros_(m.bias)
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         x = observations.view(observations.shape[0], OBS_CHANNELS, GRID, GRID).float()
@@ -605,14 +635,22 @@ def build_policy(cfg: argparse.Namespace, env: "BoxobanVecEnv", device: str) -> 
     return torch.compile(policy) if getattr(cfg, "compile", False) else policy
 
 
+def _policy_module(policy: nn.Module) -> nn.Module:
+    return getattr(policy, "_orig_mod", policy)
+
+
 # ============================ PufferLib boxoban vec-env (the dependency) =====================
 _TYPESTR = {torch.uint8: "|u1", torch.float32: "<f4"}
 
 
 class _CudaPtr:
     def __init__(self, ptr: int, shape: tuple[int, ...], dtype: torch.dtype):
-        self.__cuda_array_interface__ = {"data": (ptr, False), "shape": shape,
-                                         "typestr": _TYPESTR[dtype], "version": 2}
+        self.__cuda_array_interface__ = {
+            "data": (ptr, False),
+            "shape": shape,
+            "typestr": _TYPESTR[dtype],
+            "version": 2,
+        }
 
 
 class BoxobanVecEnv:
@@ -636,8 +674,7 @@ class BoxobanVecEnv:
         args["vec"]["total_agents"] = int(num_agents)
         args["env"]["difficulty"] = int(difficulty)
         args["env"]["max_steps"] = int(max_steps)
-        # Held-out split (forked boxoban kwargs): train env samples the first (1-holdout_frac) of the
-        # level pool, the eval env samples the disjoint held-out tail. Same holdout_frac on both sides.
+        # Forked boxoban kwargs for disjoint index-partition holdouts.
         args["env"]["eval"] = 1 if eval_mode else 0
         args["env"]["holdout_frac"] = float(holdout_frac)
         args["seed"] = int(seed)
@@ -666,7 +703,8 @@ class BoxobanVecEnv:
         a = actions.reshape(self.num_agents, 1).to(torch.float32).contiguous()
         if self.gpu:
             a = a.cuda()
-            self._vec.gpu_step(a.data_ptr()); torch.cuda.synchronize()
+            self._vec.gpu_step(a.data_ptr())
+            torch.cuda.synchronize()
         else:
             self._vec.cpu_step(a.data_ptr())
         rew = self._view(self._vec.gpu_rewards_ptr if self.gpu else self._vec.rewards_ptr,
@@ -684,34 +722,36 @@ class BoxobanVecEnv:
 
 
 # ============================ rollout buffers ===============================================
-def collect_rollout(env: BoxobanVecEnv, policy: ActorCritic, horizon: int, device: str, amp: bool = False):
+def collect_rollout(env: BoxobanVecEnv, policy: nn.Module, horizon: int, device: str, amp: bool = False):
     """Collect `horizon` steps for all agents. Stored rewards[t]/terminals[t]
     are those *received arriving at* obs[t] (i.e. for action[t-1]); the advantage uses rewards[t+1]."""
-    A, S = env.num_agents, env.obs_size
-    obs = torch.empty(horizon, A, S, dtype=torch.uint8, device=device)
-    act = torch.empty(horizon, A, dtype=torch.long, device=device)
-    logp = torch.empty(horizon, A, device=device)
-    val = torch.empty(horizon, A, device=device)
-    rew = torch.empty(horizon, A, device=device)
-    done = torch.empty(horizon, A, device=device)
-    state = policy.initial_state(A, device)
+    num_agents = env.num_agents
+    obs_size = env.obs_size
+    obs = torch.empty(horizon, num_agents, obs_size, dtype=torch.uint8, device=device)
+    act = torch.empty(horizon, num_agents, dtype=torch.long, device=device)
+    logp = torch.empty(horizon, num_agents, device=device)
+    val = torch.empty(horizon, num_agents, device=device)
+    rew = torch.empty(horizon, num_agents, device=device)
+    done = torch.empty(horizon, num_agents, device=device)
+    state = policy.initial_state(num_agents, device)
     if amp:  # carry recurrent state in bf16 so it matches the autocast activations (lerp etc.)
         state = tuple(s.to(torch.bfloat16) for s in state)
-    r = torch.zeros(A, device=device)
-    d = torch.zeros(A, device=device)
+    r = torch.zeros(num_agents, device=device)
+    d = torch.zeros(num_agents, device=device)
     for t in range(horizon):
         o = env.obs().to(device, copy=True)
         with torch.no_grad(), _amp(amp, device):
             logits, value, state = policy.forward_eval(o, state)
             action, logprob, _ = sample_logits(logits)
         obs[t] = o
-        act[t] = action.reshape(A)
+        act[t] = action.reshape(num_agents)
         logp[t] = logprob
-        val[t] = value.reshape(A)
+        val[t] = value.reshape(num_agents)
         rew[t] = r
         done[t] = d
-        reward, terminal = env.step(action.reshape(A))
-        r = reward.to(device); d = terminal.to(device)
+        reward, terminal = env.step(action.reshape(num_agents))
+        r = reward.to(device)
+        d = terminal.to(device)
     return obs, act, val, logp, rew, done
 
 
@@ -726,11 +766,12 @@ def train_step(policy: nn.Module, optimizer: torch.optim.Optimizer, obs, act, va
     batch_size = total_agents * horizon
     minibatch_segments = cfg.minibatch_size // horizon
 
-    b0, a = cfg.prio_beta0, cfg.prio_alpha
+    prio_beta0 = cfg.prio_beta0
+    prio_alpha = cfg.prio_alpha
     clip_coef, vf_clip = cfg.clip_coef, cfg.vf_clip_coef
-    # Prioritized-replay IS-bias anneal. The `* a` (prio_alpha) factor is intentional: it matches
-    # Pufferlib's trainer code, NOT the textbook `b0 + (1-b0)*epoch/total`.
-    anneal_beta = b0 + (1 - b0) * a * epoch / total_epochs
+    # Prioritized-replay IS-bias anneal. The `* prio_alpha` factor is intentional: it matches
+    # Pufferlib's trainer code, NOT the textbook `beta0 + (1-beta0)*epoch/total`.
+    anneal_beta = prio_beta0 + (1 - prio_beta0) * prio_alpha * epoch / total_epochs
     ratio_buf = torch.ones(total_agents, horizon, device=device)
 
     if cfg.anneal_lr and epoch > 0:
@@ -743,25 +784,25 @@ def train_step(policy: nn.Module, optimizer: torch.optim.Optimizer, obs, act, va
     obs_t = obs.transpose(0, 1).contiguous()
     act_t = act.transpose(0, 1).contiguous()
     val_t = val.T.contiguous()
-    lp_t = logp.T.contiguous()
+    logp_t = logp.T.contiguous()
     rew_t = rew.T.contiguous().clamp(-1, 1)
-    ter_t = ter.T.contiguous()
+    done_t = ter.T.contiguous()
 
     num_minibatches = int(cfg.replay_ratio * batch_size / cfg.minibatch_size)
     sums = {k: 0.0 for k in ("policy", "value", "entropy", "approx_kl", "clipfrac", "grad_norm")}
     advantages = torch.zeros_like(val_t)
     for _ in range(num_minibatches):
-        advantages = compute_advantages(val_t, rew_t, ter_t, ratio_buf, cfg.gamma, cfg.gae_lambda,
+        advantages = compute_advantages(val_t, rew_t, done_t, ratio_buf, cfg.gamma, cfg.gae_lambda,
                                         cfg.vtrace_rho_clip, cfg.vtrace_c_clip)
         seg_adv = advantages.abs().sum(axis=1)
-        prio_weights = torch.nan_to_num(seg_adv ** a, 0, 0, 0)
+        prio_weights = torch.nan_to_num(seg_adv ** prio_alpha, 0, 0, 0)
         prio_probs = (prio_weights + 1e-6) / (prio_weights.sum() + 1e-6)
         idx = torch.multinomial(prio_probs, minibatch_segments, replacement=True)
-        mb_prio = (total_agents * prio_probs[idx, None]) ** -anneal_beta
+        mb_is_weight = (total_agents * prio_probs[idx, None]) ** -anneal_beta
 
         mb_obs = obs_t[idx]
         mb_actions = act_t[idx]
-        mb_logprobs = lp_t[idx]
+        mb_logprobs = logp_t[idx]
         mb_values = val_t[idx]
         mb_returns = advantages[idx] + mb_values
         mb_advantages = advantages[idx]
@@ -779,7 +820,7 @@ def train_step(policy: nn.Module, optimizer: torch.optim.Optimizer, obs, act, va
                 clipfrac = ((ratio - 1.0).abs() > clip_coef).float().mean()
 
             adv = mb_advantages
-            adv = mb_prio * (adv - adv.mean()) / (adv.std() + 1e-8)
+            adv = mb_is_weight * (adv - adv.mean()) / (adv.std() + 1e-8)
             pg_loss1 = -adv * ratio
             pg_loss2 = -adv * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
             pg_loss = torch.max(pg_loss1, pg_loss2).mean()
@@ -819,12 +860,14 @@ class RunLogger:
         sha = self._save_source_snapshot(run_dir, source)
         self.path = run_dir / f"log_{uuid.uuid4().hex[:8]}.txt"
         self._fh = self.path.open("w", encoding="utf-8")
-        self._fh.write(self._header(args_dict, source, sha)); self._fh.flush()
+        self._fh.write(self._header(args_dict, source, sha))
+        self._fh.flush()
         print(f"RunLogger: writing record log to {self.path}")
 
     @staticmethod
     def _save_source_snapshot(run_dir: Path, source: str) -> str:
-        sd = run_dir / "source"; sd.mkdir(parents=True, exist_ok=True)
+        sd = run_dir / "source"
+        sd.mkdir(parents=True, exist_ok=True)
         name = SOURCE_PATH.name  # track the recipe filename so the snapshot can't drift on rename
         (sd / name).write_text(source, encoding="utf-8")
         sha = hashlib.sha256(source.encode("utf-8")).hexdigest()
@@ -854,10 +897,16 @@ class RunLogger:
         d = RunLogger._DIVIDER
         return f"{source}\n{d}\n" + "\n".join(lines) + f"\n{d}\n"
 
-    def start_clock(self, anchor): self._t0 = anchor if self._t0 is None else self._t0
-    def record_time(self): return time.monotonic() - self._t0 if self._t0 is not None else 0.0
+    def start_clock(self, anchor):
+        self._t0 = anchor if self._t0 is None else self._t0
+
+    def record_time(self):
+        return time.monotonic() - self._t0 if self._t0 is not None else 0.0
+
     def _write(self, line):
-        if self._fh is not None: self._fh.write(line + "\n"); self._fh.flush()
+        if self._fh is not None:
+            self._fh.write(line + "\n")
+            self._fh.flush()
 
     def log_step(self, step, num_steps, *, reward_mean, solved_frac, loss, grad_norm):
         rt = self.record_time()
@@ -869,13 +918,17 @@ class RunLogger:
         self._write(f"final_checkpoint:{path} record_time:{self.record_time():.1f}s")
 
     def close(self):
-        if self._fh is not None: self._fh.close(); self._fh = None
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
 
 
 # ============================ training ======================================================
 def set_seed(seed: int):
-    torch.manual_seed(seed); np.random.seed(seed)
-    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def _capture_rng_state() -> dict:
@@ -894,12 +947,6 @@ def _restore_rng_state(state: dict) -> None:
     np.random.set_state(state["numpy"])
     if torch.cuda.is_available() and "cuda" in state:
         torch.cuda.set_rng_state_all(state["cuda"])
-
-
-# NOTE: no FLOPs co-metric on this track. Wall-clock (on the fixed single H100) is the sole metric.
-# A FLOPs estimate would have to be re-derived and re-validated for every new architecture — and this
-# is an OPEN-architecture track, so any estimator silently undercounts layer/op types it doesn't know
-# about, making the number unfair across entries. Env-step throughput (SPS) is logged for diagnostics.
 
 
 def train(cfg: argparse.Namespace) -> Path:
@@ -936,19 +983,20 @@ def train(cfg: argparse.Namespace) -> Path:
 
     if cfg.compile:
         import copy
-        # modded-nanogpt timing convention: pay the one-time torch.compile cost (and cudnn autotune) in
-        # an UNTIMED warmup, then reset the weights + optimizer to their init — so the timed run trains
-        # the FULL schedule from scratch at compiled speed. No compile in the clock and no free training
-        # steps, leaving it directly comparable to the (uncompiled) fp32 records #1/#2, which time their
-        # whole run from step 1. The 2 warmup iters use the real loop, so nothing recompiles once timed.
-        # Then restore every mutable training input: weights, optimizer, RNG, and a freshly seeded env.
-        _orig = getattr(policy, "_orig_mod", policy)
+        # Warm up compile/autotune outside the timed run, then restore every mutable training input.
+        _orig = _policy_module(policy)
         init_model = copy.deepcopy(_orig.state_dict())
         init_opt = copy.deepcopy(optimizer.state_dict())
         init_rng = _capture_rng_state()
         for _ in range(2):
-            wo, wa, wv, wl, wr, wd = collect_rollout(env, policy, cfg.rollout_horizon, device, amp=cfg.bf16)
-            train_step(policy, optimizer, wo, wa, wv, wl, wr, wd, cfg, 0, total_iters)
+            warmup_obs, warmup_act, warmup_val, warmup_logp, warmup_rew, warmup_done = collect_rollout(
+                env, policy, cfg.rollout_horizon, device, amp=cfg.bf16,
+            )
+            train_step(
+                policy, optimizer,
+                warmup_obs, warmup_act, warmup_val, warmup_logp, warmup_rew, warmup_done,
+                cfg, 0, total_iters,
+            )
         _orig.load_state_dict(init_model)
         optimizer.load_state_dict(init_opt)
         env.close()
@@ -958,7 +1006,7 @@ def train(cfg: argparse.Namespace) -> Path:
         if env.device != device:
             raise RuntimeError(f"fresh env device changed after compile warmup: {device!r} -> {env.device!r}")
 
-    # Time the full schedule from step 1, every iter included — same convention as records #1/#2.
+    # Time the full schedule from step 1.
     logger.start_clock(time.monotonic())
     global_step = 0
     for it in range(total_iters):
@@ -986,124 +1034,105 @@ def train(cfg: argparse.Namespace) -> Path:
                   f"ent={stats['entropy']:.3f} kl={stats['approx_kl']:.4f} gnorm={stats['grad_norm']:.2f} "
                   f"SPS={sps:,.0f} t={logger.record_time():.0f}s")
         if cfg.checkpoint_every and (it + 1) % cfg.checkpoint_every == 0:
-            torch.save(getattr(policy, "_orig_mod", policy).state_dict(), out_dir / f"step_{global_step:012d}.pt")
+            torch.save(_policy_module(policy).state_dict(), out_dir / f"step_{global_step:012d}.pt")
 
     final_ckpt = out_dir / "final.pt"
-    torch.save(getattr(policy, "_orig_mod", policy).state_dict(), final_ckpt)
+    torch.save(_policy_module(policy).state_dict(), final_ckpt)
     logger.log_final_checkpoint(final_ckpt)
-    logger.close(); env.close(); wandb_run.finish()
+    logger.close()
+    env.close()
+    wandb_run.finish()
     print(f"[train] done. final checkpoint: {final_ckpt}")
     return final_ckpt
 
 
 # ============================ held-out evaluation ===========================================
 def evaluate(cfg: argparse.Namespace, checkpoint: Path) -> dict:
-    """Roll the trained policy over the DISJOINT held-out Boxoban split; gate on solve-rate's lower
-    95% CI. pass@1 = mean per-level solve rate.
+    """Run the fixed non-LLM leaderboard eval: greedy policy over unfiltered/test."""
+    eval_difficulty = 4
+    eval_split = "test"
+    eval_seed = 12345
+    eval_episodes = 16_384
+    eval_num_agents = 512
+    eval_max_episode_steps = 120
+    target_solve_rate = 0.70
 
-    Disjointness (the crux of a valid record): for the default unfiltered/test the eval pool IS the
-    canonical 1000-level DeepMind *test* split, while training (difficulty=4) draws from the official
-    *train* split — disjoint by DeepMind's construction. We additionally pin the exact eval bin in the
-    record (holdout_bin_sha256 + per_puzzle_level_sha) so verify_record.py can confirm offline that
-    the eval ran on that committed pool. For procedural difficulties the forked boxoban env reserves
-    the last holdout_frac of the pool for eval (never sampled in training); in the official-split path
-    holdout_frac is unused on the eval side (the eval pool comes from the test bin, not the reserve)."""
     ensure_boxoban_extension()
     os.chdir(pufferlib_root())
-    set_seed(cfg.eval_seed)
-    diff_name = DIFFICULTY_NAMES.get(cfg.difficulty)
-    holdout_bin = ensure_holdout_bin(diff_name, cfg.eval_split)
-    if holdout_bin is not None:
-        # official DeepMind held-out split: load that pool directly (difficulty=-1 => BOXOBAN_MAP_BIN)
-        os.environ["BOXOBAN_MAP_BIN"] = str(holdout_bin)
-        eval_difficulty, eval_mode, eval_holdout = -1, False, 0.0
-        split_label = f"{diff_name}/{cfg.eval_split}-official"
-    else:
-        # fallback: disjoint index-partition of the (procedural) difficulty pool
-        eval_difficulty, eval_mode, eval_holdout = cfg.difficulty, True, cfg.holdout_frac
-        split_label = f"{diff_name}-holdout{cfg.holdout_frac}"
-    # Eval is num_agents-INVARIANT: cap the eval pool so each agent completes many episodes (>= ~32).
-    # The per-level mean only converges when every held-out level is sampled enough; with the training
-    # num_agents (e.g. 32768) vs eval_episodes (16384) each agent finishes <1 episode, levels are
-    # starved, and the score collapses (32768 agents -> 0.27 vs 1024 -> 0.69 on the SAME checkpoint).
-    # PufferLib sidesteps this entirely by reading the C-aggregated env.log()['perf'] (a true
-    # per-episode solve mean) over long rollouts; we cross-check against it below.
-    eval_num_agents = min(cfg.num_agents, max(256, cfg.eval_episodes // 32))
-    env = BoxobanVecEnv(difficulty=eval_difficulty, num_agents=eval_num_agents,
-                        max_steps=cfg.max_episode_steps, seed=cfg.eval_seed,
-                        eval_mode=eval_mode, holdout_frac=eval_holdout)
-    device = env.device
-    policy = build_policy(cfg, env, device)
-    getattr(policy, "_orig_mod", policy).load_state_dict(torch.load(checkpoint, map_location=device, weights_only=True))
-    policy.eval()
-    print(f"[eval] loaded {checkpoint}; scoring >= {cfg.eval_episodes} episodes "
-          f"(held-out: {split_label}, greedy={cfg.eval_greedy})")
+    set_seed(eval_seed)
 
-    # Per-LEVEL scoring (unbiased): roll greedily and key each completed episode by its INITIAL board
-    # (which uniquely identifies the held-out level). A win gives terminal reward >= +1; max-steps
-    # truncation gives <= -0.75 (no deadlock early-stop), so solved = (terminal reward > 0.5).
-    # Averaging over DISTINCT levels (each weighted equally) removes the startup-transient and
-    # fast-cycling biases that make episode-stream averaging depend on how many episodes are run.
+    eval_name = DIFFICULTY_NAMES[eval_difficulty]
+    holdout_bin = ensure_holdout_bin(eval_name, eval_split)
+    if holdout_bin is None:
+        raise SystemExit(f"canonical eval bin not found for {eval_name}/{eval_split}")
+
+    os.environ["BOXOBAN_MAP_BIN"] = str(holdout_bin)
+    split_label = f"{eval_name}/{eval_split}-official"
+    env = BoxobanVecEnv(difficulty=-1, num_agents=eval_num_agents,
+                        max_steps=eval_max_episode_steps, seed=eval_seed,
+                        eval_mode=False, holdout_frac=0.0)
+    device = env.device
+    policy_args = vars(cfg).copy()
+    policy_args["compile"] = True
+    policy_cfg = argparse.Namespace(**policy_args)
+    policy = build_policy(policy_cfg, env, device)
+    _policy_module(policy).load_state_dict(torch.load(checkpoint, map_location=device, weights_only=True))
+    policy.eval()
+    print(f"[eval] loaded {checkpoint}; scoring >= {eval_episodes} episodes "
+          f"(held-out: {split_label}, greedy=True)")
+
+    # Key completed episodes by their initial board and average equally over distinct levels.
     from collections import defaultdict
     init_board = env.obs().to(device, copy=True).clone()   # each agent's current-episode start board
     state = policy.initial_state(env.num_agents, device)
-    if getattr(cfg, "bf16", False):
-        state = tuple(s.to(torch.bfloat16) for s in state)
-    lvl_solved: dict = defaultdict(int)
-    lvl_n: dict = defaultdict(int)
+    level_solved: dict = defaultdict(int)
+    level_counts: dict = defaultdict(int)
     total_eps = 0
-    # Greedy eval is NEAR-deterministic (fp32 + recurrent state zeroed at each episode start): a given
-    # held-out level almost always replays to the same outcome, so the replays mostly buy coverage of
-    # the level POOL (coupon-collector), not statistical samples. It is not bit-exact on GPU, though —
-    # batched conv/matmul reductions are run-order dependent and occasionally flip the argmax of a
-    # near-tie, so a level's per_puzzle_solve_frac can land just under 1.0 (e.g. 0.95) rather than a
-    # clean 0/1. Those flips are rare enough that, once the pool is saturated (no new level for a long
-    # dry spell — 4x the levels seen so far) further replays only jitter already-near-saturated
-    # per-level fractions and cannot materially move pass@1, so we stop early and skip the redundant
-    # compute. (verify_record.py independently FAILs any record that did not score the full committed
-    # pool, so early-stop can never silently under-cover the official split.) Sampling eval
-    # (eval_greedy=False) keeps the full budget — there the replays ARE independent samples.
-    greedy_saturating = bool(cfg.eval_greedy) and not getattr(cfg, "bf16", False)
+    # Record eval is greedy over the canonical held-out bin; verifier rejects incomplete coverage.
     eps_since_new = 0
-    while total_eps < cfg.eval_episodes:
-        with torch.no_grad(), _amp(getattr(cfg, "bf16", False), device):
+    while total_eps < eval_episodes:
+        with torch.no_grad():
             logits, _, state = policy.forward_eval(env.obs().to(device, copy=True), state)
-            action = logits.argmax(-1) if cfg.eval_greedy else sample_logits(logits)[0].reshape(-1)
+            action = logits.argmax(-1)
         rew, term = env.step(action)
         done = term.to(device) > 0.5
         solved = done & (rew.to(device) > 0.5)
         idx = done.nonzero(as_tuple=True)[0]
         if idx.numel():
-            before = len(lvl_n)
+            before = len(level_counts)
             for b, s in zip(init_board[idx].cpu().numpy(), solved[idx].cpu().numpy()):
-                h = b.tobytes(); lvl_n[h] += 1; lvl_solved[h] += int(s)
+                h = b.tobytes()
+                level_counts[h] += 1
+                level_solved[h] += int(s)
             ndone = int(idx.numel())
             total_eps += ndone
-            eps_since_new = 0 if len(lvl_n) > before else eps_since_new + ndone
+            eps_since_new = 0 if len(level_counts) > before else eps_since_new + ndone
             for s_ in state:                       # reset recurrent state for finished envs
                 s_[:, idx, :] = 0.0
             init_board[idx] = env.obs().to(device, copy=True)[idx]   # new episode's start board
-            if greedy_saturating and len(lvl_n) and eps_since_new >= max(4096, 4 * len(lvl_n)):
+            if (
+                len(level_counts)
+                and eps_since_new >= max(4096, 4 * len(level_counts))
+            ):
                 break
     env_perf = float(env.log().get("perf", float("nan")))  # PufferLib's C-aggregated solve mean (num_agents-invariant)
     env.close()
 
-    keys = list(lvl_n.keys())
-    per_frac = [lvl_solved[h] / lvl_n[h] for h in keys]
-    per_n = [lvl_n[h] for h in keys]
-    per_c = [lvl_solved[h] for h in keys]
+    keys = list(level_counts.keys())
+    per_frac = [level_solved[h] / level_counts[h] for h in keys]
+    per_n = [level_counts[h] for h in keys]
+    per_c = [level_solved[h] for h in keys]
     per_level_sha = [hashlib.sha256(h).hexdigest() for h in keys]   # board identity of each held-out level
     n = len(keys)                                  # distinct held-out levels seen
     pass_at_1 = sum(per_frac) / max(1, n)          # mean per-level solve fraction (each level weight 1)
-    ci_low, ci_high = _bootstrap_ci(per_frac, seed=cfg.eval_seed)
+    ci_low, ci_high = _bootstrap_ci(per_frac, seed=eval_seed)
     se = float(np.std(per_frac) / math.sqrt(max(1, n))) if n else 0.0
-    # Pin the exact eval pool so verify_record.py can confirm offline that these levels ARE the
-    # committed (canonical) test split — and warn if greedy coverage missed levels in the pool.
-    holdout_n_levels = (holdout_bin.stat().st_size // (OBS_CHANNELS * GRID * GRID + 5)) if holdout_bin else None
+    # Pin the exact eval pool for offline verification.
+    holdout_n_levels = (holdout_bin.stat().st_size // BOXOBAN_PUZZLE_BYTES) if holdout_bin else None
     if holdout_n_levels and n < holdout_n_levels:
         print(f"[eval] WARNING: scored {n}/{holdout_n_levels} held-out levels — pool not fully covered")
     record = {
-        "seed": cfg.eval_seed, "run": cfg.run, "step": None, "checkpoint": str(checkpoint),
+        "seed": eval_seed, "run": cfg.run, "step": None, "checkpoint": str(checkpoint),
         "model": f"ppo-{cfg.arch}-h{cfg.hidden_size}-L{cfg.num_layers}", "eval_data": f"boxoban:{split_label}",
         "holdout_bin": holdout_bin.name if holdout_bin else None,
         "holdout_bin_sha256": _file_sha256(holdout_bin) if holdout_bin else None,
@@ -1116,8 +1145,8 @@ def evaluate(cfg: argparse.Namespace, checkpoint: Path) -> dict:
         "n_extract_fail": 0, "n_answered": int(sum(per_n)), "n_length_trunc": 0,
         "answer_rate": 1.0, "solve_given_answer": pass_at_1, "trunc_frac": 0.0,
         "sampling": {"temperature": None, "top_p": None, "top_k": None, "min_p": 0.0,
-                     "max_tokens": cfg.max_episode_steps, "seed": cfg.eval_seed,
-                     "greedy": cfg.eval_greedy, "episodes": int(sum(per_n)), "logprobs": 0, "interrupt": None},
+                     "max_tokens": eval_max_episode_steps, "seed": eval_seed,
+                     "greedy": True, "episodes": int(sum(per_n)), "logprobs": 0, "interrupt": None},
         "per_puzzle_solve_frac": per_frac, "per_puzzle_n": per_n,
         "per_puzzle_solved_count": per_c, "per_puzzle_answered_count": per_n,
         "per_puzzle_length_trunc_count": [0] * n,
@@ -1125,18 +1154,22 @@ def evaluate(cfg: argparse.Namespace, checkpoint: Path) -> dict:
     }
     out_dir = (REPO_DIR / cfg.output_dir / cfg.run).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"eval_step000000_seed{cfg.eval_seed}.json"
+    out_path = out_dir / f"eval_step000000_seed{eval_seed}.json"
     out_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
-    cleared = "CLEARS" if ci_low > cfg.target else "DOES NOT CLEAR"
+    cleared = "CLEARS" if ci_low > target_solve_rate else "DOES NOT CLEAR"
     print(f"[eval] per-level pass@1={pass_at_1:.4f}  95% CI [{ci_low:.4f}, {ci_high:.4f}]  "
           f"({n} levels, {int(sum(per_n))} episodes @ {eval_num_agents} agents, ~{sum(per_n)/max(1,n):.0f}/level)  "
-          f"vs target {cfg.target}: {cleared}")
+          f"vs target {target_solve_rate}: {cleared}")
     print(f"[eval] PufferLib env.log perf (per-episode solve, cross-check) = {env_perf:.4f}")
     print(f"[eval] wrote {out_path}")
     return record
 
 
 # ============================ CLI ===========================================================
+def _parse_bool(value: str) -> bool:
+    return str(value).lower() not in ("0", "false", "no")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Sokoban Speedrun — non-LLM (PufferLib boxoban + in-file PPO)")
     p.add_argument("--run", type=str, default=_default_run_name())
@@ -1144,7 +1177,7 @@ def build_parser() -> argparse.ArgumentParser:
     for key, val in RECIPE.items():
         flag = "--" + key.replace("_", "-")
         if isinstance(val, bool):
-            p.add_argument(flag, default=val, type=lambda s: str(s).lower() not in ("0", "false", "no"))
+            p.add_argument(flag, default=val, type=_parse_bool)
         else:
             p.add_argument(flag, default=val, type=type(val))
     p.add_argument("--print-every", type=int, default=10)
@@ -1169,14 +1202,8 @@ def main(argv: list[str] | None = None) -> None:
     # Eval in a FRESH process: the boxoban env caches its level pool in process-global state, so the
     # held-out pool (a different bin via BOXOBAN_MAP_BIN) only loads cleanly in a new process.
     cmd = [sys.executable, str(SOURCE_PATH), "--eval-only", "--eval-checkpoint", str(final_ckpt),
-           "--run", cfg.run, "--difficulty", str(cfg.difficulty), "--eval-split", cfg.eval_split,
-           "--eval-seed", str(cfg.eval_seed), "--eval-episodes", str(cfg.eval_episodes),
-           "--eval-greedy", "1" if cfg.eval_greedy else "0",
-           "--target", str(cfg.target), "--holdout-frac", str(cfg.holdout_frac),
-           "--num-agents", str(cfg.num_agents), "--max-episode-steps", str(cfg.max_episode_steps),
-           "--arch", cfg.arch, "--hidden-size", str(cfg.hidden_size),
-           "--num-layers", str(cfg.num_layers), "--bf16", "1" if cfg.bf16 else "0",
-           "--output-dir", cfg.output_dir]
+           "--run", cfg.run, "--arch", cfg.arch, "--hidden-size", str(cfg.hidden_size),
+           "--num-layers", str(cfg.num_layers), "--output-dir", cfg.output_dir]
     subprocess.run(cmd, check=True)
 
 
