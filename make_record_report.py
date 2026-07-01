@@ -572,8 +572,8 @@ TRACKS = {
 # read straight from the README leaderboard tables, so the figure fills in as
 # faster records land. Regenerate after editing a row: `--leaderboard`.
 LB_INK = "#1b1f24"      # titles / record labels
-LB_MUTED = "#5a626b"    # axis labels, ticks
-LB_GRID = "#e7e9ee"     # hairline grid
+LB_MUTED = "#333a42"    # axis labels, ticks (darkened for feed contrast)
+LB_GRID = "#d3d7dd"     # grid (darker so it survives X's downscale + re-encode)
 LB_ACCENT = "#2563a8"   # superseded records (deep academic blue)
 LB_RECORD = "#d4a017"   # current (fastest clearing) record — gold star
 LB_TARGET = "#c0392b"   # target threshold (warm red, dashed)
@@ -607,17 +607,17 @@ def set_leaderboard_style() -> None:
     plt.rcParams.update({
         "figure.facecolor": "white", "savefig.facecolor": "white", "axes.facecolor": "white",
         "figure.dpi": 130, "savefig.dpi": 200, "savefig.bbox": "tight",
-        "font.size": 12.5, "text.color": LB_INK,
-        "axes.titlesize": 14.5, "axes.titleweight": "bold",
-        "axes.titlelocation": "left", "axes.titlecolor": LB_INK, "axes.titlepad": 12,
-        "axes.labelsize": 12, "axes.labelcolor": LB_MUTED,
-        "axes.edgecolor": "#c7ccd3", "axes.linewidth": 1.0,
+        "font.size": 15, "text.color": LB_INK,
+        "axes.titlesize": 20, "axes.titleweight": "bold",
+        "axes.titlelocation": "left", "axes.titlecolor": LB_INK, "axes.titlepad": 14,
+        "axes.labelsize": 16, "axes.labelcolor": LB_MUTED,
+        "axes.edgecolor": "#b7bcc4", "axes.linewidth": 1.2,
         "axes.spines.top": False, "axes.spines.right": False,
         "axes.grid": True, "axes.grid.axis": "y",
-        "grid.color": LB_GRID, "grid.linewidth": 1.0,
+        "grid.color": LB_GRID, "grid.linewidth": 1.1,
         "xtick.color": LB_MUTED, "ytick.color": LB_MUTED,
-        "xtick.labelsize": 11, "ytick.labelsize": 11,
-        "legend.frameon": False, "legend.fontsize": 10.5, "legend.labelcolor": LB_INK,
+        "xtick.labelsize": 14, "ytick.labelsize": 14,
+        "legend.frameon": False, "legend.fontsize": 12, "legend.labelcolor": LB_INK,
         "lines.solid_capstyle": "round",
     })
 
@@ -640,27 +640,29 @@ def plot_leaderboard(cfg: dict) -> None:
     ax.set_ylim(max(0.0, target - 0.02), min(1.0, max(accs) + 0.025))
 
     ax.axhspan(ax.get_ylim()[0], target, color=LB_TARGET, alpha=0.05, zorder=0)
-    ax.axhline(target, color=LB_TARGET, lw=1.8, ls=(0, (6, 4)), zorder=2)
+    ax.axhline(target, color=LB_TARGET, lw=2.2, ls=(0, (6, 4)), zorder=2)
     ax.annotate(f"target {target:.0%}", xy=(0.985, target), xycoords=ax.get_yaxis_transform(),
-                xytext=(0, 5), textcoords="offset points", va="bottom", ha="right",
-                color=LB_TARGET, fontsize=10.5, fontweight="bold")
+                xytext=(0, 6), textcoords="offset points", va="bottom", ha="right",
+                color=LB_TARGET, fontsize=13, fontweight="bold")
 
     # connect successive records (only meaningful with >= 2); each clears the target
     order = sorted(range(len(recs)), key=lambda i: recs[i]["num"])
     if len(recs) > 1:
         ax.plot([recs[i]["minutes"] for i in order], [recs[i]["acc"] for i in order],
-                color=LB_ACCENT, lw=1.35, alpha=0.38, zorder=3)
+                color=LB_ACCENT, lw=1.8, alpha=0.5, zorder=3)
 
     for i, r in enumerate(recs):
         if i == best:
-            ax.scatter([r["minutes"]], [r["acc"]], marker="*", s=380, color=LB_RECORD,
-                       edgecolors=LB_INK, linewidths=0.8, zorder=6)
+            ax.scatter([r["minutes"]], [r["acc"]], marker="*", s=560, color=LB_RECORD,
+                       edgecolors=LB_INK, linewidths=1.0, zorder=6)
+            dx = 26
         else:
-            ax.scatter([r["minutes"]], [r["acc"]], s=70, color=LB_ACCENT,
-                       edgecolors="white", linewidths=1.0, zorder=5)
-        ax.annotate(f"#{r['num']}", xy=(r["minutes"], r["acc"]), xytext=(13, 0),
+            ax.scatter([r["minutes"]], [r["acc"]], s=120, color=LB_ACCENT,
+                       edgecolors="white", linewidths=1.2, zorder=5)
+            dx = 15
+        ax.annotate(f"#{r['num']}", xy=(r["minutes"], r["acc"]), xytext=(dx, 0),
                     textcoords="offset points", ha="left", va="center",
-                    color=LB_INK, fontsize=11, fontweight="bold")
+                    color=LB_INK, fontsize=15, fontweight="bold")
 
     ax.set_xlabel("wall-clock minutes to target")
     ax.set_ylabel(cfg["lb_metric"])
