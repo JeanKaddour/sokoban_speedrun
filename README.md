@@ -22,7 +22,7 @@ Fastest recipes to RL models to solve Sokoban to a held-out target on one node:
 
 ### Rules
 
-Fastest wall-clock run wins: one run on one 8xH100 node, from training step 1 through the first checkpoint, which must clear the target.
+Fastest wall-clock run wins: one run on one 8xH100 node, from training step 1 through the final training update.
 
 - **Target:** lower 95% bootstrap CI > 0.80 on [llm/datasets/sokoban_eval.jsonl](llm/datasets/sokoban_eval.jsonl).
 - **Eval:** 8 completions/puzzle, 12,288 tokens, temperature 0.8, top-p 0.95, seed 12345.
@@ -57,7 +57,7 @@ This track uses [PufferLib's](https://github.com/pufferai/pufferlib) Boxoban env
 
 ### Rules
 
-Fastest wall-clock run wins: one run on a single H100, from training step 1 through the first checkpoint, which must clear the target.
+Fastest wall-clock run wins: one run on a single H100, from training step 1 through the final training update.
 
 - **Target:** lower 95% CI on held-out Boxoban solve-rate > **0.70**.
 - **Eval:** official [DeepMind Boxoban](https://github.com/google-deepmind/boxoban-levels) test split `unfiltered/test`.

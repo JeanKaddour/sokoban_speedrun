@@ -2153,8 +2153,8 @@ def _git_commit() -> str | None:
 class RunLogger:
     """Self-contained record log, modded-nanogpt style: rank 0 writes outputs/<run>/log_<8hex>.txt
     holding the full script source, environment attestation (versions, git commit, nvidia-smi,
-    argv/config), per-step record-clock lines, and a final line stamped when
-    the final checkpoint finishes writing — one file proves what ran, on what, with what result.
+    argv/config), per-step record-clock lines, and a final line stamped with
+    the final training-update time — one file proves what ran, on what, with what result.
     The record clock starts at the START of the first training step (startup is untimed; see the
     README rules). Disabled instances (non-rank-0) are inert, and logging can never crash a run:
     every I/O failure prints a warning and permanently disables the logger."""
@@ -2167,6 +2167,7 @@ class RunLogger:
         self._queue: queue.Queue[str | object] | None = None
         self._thread: threading.Thread | None = None
         self._t0: float | None = None
+        self._t1: float | None = None
         if not enabled:
             return
         try:
@@ -2287,8 +2288,14 @@ class RunLogger:
         if self._t0 is None:
             self._t0 = anchor
 
+    def stop_clock(self, anchor: float) -> None:
+        if self._t1 is None:
+            self._t1 = anchor
+
     def record_time(self) -> float:
-        return time.monotonic() - self._t0 if self._t0 is not None else 0.0
+        if self._t0 is None:
+            return 0.0
+        return (self._t1 if self._t1 is not None else time.monotonic()) - self._t0
 
     def log_step(self, step: int, num_steps: int, metrics: dict) -> None:
         rt = self.record_time()
@@ -3122,7 +3129,7 @@ def run_pipeline(
             checkpoint_dir = save_hf_checkpoint(model, tokenizer, run_dir, step)
             print0(f"Saved checkpoint to {checkpoint_dir}")
             if step == num_steps - 1 and args.save_final:
-                # The record clock stops here: the final checkpoint has finished writing.
+                # Written after the artifact exists; record_time stopped at the final training update.
                 run_logger.log_final_checkpoint(checkpoint_dir)
         if trunc_ewma >= TRUNC_WARN_EWMA:
             print0(f"WARNING step {step}: gen/length_trunc_ewma={trunc_ewma:.3f} "
@@ -3450,6 +3457,8 @@ def run_pipeline(
             # MSG_WEIGHTS_READY below). ----
             if world_size > 1:
                 dist.barrier()
+            if master_process and not has_next_step:
+                run_logger.stop_clock(time.monotonic())
 
             # ---- push fresh weights to the generators (RANK 0 ONLY) ----
             # The step's collectives are done, so workers are blocked at the NEXT step's Phase-C

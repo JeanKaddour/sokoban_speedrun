@@ -855,6 +855,7 @@ class RunLogger:
         self.path = None
         self._fh = None
         self._t0 = None
+        self._t1 = None
         run_dir.mkdir(parents=True, exist_ok=True)
         source = SOURCE_PATH.read_text(encoding="utf-8")
         sha = self._save_source_snapshot(run_dir, source)
@@ -900,8 +901,13 @@ class RunLogger:
     def start_clock(self, anchor):
         self._t0 = anchor if self._t0 is None else self._t0
 
+    def stop_clock(self, anchor):
+        self._t1 = anchor if self._t1 is None else self._t1
+
     def record_time(self):
-        return time.monotonic() - self._t0 if self._t0 is not None else 0.0
+        if self._t0 is None:
+            return 0.0
+        return (self._t1 if self._t1 is not None else time.monotonic()) - self._t0
 
     def _write(self, line):
         if self._fh is not None:
@@ -1013,6 +1019,8 @@ def train(cfg: argparse.Namespace) -> Path:
         obs, act, val, logp, rew, done = collect_rollout(env, policy, cfg.rollout_horizon, device, amp=cfg.bf16)
         global_step += steps_per_iter
         stats = train_step(policy, optimizer, obs, act, val, logp, rew, done, cfg, it, total_iters)
+        if it == total_iters - 1:
+            logger.stop_clock(time.monotonic())
         elog = env.log()
         solved = float(elog.get("perf", 0.0))
         logger.log_step(it, total_iters, reward_mean=float(elog.get("targets_hit", 0.0)),
