@@ -53,6 +53,7 @@ This track uses [PufferLib's](https://github.com/pufferai/pufferlib) Boxoban env
 | 1   | 22:24               | cnn-mingru h256 | 2026-06-21 | [non_llm/records/2026-06-21_01](non_llm/records/2026-06-21_01_non_llm/) | 0.744 (CI [0.72, 0.77]) | @JeanKaddour |
 | 2 | 21:00 | same recipe as #1, earliest clearing checkpoint | 2026-06-29 | [non_llm/records/2026-06-29_01](non_llm/records/2026-06-29_01_non_llm/) | 0.727 (CI [0.70, 0.75]) | @JeanKaddour |
 | 3 | 15:55 | torch.compile + steps-matched-anneal | 2026-06-30 | [non_llm/records/2026-06-30_01](non_llm/records/2026-06-30_01_non_llm/) | 0.748 (CI [0.72, 0.77]) | @JeanKaddour |
+| 4 | 14:42 | anneal horizon tuned 1300→1200 steps | 2026-07-02 | [non_llm/records/2026-07-02_01](non_llm/records/2026-07-02_01_non_llm/) | 0.736 (CI [0.71, 0.76]) | @JeanKaddour |
 
 
 ### Rules
@@ -74,7 +75,7 @@ uv run python speedrun.py
 
 ## Submitting a record
 
-Each track's `assemble_record.sh` ([`llm/`](llm/assemble_record.sh), [`non_llm/`](non_llm/assemble_record.sh)) turns a finished run into a record dir: it collects the log, eval JSON, and source snapshot, builds the report, pins the top-level `speedrun.py`, runs `verify_record.py`, and adds the record's row + redraws the leaderboard figure. It reads a local `outputs/<RUN>/` by default; pass `SOURCE=modal` to pull off the volume.
+Each track's `assemble_record.sh` ([`llm/`](llm/assemble_record.sh), [`non_llm/`](non_llm/assemble_record.sh)) turns a finished run into a record dir: it collects the log, eval JSON, and source snapshot, builds the report, pins the top-level `speedrun.py`, runs `verify_record.py`, and adds the record's row + redraws the leaderboard figure. Configure record runs by editing `RECIPE` in `speedrun.py` and launch them flag-free — the pinned `speedrun.py` then *is* the recipe (assembly rejects flag-configured runs). It reads a local `outputs/<RUN>/` by default; pass `SOURCE=modal` to pull off the volume.
 
 1. **Train + eval** with your track's [Running](#running) commands.
 
