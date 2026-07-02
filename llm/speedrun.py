@@ -2058,6 +2058,45 @@ def group_has_signal(rewards, eps: float = 1e-8) -> bool:
     return bool((r.max() - r.min()).item() > eps)
 
 
+def shape_group_advantages(
+    rewards: torch.Tensor,
+    advantages: torch.Tensor,
+    *,
+    step: int,
+    num_steps: int,
+    centered_blend: float = 0.0,
+    difficulty_weight: float = 0.0,
+    difficulty_ramp: float = 1.0,
+    variance_boost: float = 0.0,
+) -> torch.Tensor:
+    """Domain-agnostic per-group advantage shaping (from @dexhunter's Weco method search, PR #5).
+
+    Three terms applied in order on top of compute_group_advantages; each is a no-op at its
+    default, so all-defaults returns `advantages` unchanged (byte-identical baseline):
+    1. centered_blend b: adv = (1-b)*adv + b*(r - mean(r)) — blends back the plain
+       reward-centered signal, re-injecting the reward-scale information the grpo per-group
+       std division discards.
+    2. difficulty_weight w: adv *= 1 + w*ramp*(1 - mean(r)) with ramp = (1-difficulty_ramp)
+       + difficulty_ramp*(step+1)/num_steps — up-weights hard (low-mean-reward) groups for
+       w > 0, increasingly so through training when difficulty_ramp is 1.
+    3. variance_boost v: adv *= 1 + v*var(r) (unbiased) — up-weights mixed success/failure
+       groups, prioritizing the learning frontier where the model is uncertain.
+
+    The scales in 2/3 are >= 1 for non-negative w/v and the blend in 1 preserves each
+    group's signal/no-signal status, so the zero-variance filter's group_has_signal(rewards)
+    decision is unaffected by shaping."""
+    out = advantages
+    if centered_blend:
+        out = (1.0 - centered_blend) * out + centered_blend * (rewards - rewards.mean())
+    if difficulty_weight:
+        progress = (step + 1) / max(1, num_steps)
+        ramp = (1.0 - difficulty_ramp) + difficulty_ramp * progress
+        out = out * (1.0 + difficulty_weight * ramp * (1.0 - rewards.mean()))
+    if variance_boost and rewards.numel() > 1:
+        out = out * (1.0 + variance_boost * rewards.var())
+    return out
+
+
 def is_fresh_enough(example_version: int, current_version: int, max_staleness: int) -> bool:
     """True if a rollout generated at example_version is within max_staleness weight-versions
     of the current trainer version."""
@@ -2839,6 +2878,13 @@ def run_pipeline(
             fins = [sample.finish_reason for sample in processed_samples]
             rewards_t = torch.tensor(rewards, dtype=torch.float32)
             adv = compute_group_advantages(rewards_t, args.advantage_mode)
+            adv = shape_group_advantages(
+                rewards_t, adv, step=step, num_steps=num_steps,
+                centered_blend=args.adv_centered_blend,
+                difficulty_weight=args.adv_difficulty_weight,
+                difficulty_ramp=args.adv_difficulty_ramp,
+                variance_boost=args.adv_variance_boost,
+            )
             adv_values = adv.tolist()
             # Unbiased online proxy (before any filter): solved == reward 1.0, matching evaluate().
             cs.groups_seen_total += 1
@@ -3789,6 +3835,28 @@ def build_parser() -> argparse.ArgumentParser:
                              "toward the maximum-likelihood gradient and zeroing all-fail groups. "
                              "The global batch-std rescale still applies to centered/maxrl "
                              "(preserves relative weighting, keeps LR comparable).")
+    parser.add_argument("--adv-centered-blend", type=float, default=0.0,
+                        help="Advantage shaping (@dexhunter's Weco method search, PR #5): blend fraction "
+                             "b of the plain reward-centered signal into the per-group advantages, "
+                             "adv = (1-b)*adv + b*(r - group_mean). Re-injects the reward-scale "
+                             "information the grpo std division removes. In [0, 1]; 0.0 (default) "
+                             "disables (byte-identical baseline). The Weco recipe uses 0.04.")
+    parser.add_argument("--adv-difficulty-weight", type=float, default=0.0,
+                        help="Advantage shaping: scale each group's advantages by "
+                             "1 + w*ramp*(1 - group_mean_reward), up-weighting hard (low mean reward) "
+                             "groups for w > 0; negative w emphasizes already-easy groups. 0.0 "
+                             "(default) disables. The Weco recipe uses 0.18 (with ramp 1.0, so the "
+                             "hard-group emphasis fades in linearly over the run).")
+    parser.add_argument("--adv-difficulty-ramp", type=float, default=1.0,
+                        help="Linear ramp of --adv-difficulty-weight over training: effective weight "
+                             "is w*((1-ramp) + ramp*(step+1)/num_steps). In [0, 1]; 1.0 (default) "
+                             "ramps from ~0 to full strength across the run, 0.0 applies w at full "
+                             "strength from step 1.")
+    parser.add_argument("--adv-variance-boost", type=float, default=0.0,
+                        help="Advantage shaping: scale each group's advantages by "
+                             "1 + v*var(rewards) (unbiased sample variance), boosting mixed "
+                             "success/failure groups — the learning frontier where the model is "
+                             "uncertain. 0.0 (default) disables. The Weco recipe uses 1.1.")
     parser.add_argument("--entropy-coef", type=float, default=0.0,
                         help="Entropy-bonus coefficient: adds +entropy_coef * mean H(pi) over valid "
                              "tokens to the objective (aggregated with the SAME denominator as the "
@@ -3938,6 +4006,10 @@ def _validate_pipeline_args(args: argparse.Namespace) -> None:
         raise ValueError("--adam-eps must be positive")
     if args.entropy_coef < 0:
         raise ValueError("--entropy-coef must be >= 0")
+    if not (0.0 <= args.adv_centered_blend <= 1.0):
+        raise ValueError("--adv-centered-blend must be in [0, 1]")
+    if not (0.0 <= args.adv_difficulty_ramp <= 1.0):
+        raise ValueError("--adv-difficulty-ramp must be in [0, 1]")
     if args.interrupt_min_tokens is not None or args.interrupt_max_tokens is not None:
         if not args.interruption:
             raise ValueError("--interrupt-min-tokens/--interrupt-max-tokens require --interruption")

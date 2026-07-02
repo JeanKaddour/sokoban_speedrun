@@ -59,7 +59,8 @@ STEP_RE = re.compile(
 # Key hyperparameters surfaced in the README config table; the full args dict goes in <details>.
 HEADLINE_ARGS = [
     "learning_rate", "lr_schedule", "min_lr_frac", "lr_decay_steps", "warmup_steps",
-    "cispo_eps", "loss_normalization", "examples_per_step", "num_samples",
+    "cispo_eps", "loss_normalization", "adv_centered_blend", "adv_difficulty_weight",
+    "adv_difficulty_ramp", "adv_variance_boost", "examples_per_step", "num_samples",
     "max_new_tokens", "temperature", "top_p", "max_staleness", "inflight_requests",
     "interruption", "interrupt_answer_tokens", "max_steps", "seed",
 ]
