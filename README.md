@@ -18,6 +18,7 @@ Fastest recipes to RL models to solve Sokoban to a held-out target on one node:
 | --- | ------------------- | ---------------------------------- | ---------- | ------------------------------------------------------------ | ----------------------- | ------------ |
 | 1   | 48:53               | GRPO, LR 1.6e-6 annealed, 75 steps | 2026-06-29 | [llm/records/2026-06-29_01](llm/records/2026-06-29_01_grpo/) | 0.869 (CI [0.83, 0.90]) | @JeanKaddour |
 | 2   | 36:53               | GRPO, LR 1.6e-6 annealed, 60 steps | 2026-06-29 | [llm/records/2026-06-29_02](llm/records/2026-06-29_02_grpo_60step/) | 0.843 (CI [0.81, 0.88]) | @dexhunter   |
+| 3   | 35:29               | GRPO, LR 1.6e-6 annealed, 54 steps | 2026-07-02 | [llm/records/2026-07-02_01](llm/records/2026-07-02_01_grpo_54step/) | 0.860 (CI [0.83, 0.89]) | @dexhunter   |
 
 
 ### Rules
