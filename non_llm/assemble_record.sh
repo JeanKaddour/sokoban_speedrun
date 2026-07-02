@@ -3,9 +3,11 @@
 #
 # Reads from a LOCAL run dir by default (SOURCE=local); set SOURCE=modal to pull off the volume.
 # A single train call runs the final held-out eval in the same shot, so the run log, eval JSON, and
-# source snapshot all land under the run dir (eval named eval_step<N>_seed<EVAL_SEED>.json):
-#   LOCAL  : uv run python speedrun.py --run <RUN> ...                 -> outputs/<RUN>/
-#   MODAL  : RUN_NAME=<RUN> DIFFICULTY=4 TOTAL_TIMESTEPS=<steps> uv run modal run --detach modal_app_non_llm.py
+# source snapshot all land under the run dir (eval named eval_step<N>_seed<EVAL_SEED>.json).
+# Record runs are configured by editing speedrun.py's RECIPE and launched FLAG-FREE (the pinned
+# speedrun.py then IS the recipe; assembly rejects flag-configured submission runs):
+#   LOCAL  : uv run python speedrun.py --run <RUN>                     -> outputs/<RUN>/
+#   MODAL  : RUN_NAME=<RUN> uv run modal run --detach modal_app_non_llm.py
 #            (re-eval an existing checkpoint: EVAL_CHECKPOINT=/vol/outputs/<RUN>/final.pt RUN_NAME=<RUN> ...)
 #
 # SUBMISSION (the record itself):
@@ -127,8 +129,18 @@ if [ -f "$stage/source/speedrun.py" ]; then
   mkdir -p "$DEST/source"
   cp "$stage/source/speedrun.py" "$DEST/source/speedrun_seed${TRAIN_SEED}.py"
   if [ -z "$VERIFY_OF" ]; then
+    # Recipe hygiene: the pin below is only meaningful if RECIPE (not CLI flags) configured the
+    # run — bake your config into speedrun.py's RECIPE and launch flag-free.
+    extra_flags="$(grep -m1 "^argv: \[" "$stage/$log_name" | grep -oE "'--[a-z-]+'" \
+      | grep -vE "^'--(run|output-dir)'$" || true)"
+    if [ -n "$extra_flags" ] && [ -z "${ALLOW_RUN_ARGS:-}" ]; then
+      echo "ERROR: this run was configured via CLI flags:" $extra_flags
+      echo "       Record runs must bake their config into speedrun.py's RECIPE (launch flag-free)"
+      echo "       so the pinned ./speedrun.py IS the recipe. ALLOW_RUN_ARGS=1 overrides."
+      exit 1
+    fi
     # Pin the canonical recipe to this submission (modded-nanogpt / slowrun convention):
-    # the top-level speedrun.py always holds the current record's code. Lands in the PR diff.
+    # the top-level speedrun.py always holds the current record's recipe. Lands in the PR diff.
     cp "$stage/source/speedrun.py" speedrun.py
     echo ">> pinned ./speedrun.py to this record's recipe (review the diff — it's part of your PR)"
   fi
