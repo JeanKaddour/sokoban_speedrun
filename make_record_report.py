@@ -532,9 +532,9 @@ TRACKS = {
         "lb_metric": "Held-out pass@1",
         "lb_out": "assets/llm_records.png",
         "reproduce": [
-            "# train on one 8xH100 node (recipe defaults live in speedrun.py RECIPE)",
+            "# train on one 8xH100 node (the recipe is baked into speedrun.py's RECIPE — no recipe flags)",
             "NODE_GPUS=8 uv run torchrun --standalone --nproc_per_node=3 -m speedrun -- "
-            "--run <run> --max-steps 75 --loss-fn grpo --seed <seed> --lr-decay-steps 75",
+            "--run <run> --seed <seed> --no-wandb --no-save-rollouts --final-rollout-steps 0",
             "# eval the final checkpoint under the leaderboard protocol, then verify offline",
             "uv run python -m eval_speedrun --run <run>-final-eval "
             "--eval-checkpoint outputs/<run>/step_<final> --eval-k 8 --eval-seed 12345 "

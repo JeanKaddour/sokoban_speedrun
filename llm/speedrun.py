@@ -79,9 +79,9 @@ WANDB_PROJECT = "sokoban-speedrun-llm"
 # ============================ RUN RECIPE (single source of truth) ============================
 # The benchmark sprint recipe lives here as a top-level constant. main() PREPENDS it to the CLI
 # args, so the same hyperparameters apply to local launches and Modal. Any flag passed on the CLI
-# appears AFTER the recipe and therefore OVERRIDES the recipe value (argparse last-wins). --run is
-# deliberately NOT here (it varies per launch); --max-steps IS here (75 = the record's step count)
-# so it stays a CLI override for probes and longer runs.
+# appears AFTER the recipe and therefore OVERRIDES the recipe value (argparse last-wins). --run and
+# --seed are deliberately NOT here (they vary per launch); --max-steps IS here (= the current
+# record's step count) so it stays a CLI override for probes and longer runs.
 # --eval-data stays in the recipe because --verify-datasets-only validates both train and eval sets.
 # TRAINER COUNT: the 8-GPU node runs NTRAINERS=3 (3 trainer ranks + 5 vLLM generators) — the sweet
 # spot: generation keeps the async buffer full while the trainer is compute-bound, and a 4th trainer
@@ -110,9 +110,14 @@ RECIPE = [
     "--warmup-steps", "5",
     "--lr-schedule", "linear",
     "--min-lr-frac", "0.15",
-    "--lr-decay-steps", "90",
-    "--max-steps", "75",          # the record's step count; override on the CLI for probes/longer runs
+    "--lr-decay-steps", "60",
+    "--max-steps", "52",          # the record's step count; override on the CLI for probes/longer runs
     "--grad-clip", "1.0",
+    "--loss-fn", "grpo",          # record 4: PPO-clip GRPO (advantage-mode auto-resolves to 'grpo')
+    "--adv-centered-blend", "0.04",    # record 4: Weco advantage shaping (see shape_group_advantages)
+    "--adv-difficulty-weight", "0.18",
+    "--adv-difficulty-ramp", "1.0",
+    "--adv-variance-boost", "1.1",
     "--cispo-eps", "4.0",
     "--loss-normalization", "sequence",  # sample-level (GRPO).
     "--max-staleness", "4",          # less off-policy than ScaleRL's 8; a proven stability lever

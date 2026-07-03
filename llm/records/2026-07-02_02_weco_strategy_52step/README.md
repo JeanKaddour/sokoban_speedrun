@@ -178,8 +178,8 @@ Standalone `speedrun.py` snapshots are saved per run and checked against the emb
 ## Reproduce
 
 ```bash
-# train on one 8xH100 node (recipe defaults live in speedrun.py RECIPE)
-NODE_GPUS=8 uv run torchrun --standalone --nproc_per_node=3 -m speedrun -- --run <run> --max-steps 52 --loss-fn grpo --seed <seed> --lr-decay-steps 60 --adv-centered-blend 0.04 --adv-difficulty-weight 0.18 --adv-variance-boost 1.1 --no-wandb --no-save-rollouts --final-rollout-steps 0
+# train on one 8xH100 node (the recipe is baked into speedrun.py's RECIPE — no recipe flags)
+NODE_GPUS=8 uv run torchrun --standalone --nproc_per_node=3 -m speedrun -- --run <run> --seed <seed> --no-wandb --no-save-rollouts --final-rollout-steps 0
 # eval the final checkpoint under the leaderboard protocol, then verify offline
 uv run python -m eval_speedrun --run <run>-final-eval --eval-checkpoint outputs/<run>/step_<final> --eval-k 8 --eval-seed 12345 --eval-limit 0 --eval-max-tokens 12288 --eval-max-model-len 16384 --eval-interruption --eval-interrupt-answer-tokens 512 --eval-vllm-dp 8 --eval-gpu-mem-util 0.9 --eval-vllm-max-num-batched-tokens 40960 --eval-vllm-max-num-seqs 32 --eval-concurrency 32
 uv run python verify_record.py records/2026-07-02_02_weco_strategy_52step
