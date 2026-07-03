@@ -69,7 +69,7 @@ RECIPE = {
     "max_episode_steps": 120,
     "holdout_frac": 0.1,        # procedural/index-partition holdout knob; canonical eval ignores it
     # --- PPO rollout / optimization ---
-    "total_timesteps": 629_145_600,  # 1200 iters — record #4's matched-anneal horizon (cosine LR anneals over the run)
+    "total_timesteps": 498_073_600,  # 950 iters — record #5's matched-anneal horizon (cosine LR anneals over the run)
     "rollout_horizon": 64,
     "minibatch_size": 32768,    # segment minibatch: minibatch_segments = minibatch_size / horizon
     "replay_ratio": 1.6234,     # num_minibatches = replay_ratio * batch_size / minibatch_size
@@ -92,7 +92,7 @@ RECIPE = {
     "muon_eps": 1e-14,
     # --- model ---
     # cnn-mingru = spatial conv encoder + recurrent core.
-    "arch": "cnn-mingru",       # cnn | mingru|lstm|gru|mlp | {cnn,gemmconv,shiftconv,sgp,sgpm,sgpm2,sgpt,sgpmt,lmixer,mlp,emb,axial,mixer,attn}-{mingru,lstm,gru}
+    "arch": "sgpm2-mingru",     # cnn | mingru|lstm|gru|mlp | {cnn,gemmconv,shiftconv,sgp,sgpm,sgpm2,sgpt,sgpmt,lmixer,mlp,emb,axial,mixer,attn}-{mingru,lstm,gru}
     "hidden_size": 256,
     "num_layers": 3,            # recurrent (planning) depth — deeper generalizes better on official sets
     "enc_width": 0,             # mlp encoder hidden width (0 = arch default)
