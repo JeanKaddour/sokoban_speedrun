@@ -1,0 +1,2514 @@
+"""Sokoban Speedrun — non-LLM track, using Pufferlib's Boxoban environment.
+
+A from-scratch deep-RL agent that learns to solve Sokoban.
+
+Boxoban obs is a 4x10x10 byte grid (channels: agent, walls, boxes, targets); actions are
+{noop,down,up,left,right}. Solved == every box on a target. difficulty 0=basic..4=unfiltered.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import ctypes
+import hashlib
+import json
+import math
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from pathlib import Path
+
+import numpy as np
+
+SOURCE_PATH = Path(__file__).resolve()
+REPO_DIR = SOURCE_PATH.parent
+
+import torch  # noqa: E402
+import torch.nn as nn  # noqa: E402
+import torch.nn.functional as F  # noqa: E402
+
+torch.set_float32_matmul_precision("high")  # TF32 on the fp32 matmuls (matches PufferLib's torch path)
+torch.backends.cudnn.benchmark = True  # autotune conv kernels for our fixed shapes (lossless speedup)
+
+
+def _amp(enabled: bool, device: str):
+    """bf16 autocast for the policy forward/loss (matmuls -> tensor cores; reductions/exp stay fp32).
+    PufferLib's fused _C trainer runs the whole PPO in bf16, so the recipe is bf16-robust; this is the
+    torch-path equivalent. No GradScaler: bf16 has fp32 range. Off => bit-identical to PufferLib (fp32)."""
+    if enabled and str(device).startswith("cuda"):
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return contextlib.nullcontext()
+
+
+ENV_NAME = "boxoban"
+DEFAULT_RUN_NAME_PREFIX = "boxoban-non-llm"
+PUFFERLIB_REPO_URL = "https://github.com/JeanKaddour/PufferLib.git"
+PUFFERLIB_COMMIT = "e90b58edef5445d1a3689e2f908f5841ad6a0f23"
+LOCAL_PUFFERLIB_DIR = Path(os.environ.get("PUFFERLIB_SRC_DIR", REPO_DIR / ".pufferlib-src")).expanduser()
+DIFFICULTY_NAMES = {0: "basic", 1: "easy", 2: "medium", 3: "hard", 4: "unfiltered"}
+OBS_CHANNELS, GRID = 4, 10
+GRID_CELLS = GRID * GRID
+BOXOBAN_META_BYTES = 5
+BOXOBAN_PUZZLE_BYTES = OBS_CHANNELS * GRID_CELLS + BOXOBAN_META_BYTES
+NUM_ACTIONS = 5
+
+
+# ============================ RUN RECIPE (single source of truth) ============================
+# PufferLib's tuned boxoban PPO hyperparameters (config/boxoban.ini) + speedrun knobs. These are the
+# train-time defaults; argparse exposes them for experimentation without changing the eval contract.
+RECIPE = {
+    # --- environment ---
+    # Default = official DeepMind unfiltered levels with the canonical 1000-level test split.
+    "difficulty": 4,            # 0=basic 1=easy 2=medium 3=hard 4=unfiltered
+    "num_agents": 8192,
+    "max_episode_steps": 120,
+    "holdout_frac": 0.1,        # procedural/index-partition holdout knob; canonical eval ignores it
+    # --- PPO rollout / optimization ---
+    "total_timesteps": 681_574_400,  # 1300 iters — record #3's matched-anneal horizon (cosine LR anneals over the run)
+    "rollout_horizon": 64,
+    "minibatch_size": 32768,    # segment minibatch: minibatch_segments = minibatch_size / horizon
+    "replay_ratio": 1.6234,     # num_minibatches = replay_ratio * batch_size / minibatch_size
+    "gamma": 0.989717,
+    "gae_lambda": 0.759273,
+    "vtrace_rho_clip": 3.13347,
+    "vtrace_c_clip": 2.75328,
+    "prio_alpha": 0.453827,     # prioritized-replay exponent
+    "prio_beta0": 0.765589,     # prioritized-replay importance-sampling bias correction
+    "clip_coef": 0.01,
+    "vf_coef": 5.0,
+    "vf_clip_coef": 5.0,
+    "ent_coef": 0.000188411,
+    "max_grad_norm": 1.20325,
+    "learning_rate": 0.00134234,
+    "anneal_lr": True,
+    "min_lr_ratio": 0.37872,
+    "beta1": 0.995526,          # Muon momentum
+    "weight_decay": 0.0,
+    "muon_eps": 1e-14,
+    # --- model ---
+    # cnn-mingru = spatial conv encoder + recurrent core.
+    "arch": "cnn-mingru",       # cnn | mingru|lstm|gru|mlp | {cnn,gemmconv,mlp,emb,axial,mixer,attn}-{mingru,lstm,gru}
+    "hidden_size": 256,
+    "num_layers": 3,            # recurrent (planning) depth — deeper generalizes better on official sets
+    "enc_width": 0,             # mlp encoder hidden width (0 = arch default)
+    "enc_dim": 0,               # per-cell channel dim for emb/axial/mixer/attn (0 = arch default)
+    "enc_depth": 0,             # block count for axial/mixer/attn/shiftconv (0 = arch default)
+    "enc_stride": 0,            # shiftconv last-layer stride (0 = arch default 1)
+    "bf16": False,              # fp32 by default
+    "compile": True,            # torch.compile the policy for train-bound fwd/bwd kernel fusion.
+    "compile_mode": "default",  # default | reduce-overhead (CUDA graphs) | max-autotune
+    # --- bookkeeping ---
+    "seed": 42,
+    "wandb": False,             # --wandb 1 to enable; logs train/loss/opt/perf metrics per iter
+    "wandb_project": "sokoban-speedrun-non-llm",
+}
+
+
+# ============================ eval aggregates (verbatim from eval_speedrun.py) ===============
+# Single source of truth for the record aggregates: verify_record.py imports these so an offline
+# re-derivation of pass@1 / pass@k / CI can never drift from what evaluate() actually computed.
+# This track always uses percentile bootstrap CIs over per-level solve fractions.
+def _pass_at_k_unbiased(n: int, c: int, k: int) -> float:
+    if k > n:
+        raise ValueError(f"pass@k requires k<=n, got k={k}, n={n}")
+    if n - c < k:
+        return 1.0
+    prod = 1.0
+    for i in range(n - c + 1, n + 1):
+        prod *= 1.0 - k / i
+    return 1.0 - prod
+
+
+def _bootstrap_ci(values: list[float], *, n_boot: int = 10000, seed: int = 0,
+                  alpha: float = 0.05) -> tuple[float, float]:
+    """Percentile bootstrap CI for the mean of per-level solve fractions (verbatim from eval_speedrun)."""
+    n = len(values)
+    if n == 0:
+        return (0.0, 0.0)
+    rng = np.random.default_rng(seed)
+    arr = np.asarray(values, dtype=float)
+    means = arr[rng.integers(0, n, size=(n_boot, n))].mean(axis=1)
+    return (float(np.quantile(means, alpha / 2)), float(np.quantile(means, 1.0 - alpha / 2)))
+
+
+def _git_commit() -> str | None:
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_DIR),
+            timeout=10,
+        )
+        return out.stdout.strip() if out.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def _file_sha256(path) -> str | None:
+    """sha256 of a file (the held-out level bin), so the record pins the exact eval pool and
+    verify_record.py can confirm it offline. Mirrors eval_speedrun._file_sha256."""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+class DummyWandb:
+    """No-op wandb stand-in (mirrors speedrun.py) so the train loop is wandb-agnostic."""
+
+    def log(self, *a, **k):
+        pass
+
+    def finish(self, *a, **k):
+        pass
+
+
+def pufferlib_root() -> Path:
+    import pufferlib
+    return Path(pufferlib.__file__).resolve().parent.parent
+
+
+def _default_run_name() -> str:
+    return f"{DEFAULT_RUN_NAME_PREFIX}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+
+
+def _clear_pufferlib_modules() -> None:
+    for name in list(sys.modules):
+        if name == "pufferlib" or name.startswith("pufferlib."):
+            del sys.modules[name]
+
+
+def _pufferlib_extension_env_name() -> str | None:
+    from pufferlib import _C
+    return getattr(_C, "env_name", None)
+
+
+def _pufferlib_source_ready(path: Path) -> bool:
+    return (path / "build.sh").is_file() and (path / "ocean" / ENV_NAME / "binding.c").is_file()
+
+
+def _pufferlib_checkout_matches(path: Path) -> bool:
+    if not _pufferlib_source_ready(path):
+        return False
+    out = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    return out.returncode == 0 and out.stdout.strip() == PUFFERLIB_COMMIT
+
+
+def _find_cached_pufferlib_checkout() -> Path | None:
+    cache_root = Path(os.environ.get("UV_CACHE_DIR", Path.home() / ".cache" / "uv")) / "git-v0" / "checkouts"
+    if not cache_root.exists():
+        return None
+    for candidate in cache_root.glob("*/*"):
+        if _pufferlib_checkout_matches(candidate):
+            return candidate
+    return None
+
+
+def _patch_pufferlib_float_build(src: Path) -> None:
+    path = src / "src" / "kernels.cu"
+    needle = """inline void cast_dispatch(precision_t* dst, const float* src, int n, cudaStream_t stream) {
+    cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(dst, src, n);
+}
+
+"""
+    guard = "#ifndef PRECISION_FLOAT\n" + needle + "#endif\n\n"
+    text = path.read_text(encoding="utf-8")
+    if guard in text:
+        return
+    if needle not in text:
+        raise SystemExit(f"Could not apply PufferLib float-build patch to {path}")
+    print(f"[setup] patching PufferLib float build in {path}", flush=True)
+    path.write_text(text.replace(needle, guard, 1), encoding="utf-8")
+
+
+def _ensure_local_pufferlib_source() -> Path:
+    src = LOCAL_PUFFERLIB_DIR.resolve()
+    if _pufferlib_checkout_matches(src):
+        _patch_pufferlib_float_build(src)
+        return src
+    if src.exists():
+        raise SystemExit(
+            f"{src} exists but is not the pinned PufferLib checkout {PUFFERLIB_COMMIT}. "
+            "Remove it, or set PUFFERLIB_SRC_DIR to a checkout of the pinned commit."
+        )
+    cached = _find_cached_pufferlib_checkout()
+    if cached is not None:
+        print(f"[setup] cloning cached PufferLib checkout to {src}", flush=True)
+        subprocess.run(["git", "clone", "--no-hardlinks", str(cached), str(src)], check=True)
+    else:
+        print(f"[setup] cloning PufferLib {PUFFERLIB_COMMIT[:7]} to {src}", flush=True)
+        subprocess.run(["git", "clone", PUFFERLIB_REPO_URL, str(src)], check=True)
+    subprocess.run(["git", "-C", str(src), "checkout", "--detach", PUFFERLIB_COMMIT], check=True)
+    _patch_pufferlib_float_build(src)
+    return src
+
+
+def _install_editable_pufferlib(src: Path) -> None:
+    print(f"[setup] installing editable PufferLib from {src}", flush=True)
+    uv = shutil.which("uv")
+    if uv is not None:
+        cmd = [uv, "pip", "install", "--python", sys.executable, "--no-deps", "-e", str(src)]
+    else:
+        cmd = [sys.executable, "-m", "pip", "install", "--no-deps", "-e", str(src)]
+    subprocess.run(cmd, check=True)
+    if str(src) not in sys.path:
+        sys.path.insert(0, str(src))
+    _clear_pufferlib_modules()
+
+
+def _ensure_nvidia_lib_symlink(module_name: str, link_name: str, target_name: str) -> None:
+    try:
+        mod = __import__(module_name, fromlist=["_"])
+        lib_dir = Path(next(iter(mod.__path__))) / "lib"
+    except Exception:
+        return
+    link = lib_dir / link_name
+    target = lib_dir / target_name
+    if target.exists() and not link.exists():
+        link.symlink_to(target.name)
+
+
+def _build_boxoban_extension(src: Path) -> None:
+    print(f"[setup] building PufferLib native extension: bash build.sh {ENV_NAME} --float", flush=True)
+    _ensure_nvidia_lib_symlink("nvidia.cudnn", "libcudnn.so", "libcudnn.so.9")
+    _ensure_nvidia_lib_symlink("nvidia.nccl", "libnccl.so", "libnccl.so.2")
+    env = dict(os.environ)
+    if shutil.which("ccache", path=env.get("PATH")) is None:
+        with tempfile.TemporaryDirectory(prefix="pufferlib-build-") as td:
+            shim = Path(td) / "ccache"
+            shim.write_text("#!/bin/sh\nexec \"$@\"\n", encoding="utf-8")
+            shim.chmod(0o755)
+            env["PATH"] = td + os.pathsep + env.get("PATH", "")
+            subprocess.run(["bash", "build.sh", ENV_NAME, "--float"], cwd=str(src), env=env, check=True)
+    else:
+        subprocess.run(["bash", "build.sh", ENV_NAME, "--float"], cwd=str(src), env=env, check=True)
+    _clear_pufferlib_modules()
+
+
+def ensure_boxoban_extension() -> None:
+    """Validate, and locally build if needed, the PufferLib Boxoban native env."""
+    try:
+        env_name = _pufferlib_extension_env_name()
+        if env_name == ENV_NAME and _pufferlib_source_ready(pufferlib_root()):
+            return
+        reason = f"built for {env_name!r}" if env_name != ENV_NAME else "installed wheel lacks source resources"
+    except Exception as exc:
+        reason = f"`pufferlib._C` unavailable ({exc})"
+
+    print(f"[setup] PufferLib Boxoban extension needs a local build: {reason}", flush=True)
+    src = _ensure_local_pufferlib_source()
+    _install_editable_pufferlib(src)
+    try:
+        env_name = _pufferlib_extension_env_name()
+    except Exception:
+        _build_boxoban_extension(src)
+        try:
+            env_name = _pufferlib_extension_env_name()
+        except Exception as exc:
+            raise SystemExit(
+                "PufferLib's native extension was built, but `pufferlib._C` still cannot be loaded. "
+                "Check the compiler/CUDA library output above."
+            ) from exc
+    if env_name != ENV_NAME:
+        _build_boxoban_extension(src)
+        try:
+            env_name = _pufferlib_extension_env_name()
+        except Exception as exc:
+            raise SystemExit(
+                "PufferLib's native extension was rebuilt, but `pufferlib._C` still cannot be loaded. "
+                "Check the compiler/CUDA library output above."
+            ) from exc
+    if env_name != ENV_NAME:
+        raise SystemExit(f"PufferLib native extension is built for {env_name!r}, expected {ENV_NAME!r}.")
+
+
+# ============================ official DeepMind held-out levels ==============================
+# The boxoban env's bin format is [agent(100), walls(100), boxes(100), targets(100), meta(5)] per
+# 10x10 puzzle. BOXOBAN_MAP_BIN lets eval load the official held-out split directly.
+_BOX_CHARS = {"agent": ("@", "+"), "wall": ("#",), "box": ("$", "*"), "target": (".", "*", "+")}
+
+
+def _encode_boxoban_puzzle(rows: list[str]) -> bytes:
+    agent = bytearray(GRID_CELLS)
+    walls = bytearray(GRID_CELLS)
+    boxes = bytearray(GRID_CELLS)
+    targets = bytearray(GRID_CELLS)
+    ax = ay = -1
+    nb = nt = ot = 0
+
+    for r in range(GRID):
+        for c in range(GRID):
+            ch = rows[r][c]
+            is_a = ch in _BOX_CHARS["agent"]
+            is_w = ch in _BOX_CHARS["wall"]
+            is_b = ch in _BOX_CHARS["box"]
+            is_t = ch in _BOX_CHARS["target"]
+            i = r * GRID + c
+            agent[i] = is_a
+            walls[i] = is_w
+            boxes[i] = is_b
+            targets[i] = is_t
+            if is_a:
+                ax, ay = c, r
+            nb += is_b
+            nt += is_t
+            ot += is_b and is_t
+
+    meta = bytes([ax & 0xFF, ay & 0xFF, nb, nt, ot])
+    return bytes(agent) + bytes(walls) + bytes(boxes) + bytes(targets) + meta
+
+
+def build_boxoban_bin(level_dir: Path, out_path: Path) -> int:
+    import glob as _glob
+    n = 0
+    with open(out_path, "wb") as out:
+        for path in sorted(_glob.glob(str(level_dir / "*.txt"))):
+            rows: list[str] = []
+            with open(path) as fh:
+                for line in fh:
+                    line = line.rstrip("\n")
+                    if line.startswith(";"):
+                        if rows:
+                            out.write(_encode_boxoban_puzzle(rows))
+                            rows = []
+                            n += 1
+                        continue
+                    if not line.strip():
+                        continue
+                    if len(rows) < GRID:
+                        rows.append(line[:GRID])
+                    if len(rows) == GRID:
+                        out.write(_encode_boxoban_puzzle(rows))
+                        rows = []
+                        n += 1
+    return n
+
+
+def ensure_holdout_bin(difficulty_name: str | None, split: str) -> Path | None:
+    """Resolve the held-out level bin for <difficulty>/<split>. Returns the absolute bin path, or None
+    if neither a committed bin nor the raw levels are present (→ index-partition fallback).
+
+    Priority: (1) a SINGLE committed `data/boxoban_<diff>_<split>.bin` shipped in the repo — this is
+    what makes the repo self-contained (the leaderboard held-out is ~400KB; no 200MB of raw text). If
+    absent, (2) encode it from the raw `resources/.../levels/<diff>/<split>` text (local dev / other
+    splits the repo doesn't ship)."""
+    if not difficulty_name:
+        return None
+    committed = REPO_DIR / "data" / f"boxoban_{difficulty_name}_{split}.bin"
+    if committed.exists():
+        return committed
+    levels = pufferlib_root() / "resources" / "boxoban" / "levels" / difficulty_name / split
+    if not levels.is_dir() or not any(levels.glob("*.txt")):
+        return None
+    out = REPO_DIR / "resources" / "boxoban" / f"boxoban_maps_{difficulty_name}_{split}.bin"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if not out.exists():
+        print(f"[eval] encoding official held-out {difficulty_name}/{split} -> {out.name}")
+        build_boxoban_bin(levels, out)
+    return out
+
+
+# ============================ action sampling ===============================================
+from torch.distributions.utils import logits_to_probs  # noqa: E402
+
+
+def _log_prob(logits: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+    value = value.long().unsqueeze(-1)
+    value, log_pmf = torch.broadcast_tensors(value, logits)
+    value = value[..., :1]
+    return log_pmf.gather(-1, value).squeeze(-1)
+
+
+def _entropy(logits: torch.Tensor) -> torch.Tensor:
+    min_real = torch.finfo(logits.dtype).min
+    logits = torch.clamp(logits, min=min_real)
+    p_log_p = logits * logits_to_probs(logits)
+    return -p_log_p.sum(-1)
+
+
+def sample_logits(logits: torch.Tensor, action: torch.Tensor | None = None):
+    """Discrete (single-head) action sampling. logits: (N, num_actions)."""
+    logits = logits.unsqueeze(0)
+    normalized_logits = logits - logits.logsumexp(dim=-1, keepdim=True)
+    probs = logits_to_probs(logits)
+    if action is None:
+        probs = torch.nan_to_num(probs, 1e-8, 1e-8, 1e-8)
+        action = torch.multinomial(probs.reshape(-1, probs.shape[-1]), 1, replacement=True).int()
+        action = action.reshape(probs.shape[:-1])
+    else:
+        batch = logits[0].shape[0]
+        action = action.view(batch, -1).T
+    logprob = _log_prob(normalized_logits, action)
+    logits_entropy = _entropy(normalized_logits).sum(0)
+    return action.T, logprob.squeeze(0), logits_entropy.squeeze(0)
+
+
+# ============================ Muon optimizer =================================================
+_NS_COEFS = [
+    (4.0848, -6.8946, 2.9270),
+    (3.9505, -6.3029, 2.6377),
+    (3.7418, -5.5913, 2.3037),
+    (2.8769, -3.1427, 1.2046),
+    (2.8366, -3.0525, 1.2012),
+]
+
+
+def _zeropower_via_newtonschulz5(G: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    x = G.clone()
+    if G.size(-2) > G.size(-1):
+        x = x.mT
+    x = x / torch.clamp(G.norm(dim=(-2, -1)), min=eps)
+    for a, b, c in _NS_COEFS:
+        s = x @ x.mT
+        y = c * s
+        y.diagonal(dim1=-2, dim2=-1).add_(b)
+        y = y @ s
+        y.diagonal(dim1=-2, dim2=-1).add_(a)
+        x = y @ x
+    if G.size(-2) > G.size(-1):
+        x = x.mT
+    return x.to(G.dtype)
+
+
+class Muon(torch.optim.Optimizer):
+    """Muon (Newton-Schulz orthogonalized momentum)."""
+
+    def __init__(self, params, lr=0.0025, weight_decay=0.0, momentum=0.9, eps=1e-8):
+        defaults = {
+            "lr": lr,
+            "weight_decay": weight_decay,
+            "momentum": momentum,
+            "eps": eps,
+        }
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = closure() if closure is not None else None
+        for group in self.param_groups:
+            lr = float(group["lr"])
+            wd = group["weight_decay"]
+            momentum = group["momentum"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(p.grad)
+                buf = state["momentum_buffer"]
+                grad = p.grad
+                buf.mul_(momentum)
+                buf.add_(grad)
+                grad = grad + buf * momentum
+                if grad.ndim >= 2:
+                    g2 = grad.view(grad.shape[0], -1)
+                    g2 = _zeropower_via_newtonschulz5(g2)
+                    g2 *= max(1, g2.size(-2) / g2.size(-1)) ** 0.5
+                    grad = g2.view(p.shape)
+                p.mul_(1 - lr * wd)
+                p.sub_(lr * grad.view(p.shape))
+        return loss
+
+
+# ============================ VTrace+GAE advantage ===========================================
+def compute_advantages(values, rewards, terminals, importance, gamma, gae_lambda, rho_clip, c_clip):
+    """VTrace-corrected GAE advantage. Matches the vectorized kernel path selected whenever
+    horizon % (16/precision_bytes) == 0, which holds for horizon 64 / float32. Note rho_t scales
+    the WHOLE TD residual here — the scalar/CPU variant `rho_t*r + ...` differs and is unused.
+    All tensors are (rows, horizon); advantages[:, -1] stays 0."""
+    rows, horizon = values.shape
+    adv = torch.zeros_like(values)
+    lastlam = torch.zeros(rows, device=values.device, dtype=values.dtype)
+    for t in range(horizon - 2, -1, -1):
+        nextnonterminal = 1.0 - terminals[:, t + 1]
+        imp = importance[:, t]
+        rho_t = torch.clamp(imp, max=rho_clip)
+        c_t = torch.clamp(imp, max=c_clip)
+        delta = rho_t * (rewards[:, t + 1] + gamma * values[:, t + 1] * nextnonterminal - values[:, t])
+        lastlam = delta + gamma * gae_lambda * c_t * lastlam * nextnonterminal
+        adv[:, t] = lastlam
+    return adv
+
+
+# ============================ policy network (hackable) =====================================
+class ActorCritic(nn.Module):
+    """Small conv actor-critic over the 4x10x10 Sokoban board. forward()/forward_eval() return the
+    same shapes as pufferlib.models.Policy so this plugs into the train step."""
+
+    def __init__(self, hidden_size: int = 256):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(OBS_CHANNELS, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(64 * GRID_CELLS, hidden_size),
+            nn.ReLU(),
+        )
+        self.actor = nn.Linear(hidden_size, NUM_ACTIONS)
+        self.critic = nn.Linear(hidden_size, 1)
+        self.apply(self._init)
+        nn.init.orthogonal_(self.actor.weight, 0.01)
+        nn.init.zeros_(self.actor.bias)
+        nn.init.orthogonal_(self.critic.weight, 1.0)
+        nn.init.zeros_(self.critic.bias)
+
+    @staticmethod
+    def _init(m: nn.Module) -> None:
+        if isinstance(m, (nn.Conv2d, nn.Linear)):
+            nn.init.orthogonal_(m.weight, math.sqrt(2))
+            nn.init.zeros_(m.bias)
+
+    def _encode(self, obs_flat: torch.Tensor) -> torch.Tensor:
+        return self.encoder(obs_flat.view(-1, OBS_CHANNELS, GRID, GRID).float())
+
+    def initial_state(self, batch_size: int, device):
+        return ()  # feedforward: fully-observable board, no recurrence
+
+    def forward(self, x: torch.Tensor):
+        """Training call: x (B, T, obs_size) -> logits (B*T, num_actions), values (B, T)."""
+        B, T = x.shape[:2]
+        h = self._encode(x.reshape(B * T, -1))
+        return self.actor(h), self.critic(h).reshape(B, T)
+
+    def forward_eval(self, x: torch.Tensor, state):
+        """Rollout call: x (A, obs_size) -> logits (A, num_actions), values (A,), state."""
+        h = self._encode(x)
+        return self.actor(h), self.critic(h).squeeze(-1), state
+
+
+class ConvEncoder(nn.Module):
+    """Spatial conv encoder for the 4x10x10 board, drop-in for pufferlib.models.Policy (whose forward
+    hands the encoder a flattened (N, obs_size) batch). Keeps the board's spatial structure that the
+    linear DefaultEncoder throws away — the key lever for Sokoban perception."""
+
+    def __init__(self, obs_size: int, hidden_size: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(OBS_CHANNELS, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(64 * GRID_CELLS, hidden_size),
+            nn.ReLU(),
+        )
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                nn.init.orthogonal_(m.weight, math.sqrt(2))
+                nn.init.zeros_(m.bias)
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        x = observations.view(observations.shape[0], OBS_CHANNELS, GRID, GRID).float()
+        return self.net(x)
+
+
+class GemmConvEncoder(nn.Module):
+    """ConvEncoder with the 3x3 convs computed as im2col (unfold) + GEMM. Same function class and
+    init as ConvEncoder — only the kernels differ: 3x3 convs on a 10x10 board are cudnn
+    latency-bound, while unfold+matmul runs them as tensor-core GEMMs."""
+
+    def __init__(self, obs_size: int, hidden_size: int):
+        super().__init__()
+        self.conv1 = nn.Conv2d(OBS_CHANNELS, 32, 3, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
+        self.proj = nn.Linear(64 * GRID_CELLS, hidden_size)
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                nn.init.orthogonal_(m.weight, math.sqrt(2))
+                nn.init.zeros_(m.bias)
+
+    @staticmethod
+    def _conv3x3_gemm(x: torch.Tensor, conv: nn.Conv2d) -> torch.Tensor:
+        patches = F.unfold(x, 3, padding=1)                 # (N, Cin*9, 100)
+        w = conv.weight.view(conv.out_channels, -1)         # (Cout, Cin*9)
+        h = w @ patches + conv.bias[:, None]                # (N, Cout, 100)
+        return h.view(x.shape[0], conv.out_channels, GRID, GRID)
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        x = observations.view(observations.shape[0], OBS_CHANNELS, GRID, GRID).float()
+        h = torch.relu(self._conv3x3_gemm(x, self.conv1))
+        h = torch.relu(self._conv3x3_gemm(h, self.conv2))
+        return torch.relu(self.proj(h.flatten(1)))
+
+
+class MLPEncoder(nn.Module):
+    """Dense MLP encoder. On a fixed 10x10 board a dense linear subsumes any conv, so this trades
+    the CNN's weight sharing (sample efficiency / equivariance) for pure GEMMs."""
+
+    def __init__(self, obs_size: int, hidden_size: int, width: int = 1024):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_size, width), nn.ReLU(),
+            nn.Linear(width, hidden_size), nn.ReLU(),
+        )
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, math.sqrt(2))
+                nn.init.zeros_(m.bias)
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        return self.net(observations.view(observations.shape[0], -1).float())
+
+
+class EmbedEncoder(nn.Module):
+    """Cell-state embedding + learned position embedding. The 4 binary channels per cell form a
+    16-state vocabulary (~7 legal combos), so perception becomes a gather + one projection."""
+
+    def __init__(self, obs_size: int, hidden_size: int, dim: int = 32):
+        super().__init__()
+        self.embed = nn.Embedding(16, dim)
+        self.pos = nn.Parameter(torch.zeros(GRID_CELLS, dim))
+        self.proj = nn.Linear(GRID_CELLS * dim, hidden_size)
+        nn.init.normal_(self.pos, std=0.02)
+        nn.init.orthogonal_(self.proj.weight, math.sqrt(2))
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        x = observations.view(observations.shape[0], OBS_CHANNELS, GRID_CELLS).long()
+        idx = x[:, 0] + 2 * x[:, 1] + 4 * x[:, 2] + 8 * x[:, 3]
+        h = self.embed(idx) + self.pos
+        return torch.relu(self.proj(h.flatten(1)))
+
+
+class _AxialBlock(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.col_mix = nn.Linear(GRID, GRID)
+        self.row_mix = nn.Linear(GRID, GRID)
+        self.chan = nn.Linear(dim, dim)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:                             # (N, H, W, d)
+        h = h + torch.relu(self.col_mix(h.transpose(2, 3)).transpose(2, 3))         # mix along W
+        h = h + torch.relu(self.row_mix(h.permute(0, 3, 2, 1)).permute(0, 3, 2, 1))  # mix along H
+        return h + torch.relu(self.chan(h))
+
+
+class AxialEncoder(nn.Module):
+    """Row/column axial mixing: linears shared along each board axis give a full receptive field
+    and translation-style weight sharing in tiny GEMMs — no conv kernels. Residual blocks."""
+
+    def __init__(self, obs_size: int, hidden_size: int, dim: int = 64, depth: int = 1):
+        super().__init__()
+        self.cell = nn.Linear(OBS_CHANNELS, dim)
+        self.blocks = nn.Sequential(*[_AxialBlock(dim) for _ in range(depth)])
+        self.proj = nn.Linear(GRID_CELLS * dim, hidden_size)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, math.sqrt(2))
+                nn.init.zeros_(m.bias)
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        n = observations.shape[0]
+        x = observations.view(n, OBS_CHANNELS, GRID, GRID).float()
+        h = self.blocks(torch.relu(self.cell(x.permute(0, 2, 3, 1))))               # (N, H, W, d)
+        return torch.relu(self.proj(h.reshape(n, -1)))
+
+
+class ShiftConvEncoder(nn.Module):
+    """3x3 zero-padded convs computed channels-last: pad once, gather the 9 neighbor slices, run one
+    (N*cells, 9*Cin)x(9*Cin, Cout) GEMM per layer. Unlike the unfold/bmm route (gemmconv — 7x SLOWER
+    than cudnn in practice), this shape is a single dense tensor-core GEMM.
+    depth=2, stride=1 is the CNN's exact function (verified bitwise vs ConvEncoder).
+    depth=1: single wider (9*Cin -> 64) layer. stride=2 on the LAST layer: 3x3 neighborhoods sampled
+    on a 5x5 grid, shrinking the flatten-projection 4x (the single largest FLOP block)."""
+
+    def __init__(self, obs_size: int, hidden_size: int, depth: int = 2, stride: int = 1):
+        super().__init__()
+        out_grid = (GRID + stride - 1) // stride
+        chans = [32, 64] if depth == 2 else [64]
+        self.stride = stride
+        self.mixes = nn.ModuleList()
+        cin = OBS_CHANNELS
+        for c in chans:
+            self.mixes.append(nn.Linear(9 * cin, c))
+            cin = c
+        self.proj = nn.Linear(chans[-1] * out_grid * out_grid, hidden_size)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, math.sqrt(2))
+                nn.init.zeros_(m.bias)
+
+    @staticmethod
+    def _neighbors(h: torch.Tensor, stride: int = 1) -> torch.Tensor:
+        """(N, H, W, C) -> (N, H/stride, W/stride, 9C): 3x3 neighborhoods, zero-padded borders."""
+        p = F.pad(h, (0, 0, 1, 1, 1, 1))
+        return torch.cat([p[:, dr:dr + GRID:stride, dc:dc + GRID:stride]
+                          for dr in range(3) for dc in range(3)], dim=-1)
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        n = observations.shape[0]
+        h = observations.view(n, OBS_CHANNELS, GRID, GRID).float().permute(0, 2, 3, 1)  # (N,H,W,C)
+        for i, mix in enumerate(self.mixes):
+            last = i == len(self.mixes) - 1
+            h = torch.relu(mix(self._neighbors(h, self.stride if last else 1)))
+        return torch.relu(self.proj(h.reshape(n, -1)))
+
+
+class ShiftGlobalPoolEncoder(nn.Module):
+    """Local 3x3 shift-mix + broadcast global context: one shift layer for local perception, a
+    mean-pooled squeeze-excite-style global vector concatenated back per cell, then a second
+    channel mix. All channel-side GEMMs (efficient K), two pooling kernels — the cheapest way to
+    give every cell board-global information without token mixing."""
+
+    def __init__(self, obs_size: int, hidden_size: int, dim: int = 48,
+                 pool: str = "mean", rank: int = 0, stage2: bool = False):
+        super().__init__()
+        self.pool = pool
+        self.rank = rank
+        self.stage2 = stage2
+        self.mix1 = nn.Linear(9 * OBS_CHANNELS, dim)
+        if rank:  # low-rank positional token mix: the mixer ingredient a pooled global lacks
+            self.tok_down = nn.Linear(GRID_CELLS, rank)
+            self.tok_up = nn.Linear(rank, GRID_CELLS)
+        self.glob = nn.Linear((2 if pool == "meanmax" else 1) * dim, dim)
+        self.mix2 = nn.Linear(2 * dim, 64)
+        if stage2:  # second pooled-global round after mix2, appended to the flatten readout
+            self.glob2 = nn.Linear(2 * 64, 64)
+        self.proj = nn.Linear(64 * GRID_CELLS + (64 if stage2 else 0), hidden_size)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, math.sqrt(2))
+                nn.init.zeros_(m.bias)
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        n = observations.shape[0]
+        x = observations.view(n, OBS_CHANNELS, GRID, GRID).float().permute(0, 2, 3, 1)   # (N,H,W,C)
+        h = torch.relu(self.mix1(ShiftConvEncoder._neighbors(x)))                        # (N,H,W,d)
+        if self.rank:
+            t = h.reshape(n, GRID_CELLS, -1).transpose(1, 2)                             # (N,d,100)
+            h = h + self.tok_up(torch.relu(self.tok_down(t))).transpose(1, 2).reshape(h.shape)
+        g = h.mean(dim=(1, 2))
+        if self.pool == "meanmax":
+            g = torch.cat([g, h.amax(dim=(1, 2))], dim=-1)
+        g = torch.relu(self.glob(g))                                                     # (N,d)
+        g = g[:, None, None, :].expand(-1, GRID, GRID, -1)
+        h = torch.relu(self.mix2(torch.cat([h, g], dim=-1)))                             # (N,H,W,64)
+        flat = h.reshape(n, -1)
+        if self.stage2:
+            g2 = torch.relu(self.glob2(torch.cat([h.mean(dim=(1, 2)), h.amax(dim=(1, 2))], dim=-1)))
+            flat = torch.cat([flat, g2], dim=-1)
+        return torch.relu(self.proj(flat))
+
+
+class LeanMixerEncoder(nn.Module):
+    """Kernel-lean mixer: one block, no LayerNorm, ReLU, low-rank token mix (100 -> rank -> 100).
+    Keeps the mixer's positional global mixing (its accuracy edge over cnn) at a fraction of the
+    kernel launches and FLOPs."""
+
+    def __init__(self, obs_size: int, hidden_size: int, dim: int = 32, rank: int = 32):
+        super().__init__()
+        self.cell = nn.Linear(OBS_CHANNELS, dim)
+        self.tok_down = nn.Linear(GRID_CELLS, rank)
+        self.tok_up = nn.Linear(rank, GRID_CELLS)
+        self.chan = nn.Sequential(nn.Linear(dim, 4 * dim), nn.ReLU(), nn.Linear(4 * dim, dim))
+        self.proj = nn.Linear(GRID_CELLS * dim, hidden_size)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, math.sqrt(2))
+                nn.init.zeros_(m.bias)
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        n = observations.shape[0]
+        x = observations.view(n, OBS_CHANNELS, GRID_CELLS).float().transpose(1, 2)  # (N, 100, 4)
+        h = torch.relu(self.cell(x))                                                # (N, 100, d)
+        t = h.transpose(1, 2)                                                       # (N, d, 100)
+        h = h + self.tok_up(torch.relu(self.tok_down(t))).transpose(1, 2)           # token mix
+        h = h + self.chan(h)                                                        # channel mix
+        return torch.relu(self.proj(h.reshape(n, -1)))
+
+
+class _MixerBlock(nn.Module):
+    def __init__(self, tokens: int, dim: int, token_hidden: int, chan_hidden: int):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.token = nn.Sequential(nn.Linear(tokens, token_hidden), nn.GELU(),
+                                   nn.Linear(token_hidden, tokens))
+        self.norm2 = nn.LayerNorm(dim)
+        self.chan = nn.Sequential(nn.Linear(dim, chan_hidden), nn.GELU(),
+                                  nn.Linear(chan_hidden, dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:                # (N, tokens, dim)
+        x = x + self.token(self.norm1(x).transpose(1, 2)).transpose(1, 2)
+        return x + self.chan(self.norm2(x))
+
+
+class MixerEncoder(nn.Module):
+    """MLP-Mixer over the 100 board cells: token-mix + channel-mix blocks give a global receptive
+    field per block, all GEMMs. Position is encoded by the per-position token-mix weights."""
+
+    def __init__(self, obs_size: int, hidden_size: int, dim: int = 64, depth: int = 2):
+        super().__init__()
+        self.cell = nn.Linear(OBS_CHANNELS, dim)
+        self.blocks = nn.Sequential(*[_MixerBlock(GRID_CELLS, dim, 4 * dim, 4 * dim)
+                                      for _ in range(depth)])
+        self.proj = nn.Linear(GRID_CELLS * dim, hidden_size)
+        for m in (self.cell, self.proj):
+            nn.init.orthogonal_(m.weight, math.sqrt(2))
+            nn.init.zeros_(m.bias)
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        n = observations.shape[0]
+        x = observations.view(n, OBS_CHANNELS, GRID_CELLS).float().transpose(1, 2)  # (N, 100, 4)
+        h = self.blocks(self.cell(x))
+        return torch.relu(self.proj(h.reshape(n, -1)))
+
+
+class AttnEncoder(nn.Module):
+    """Tiny pre-norm transformer over the 100 cell tokens (SDPA). Relational attention matches the
+    box<->target pairing structure of Sokoban; all GEMMs, no conv."""
+
+    def __init__(self, obs_size: int, hidden_size: int, dim: int = 128, depth: int = 2, heads: int = 4):
+        super().__init__()
+        self.cell = nn.Linear(OBS_CHANNELS, dim)
+        self.pos = nn.Parameter(torch.zeros(GRID_CELLS, dim))
+        layer = nn.TransformerEncoderLayer(dim, heads, dim_feedforward=4 * dim, dropout=0.0,
+                                           batch_first=True, norm_first=True)
+        self.blocks = nn.TransformerEncoder(layer, depth, enable_nested_tensor=False)
+        self.proj = nn.Linear(GRID_CELLS * dim, hidden_size)
+        nn.init.normal_(self.pos, std=0.02)
+        nn.init.orthogonal_(self.proj.weight, math.sqrt(2))
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        n = observations.shape[0]
+        x = observations.view(n, OBS_CHANNELS, GRID_CELLS).float().transpose(1, 2)  # (N, 100, 4)
+        h = self.blocks(self.cell(x) + self.pos)
+        return torch.relu(self.proj(h.reshape(n, -1)))
+
+
+def build_policy(cfg: argparse.Namespace, env: "BoxobanVecEnv", device: str) -> nn.Module:
+    """Policy factory. Arch options:
+      cnn                    - in-file feedforward conv actor-critic (no recurrence)
+      {mingru,lstm,gru,mlp}  - PufferLib's linear DefaultEncoder + that core (their tuned recipe)
+      <enc>-{mingru,lstm,gru} - encoder + recurrent core, enc one of:
+        cnn      spatial conv encoder (the record recipe)
+        gemmconv ConvEncoder computed as im2col+GEMM (same function, no cudnn conv kernels)
+        mlp      dense 400->1024->hidden MLP
+        emb      cell-state embedding + position embedding
+        axial    row/column axial-mixing linears
+        mixer    MLP-Mixer over the 100 cells
+        attn     2-layer transformer over the 100 cells
+    All expose forward()/forward_eval()/initial_state() the matched train step needs."""
+    if cfg.arch == "cnn":
+        policy = ActorCritic(cfg.hidden_size).to(device)
+    else:
+        import pufferlib.models as pm
+        nets = {"mingru": pm.MinGRU, "lstm": pm.LSTM, "gru": pm.GRU, "mlp": pm.MLP}
+        encoders = {"linear": pm.DefaultEncoder, "cnn": ConvEncoder, "gemmconv": GemmConvEncoder,
+                    "shiftconv": ShiftConvEncoder, "sgp": ShiftGlobalPoolEncoder,
+                    "sgpm": lambda o, h, **kw: ShiftGlobalPoolEncoder(o, h, pool="meanmax", **kw),
+                    "sgpm2": lambda o, h, **kw: ShiftGlobalPoolEncoder(o, h, pool="meanmax",
+                                                                       stage2=True, **kw),
+                    "sgpt": lambda o, h, **kw: ShiftGlobalPoolEncoder(o, h, rank=16, **kw),
+                    "sgpmt": lambda o, h, **kw: ShiftGlobalPoolEncoder(o, h, pool="meanmax", rank=16, **kw),
+                    "lmixer": LeanMixerEncoder, "mlp": MLPEncoder, "emb": EmbedEncoder,
+                    "axial": AxialEncoder, "mixer": MixerEncoder, "attn": AttnEncoder}
+        enc_name, net_name = cfg.arch.split("-", 1) if "-" in cfg.arch else ("linear", cfg.arch)
+        if net_name not in nets or enc_name not in encoders:
+            enc_opts = "|".join(k for k in encoders if k != "linear")
+            raise SystemExit(f"unknown --arch {cfg.arch!r} (cnn | {'|'.join(nets)} | "
+                             f"{{{enc_opts}}}-{{mingru,lstm,gru}})")
+        # Optional size overrides (0 = keep the arch's default), so sweeps need no code edits.
+        enc_kwargs = {}
+        if getattr(cfg, "enc_width", 0) and enc_name == "mlp":
+            enc_kwargs["width"] = int(cfg.enc_width)
+        if getattr(cfg, "enc_dim", 0) and enc_name in ("emb", "axial", "mixer", "attn", "sgp",
+                                                       "sgpm", "sgpm2", "sgpt", "sgpmt", "lmixer"):
+            enc_kwargs["dim"] = int(cfg.enc_dim)
+        if getattr(cfg, "enc_depth", 0) and enc_name in ("axial", "mixer", "attn", "shiftconv"):
+            enc_kwargs["depth"] = int(cfg.enc_depth)
+        if getattr(cfg, "enc_stride", 0) and enc_name == "shiftconv":
+            enc_kwargs["stride"] = int(cfg.enc_stride)
+        encoder = encoders[enc_name](env.obs_size, cfg.hidden_size, **enc_kwargs)
+        decoder = pm.DefaultDecoder(env.act_sizes, cfg.hidden_size)
+        network = nets[net_name](cfg.hidden_size, num_layers=int(cfg.num_layers))
+        policy = pm.Policy(encoder, decoder, network).to(device)
+    if not getattr(cfg, "compile", False):
+        return policy
+    mode = getattr(cfg, "compile_mode", "default")
+    return torch.compile(policy, mode=None if mode in ("", "default") else mode)
+
+
+def _policy_module(policy: nn.Module) -> nn.Module:
+    return getattr(policy, "_orig_mod", policy)
+
+
+# ============================ PufferLib boxoban vec-env (the dependency) =====================
+_TYPESTR = {torch.uint8: "|u1", torch.float32: "<f4"}
+
+
+class _CudaPtr:
+    def __init__(self, ptr: int, shape: tuple[int, ...], dtype: torch.dtype):
+        self.__cuda_array_interface__ = {
+            "data": (ptr, False),
+            "shape": shape,
+            "typestr": _TYPESTR[dtype],
+            "version": 2,
+        }
+
+
+class BoxobanVecEnv:
+    """Thin handle over PufferLib's native boxoban vec-env. Only the environment is borrowed; no
+    PufferLib training code runs. obs/reward/terminal buffers are read zero-copy from GPU pointers."""
+
+    def __init__(self, *, difficulty: int, num_agents: int, max_steps: int, seed: int,
+                 eval_mode: bool = False, holdout_frac: float = 0.0):
+        ensure_boxoban_extension()
+        from pufferlib import pufferl, _C
+        assert getattr(_C, "env_name", None) == ENV_NAME, (
+            f"_C built for {getattr(_C, 'env_name', None)!r}, not {ENV_NAME!r}. "
+            "Run `uv run python speedrun.py` from non_llm/ to rebuild the local extension.")
+        saved = sys.argv
+        sys.argv = [saved[0]]
+        try:
+            args = pufferl.load_config(ENV_NAME)
+        finally:
+            sys.argv = saved
+        args["vec"]["num_buffers"] = 1
+        args["vec"]["total_agents"] = int(num_agents)
+        args["env"]["difficulty"] = int(difficulty)
+        args["env"]["max_steps"] = int(max_steps)
+        # Forked boxoban kwargs for disjoint index-partition holdouts.
+        args["env"]["eval"] = 1 if eval_mode else 0
+        args["env"]["holdout_frac"] = float(holdout_frac)
+        args["seed"] = int(seed)
+        args["train"]["seed"] = int(seed)
+        self.args = args
+        self.gpu = bool(_C.gpu)
+        self.device = "cuda" if self.gpu else "cpu"
+        self._vec = _C.create_vec(args, _C.gpu)
+        self.num_agents = int(self._vec.total_agents)
+        self.obs_size = int(self._vec.obs_size)
+        self.act_sizes = list(self._vec.act_sizes)
+        self._vec.reset()
+
+    def _view(self, ptr, shape, dtype):
+        if self.gpu:
+            return torch.as_tensor(_CudaPtr(ptr, shape, dtype))
+        n = int(np.prod(shape))
+        ctype = {torch.uint8: ctypes.c_uint8, torch.float32: ctypes.c_float}[dtype]
+        return torch.frombuffer((ctype * n).from_address(ptr), dtype=dtype).reshape(shape)
+
+    def obs(self) -> torch.Tensor:
+        return self._view(self._vec.gpu_obs_ptr if self.gpu else self._vec.obs_ptr,
+                          (self.num_agents, self.obs_size), torch.uint8)
+
+    def step(self, actions: torch.Tensor):
+        a = actions.reshape(self.num_agents, 1).to(torch.float32).contiguous()
+        if self.gpu:
+            a = a.cuda()
+            self._vec.gpu_step(a.data_ptr())
+            torch.cuda.synchronize()
+        else:
+            self._vec.cpu_step(a.data_ptr())
+        rew = self._view(self._vec.gpu_rewards_ptr if self.gpu else self._vec.rewards_ptr,
+                         (self.num_agents,), torch.float32)
+        term = self._view(self._vec.gpu_terminals_ptr if self.gpu else self._vec.terminals_ptr,
+                          (self.num_agents,), torch.float32)
+        return rew, term
+
+    def log(self) -> dict:
+        from pufferlib.pufferl import unroll_nested_dict
+        return dict(unroll_nested_dict(self._vec.log()))
+
+    def close(self):
+        self._vec.close()
+
+
+# ============================ rollout buffers ===============================================
+def collect_rollout(env: BoxobanVecEnv, policy: nn.Module, horizon: int, device: str, amp: bool = False):
+    """Collect `horizon` steps for all agents. Stored rewards[t]/terminals[t]
+    are those *received arriving at* obs[t] (i.e. for action[t-1]); the advantage uses rewards[t+1]."""
+    num_agents = env.num_agents
+    obs_size = env.obs_size
+    obs = torch.empty(horizon, num_agents, obs_size, dtype=torch.uint8, device=device)
+    act = torch.empty(horizon, num_agents, dtype=torch.long, device=device)
+    logp = torch.empty(horizon, num_agents, device=device)
+    val = torch.empty(horizon, num_agents, device=device)
+    rew = torch.empty(horizon, num_agents, device=device)
+    done = torch.empty(horizon, num_agents, device=device)
+    state = policy.initial_state(num_agents, device)
+    if amp:  # carry recurrent state in bf16 so it matches the autocast activations (lerp etc.)
+        state = tuple(s.to(torch.bfloat16) for s in state)
+    r = torch.zeros(num_agents, device=device)
+    d = torch.zeros(num_agents, device=device)
+    for t in range(horizon):
+        o = env.obs().to(device, copy=True)
+        with torch.no_grad(), _amp(amp, device):
+            logits, value, state = policy.forward_eval(o, state)
+            action, logprob, _ = sample_logits(logits)
+        obs[t] = o
+        act[t] = action.reshape(num_agents)
+        logp[t] = logprob
+        val[t] = value.reshape(num_agents)
+        rew[t] = r
+        done[t] = d
+        reward, terminal = env.step(action.reshape(num_agents))
+        r = reward.to(device)
+        d = terminal.to(device)
+    return obs, act, val, logp, rew, done
+
+
+# ============================ PPO train step =================================================
+def train_step(policy: nn.Module, optimizer: torch.optim.Optimizer, obs, act, val, logp, rew, ter,
+               cfg, epoch: int, total_epochs: int) -> dict:
+    """One PPO training pass over a rollout: reward clamp, prioritized segment replay, VTrace+GAE
+    advantage recomputed per minibatch with refreshed values, clipped policy+value loss, Muon step,
+    cosine LR. Buffers are (horizon, agents[, obs]); updates `policy` in place. Returns mean losses."""
+    device = val.device
+    horizon, total_agents = val.shape
+    batch_size = total_agents * horizon
+    minibatch_segments = cfg.minibatch_size // horizon
+
+    prio_beta0 = cfg.prio_beta0
+    prio_alpha = cfg.prio_alpha
+    clip_coef, vf_clip = cfg.clip_coef, cfg.vf_clip_coef
+    # Prioritized-replay IS-bias anneal. The `* prio_alpha` factor is intentional: it matches
+    # Pufferlib's trainer code, NOT the textbook `beta0 + (1-beta0)*epoch/total`.
+    anneal_beta = prio_beta0 + (1 - prio_beta0) * prio_alpha * epoch / total_epochs
+    ratio_buf = torch.ones(total_agents, horizon, device=device)
+
+    if cfg.anneal_lr and epoch > 0:
+        lr_ratio = epoch / total_epochs
+        lr_min = cfg.learning_rate * cfg.min_lr_ratio
+        lr = lr_min + 0.5 * (cfg.learning_rate - lr_min) * (1 + math.cos(math.pi * lr_ratio))
+        optimizer.param_groups[0]["lr"] = lr
+
+    # [horizon, agents] (contiguous writes) -> [agents, horizon] (segment indexing)
+    obs_t = obs.transpose(0, 1).contiguous()
+    act_t = act.transpose(0, 1).contiguous()
+    val_t = val.T.contiguous()
+    logp_t = logp.T.contiguous()
+    rew_t = rew.T.contiguous().clamp(-1, 1)
+    done_t = ter.T.contiguous()
+
+    num_minibatches = int(cfg.replay_ratio * batch_size / cfg.minibatch_size)
+    sums = {k: 0.0 for k in ("policy", "value", "entropy", "approx_kl", "clipfrac", "grad_norm")}
+    advantages = torch.zeros_like(val_t)
+    for _ in range(num_minibatches):
+        advantages = compute_advantages(val_t, rew_t, done_t, ratio_buf, cfg.gamma, cfg.gae_lambda,
+                                        cfg.vtrace_rho_clip, cfg.vtrace_c_clip)
+        seg_adv = advantages.abs().sum(axis=1)
+        prio_weights = torch.nan_to_num(seg_adv ** prio_alpha, 0, 0, 0)
+        prio_probs = (prio_weights + 1e-6) / (prio_weights.sum() + 1e-6)
+        idx = torch.multinomial(prio_probs, minibatch_segments, replacement=True)
+        mb_is_weight = (total_agents * prio_probs[idx, None]) ** -anneal_beta
+
+        mb_obs = obs_t[idx]
+        mb_actions = act_t[idx]
+        mb_logprobs = logp_t[idx]
+        mb_values = val_t[idx]
+        mb_returns = advantages[idx] + mb_values
+        mb_advantages = advantages[idx]
+
+        with _amp(getattr(cfg, "bf16", False), device):   # bf16 autocast: matmuls -> tensor cores
+            logits, newvalue = policy(mb_obs)
+            _, newlogprob, entropy = sample_logits(logits, action=mb_actions)
+            newlogprob = newlogprob.reshape(mb_logprobs.shape)
+            logratio = newlogprob - mb_logprobs
+            ratio = logratio.exp()
+            ratio_buf[idx] = ratio.detach().float()
+
+            with torch.no_grad():
+                approx_kl = ((ratio - 1) - logratio).mean()
+                clipfrac = ((ratio - 1.0).abs() > clip_coef).float().mean()
+
+            adv = mb_advantages
+            adv = mb_is_weight * (adv - adv.mean()) / (adv.std() + 1e-8)
+            pg_loss1 = -adv * ratio
+            pg_loss2 = -adv * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
+            pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+            newvalue = newvalue.view(mb_returns.shape)
+            v_clipped = mb_values + torch.clamp(newvalue - mb_values, -vf_clip, vf_clip)
+            v_loss = 0.5 * torch.max((newvalue - mb_returns) ** 2, (v_clipped - mb_returns) ** 2).mean()
+
+            entropy_loss = entropy.mean()
+            loss = pg_loss + cfg.vf_coef * v_loss - cfg.ent_coef * entropy_loss
+        val_t[idx] = newvalue.detach().float()
+
+        optimizer.zero_grad()
+        loss.backward()
+        grad_norm = nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
+        optimizer.step()
+
+        sums["policy"] += pg_loss.item()
+        sums["value"] += v_loss.item()
+        sums["entropy"] += entropy_loss.item()
+        sums["approx_kl"] += approx_kl.item()
+        sums["clipfrac"] += clipfrac.item()
+        sums["grad_norm"] += float(grad_norm)
+    return {k: v / max(1, num_minibatches) for k, v in sums.items()}
+
+
+# ============================ record log (mirrors speedrun.py RunLogger) =====================
+class RunLogger:
+    _DIVIDER = "=" * 100
+
+    def __init__(self, run_dir: Path, args_dict: dict):
+        self.path = None
+        self._fh = None
+        self._t0 = None
+        self._t1 = None
+        run_dir.mkdir(parents=True, exist_ok=True)
+        source = SOURCE_PATH.read_text(encoding="utf-8")
+        sha = self._save_source_snapshot(run_dir, source)
+        self.path = run_dir / f"log_{uuid.uuid4().hex[:8]}.txt"
+        self._fh = self.path.open("w", encoding="utf-8")
+        self._fh.write(self._header(args_dict, source, sha))
+        self._fh.flush()
+        print(f"RunLogger: writing record log to {self.path}")
+
+    @staticmethod
+    def _save_source_snapshot(run_dir: Path, source: str) -> str:
+        sd = run_dir / "source"
+        sd.mkdir(parents=True, exist_ok=True)
+        name = SOURCE_PATH.name  # track the recipe filename so the snapshot can't drift on rename
+        (sd / name).write_text(source, encoding="utf-8")
+        sha = hashlib.sha256(source.encode("utf-8")).hexdigest()
+        (sd / "manifest.json").write_text(json.dumps(
+            {"version": 1, "git_commit": _git_commit(), "source_file": str(SOURCE_PATH),
+             "files": {name: {"sha256": sha, "bytes": len(source.encode())}}},
+            indent=2) + "\n", encoding="utf-8")
+        return sha
+
+    @staticmethod
+    def _header(args_dict: dict, source: str, sha: str) -> str:
+        lines = ["python: " + " ".join(sys.version.split()), f"torch: {torch.__version__}"]
+        try:
+            import importlib.metadata
+            lines.append(f"pufferlib: {importlib.metadata.version('pufferlib')}")
+        except Exception:
+            lines.append("pufferlib: unknown")
+        lines.append(f"git commit: {_git_commit()}")
+        lines.append(f"source snapshot: source/{SOURCE_PATH.name} sha256:{sha}")
+        try:
+            smi = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=10)
+            lines.append(smi.stdout if smi.returncode == 0 else f"nvidia-smi failed: {smi.stderr}")
+        except Exception as exc:
+            lines.append(f"nvidia-smi unavailable: {exc!r}")
+        lines.append(f"argv: {sys.argv}")
+        lines.append(f"args: {args_dict}")
+        d = RunLogger._DIVIDER
+        return f"{source}\n{d}\n" + "\n".join(lines) + f"\n{d}\n"
+
+    def start_clock(self, anchor):
+        self._t0 = anchor if self._t0 is None else self._t0
+
+    def stop_clock(self, anchor):
+        self._t1 = anchor if self._t1 is None else self._t1
+
+    def record_time(self):
+        if self._t0 is None:
+            return 0.0
+        return (self._t1 if self._t1 is not None else time.monotonic()) - self._t0
+
+    def _write(self, line):
+        if self._fh is not None:
+            self._fh.write(line + "\n")
+            self._fh.flush()
+
+    def log_step(self, step, num_steps, *, reward_mean, solved_frac, loss, grad_norm):
+        rt = self.record_time()
+        self._write(f"step:{step + 1}/{num_steps} record_time:{rt:.1f}s step_avg:{rt / (step + 1):.1f}s "
+                    f"reward_mean:{max(0.0, reward_mean):.4f} solved_frac:{solved_frac:.4f} "
+                    f"loss:{loss:.4f} grad_norm:{grad_norm:.4f}")
+
+    def log_final_checkpoint(self, path):
+        self._write(f"final_checkpoint:{path} record_time:{self.record_time():.1f}s")
+
+    def close(self):
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+
+# ============================ training ======================================================
+def set_seed(seed: int):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _capture_rng_state() -> dict:
+    np_state = np.random.get_state()
+    state = {
+        "torch": torch.get_rng_state().clone(),
+        "numpy": (np_state[0], np_state[1].copy(), *np_state[2:]),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = [s.clone() for s in torch.cuda.get_rng_state_all()]
+    return state
+
+
+def _restore_rng_state(state: dict) -> None:
+    torch.set_rng_state(state["torch"])
+    np.random.set_state(state["numpy"])
+    if torch.cuda.is_available() and "cuda" in state:
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def train(cfg: argparse.Namespace) -> Path:
+    out_dir = (REPO_DIR / cfg.output_dir / cfg.run).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ensure_boxoban_extension()
+    os.chdir(pufferlib_root())  # boxoban C env caches level files under a cwd-relative resources/
+    set_seed(cfg.seed)
+
+    def make_train_env() -> BoxobanVecEnv:
+        return BoxobanVecEnv(difficulty=cfg.difficulty, num_agents=cfg.num_agents,
+                             max_steps=cfg.max_episode_steps, seed=cfg.seed,
+                             eval_mode=False, holdout_frac=cfg.holdout_frac)
+
+    env = make_train_env()
+    device = env.device
+    policy = build_policy(cfg, env, device)
+    optimizer = Muon(policy.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
+                     momentum=cfg.beta1, eps=cfg.muon_eps)
+    num_params = sum(p.numel() for p in policy.parameters())
+
+    wandb_run = DummyWandb()
+    if cfg.wandb:
+        import wandb
+        wandb_run = wandb.init(project=cfg.wandb_project, name=cfg.run,
+                               config={**vars(cfg), "num_params": num_params})
+
+    logger = RunLogger(out_dir, {**vars(cfg), "env_config": env.args["env"], "num_params": num_params})
+    steps_per_iter = cfg.num_agents * cfg.rollout_horizon
+    total_iters = max(1, math.ceil(cfg.total_timesteps / steps_per_iter))
+    print(f"[train] params={num_params:,} device={device} difficulty={DIFFICULTY_NAMES.get(cfg.difficulty)} "
+          f"agents={cfg.num_agents} horizon={cfg.rollout_horizon} iters={total_iters} "
+          f"minibatches/iter={int(cfg.replay_ratio * steps_per_iter / cfg.minibatch_size)}")
+
+    if cfg.compile:
+        import copy
+        # Warm up compile/autotune outside the timed run, then restore every mutable training input.
+        _orig = _policy_module(policy)
+        init_model = copy.deepcopy(_orig.state_dict())
+        init_opt = copy.deepcopy(optimizer.state_dict())
+        init_rng = _capture_rng_state()
+        for _ in range(2):
+            warmup_obs, warmup_act, warmup_val, warmup_logp, warmup_rew, warmup_done = collect_rollout(
+                env, policy, cfg.rollout_horizon, device, amp=cfg.bf16,
+            )
+            train_step(
+                policy, optimizer,
+                warmup_obs, warmup_act, warmup_val, warmup_logp, warmup_rew, warmup_done,
+                cfg, 0, total_iters,
+            )
+        _orig.load_state_dict(init_model)
+        optimizer.load_state_dict(init_opt)
+        env.close()
+        set_seed(cfg.seed)
+        env = make_train_env()
+        _restore_rng_state(init_rng)
+        if env.device != device:
+            raise RuntimeError(f"fresh env device changed after compile warmup: {device!r} -> {env.device!r}")
+
+    # Time the full schedule from step 1.
+    logger.start_clock(time.monotonic())
+    global_step = 0
+    for it in range(total_iters):
+        obs, act, val, logp, rew, done = collect_rollout(env, policy, cfg.rollout_horizon, device, amp=cfg.bf16)
+        global_step += steps_per_iter
+        stats = train_step(policy, optimizer, obs, act, val, logp, rew, done, cfg, it, total_iters)
+        if it == total_iters - 1:
+            logger.stop_clock(time.monotonic())
+        elog = env.log()
+        solved = float(elog.get("perf", 0.0))
+        logger.log_step(it, total_iters, reward_mean=float(elog.get("targets_hit", 0.0)),
+                        solved_frac=solved, loss=float(stats["policy"] + cfg.vf_coef * stats["value"]),
+                        grad_norm=float(stats["grad_norm"]))
+        sps = global_step / max(1e-6, logger.record_time())
+        wandb_run.log({
+            "train/solved_frac": solved,
+            "train/targets_hit": float(elog.get("targets_hit", 0.0)),
+            "train/episode_return": float(elog.get("episode_return", 0.0)),
+            "loss/policy": stats["policy"], "loss/value": stats["value"], "loss/entropy": stats["entropy"],
+            "loss/approx_kl": stats["approx_kl"], "loss/clipfrac": stats["clipfrac"],
+            "opt/grad_norm": stats["grad_norm"], "opt/lr": optimizer.param_groups[0]["lr"],
+            "perf/sps": sps, "perf/record_time_s": logger.record_time(),
+            "epoch": it + 1,
+        }, step=global_step)
+        if it % max(1, cfg.print_every) == 0 or it == total_iters - 1:
+            print(f"  iter {it + 1}/{total_iters} gstep={global_step:,} solved={solved:.3f} "
+                  f"ent={stats['entropy']:.3f} kl={stats['approx_kl']:.4f} gnorm={stats['grad_norm']:.2f} "
+                  f"SPS={sps:,.0f} t={logger.record_time():.0f}s")
+        if cfg.checkpoint_every and (it + 1) % cfg.checkpoint_every == 0:
+            torch.save(_policy_module(policy).state_dict(), out_dir / f"step_{global_step:012d}.pt")
+
+    final_ckpt = out_dir / "final.pt"
+    torch.save(_policy_module(policy).state_dict(), final_ckpt)
+    logger.log_final_checkpoint(final_ckpt)
+    logger.close()
+    env.close()
+    wandb_run.finish()
+    print(f"[train] done. final checkpoint: {final_ckpt}")
+    return final_ckpt
+
+
+# ============================ held-out evaluation ===========================================
+def evaluate(cfg: argparse.Namespace, checkpoint: Path) -> dict:
+    """Run the fixed non-LLM leaderboard eval: greedy policy over unfiltered/test."""
+    eval_difficulty = 4
+    eval_split = "test"
+    eval_seed = 12345
+    eval_episodes = 16_384
+    eval_num_agents = 512
+    eval_max_episode_steps = 120
+    target_solve_rate = 0.70
+
+    ensure_boxoban_extension()
+    os.chdir(pufferlib_root())
+    set_seed(eval_seed)
+
+    eval_name = DIFFICULTY_NAMES[eval_difficulty]
+    holdout_bin = ensure_holdout_bin(eval_name, eval_split)
+    if holdout_bin is None:
+        raise SystemExit(f"canonical eval bin not found for {eval_name}/{eval_split}")
+
+    os.environ["BOXOBAN_MAP_BIN"] = str(holdout_bin)
+    split_label = f"{eval_name}/{eval_split}-official"
+    env = BoxobanVecEnv(difficulty=-1, num_agents=eval_num_agents,
+                        max_steps=eval_max_episode_steps, seed=eval_seed,
+                        eval_mode=False, holdout_frac=0.0)
+    device = env.device
+    policy_args = vars(cfg).copy()
+    policy_args["compile"] = True
+    policy_cfg = argparse.Namespace(**policy_args)
+    policy = build_policy(policy_cfg, env, device)
+    _policy_module(policy).load_state_dict(torch.load(checkpoint, map_location=device, weights_only=True))
+    policy.eval()
+    print(f"[eval] loaded {checkpoint}; scoring >= {eval_episodes} episodes "
+          f"(held-out: {split_label}, greedy=True)")
+
+    # Key completed episodes by their initial board and average equally over distinct levels.
+    from collections import defaultdict
+    init_board = env.obs().to(device, copy=True).clone()   # each agent's current-episode start board
+    state = policy.initial_state(env.num_agents, device)
+    level_solved: dict = defaultdict(int)
+    level_counts: dict = defaultdict(int)
+    total_eps = 0
+    # Record eval is greedy over the canonical held-out bin; verifier rejects incomplete coverage.
+    eps_since_new = 0
+    while total_eps < eval_episodes:
+        with torch.no_grad():
+            logits, _, state = policy.forward_eval(env.obs().to(device, copy=True), state)
+            action = logits.argmax(-1)
+        rew, term = env.step(action)
+        done = term.to(device) > 0.5
+        solved = done & (rew.to(device) > 0.5)
+        idx = done.nonzero(as_tuple=True)[0]
+        if idx.numel():
+            before = len(level_counts)
+            for b, s in zip(init_board[idx].cpu().numpy(), solved[idx].cpu().numpy()):
+                h = b.tobytes()
+                level_counts[h] += 1
+                level_solved[h] += int(s)
+            ndone = int(idx.numel())
+            total_eps += ndone
+            eps_since_new = 0 if len(level_counts) > before else eps_since_new + ndone
+            for s_ in state:                       # reset recurrent state for finished envs
+                s_[:, idx, :] = 0.0
+            init_board[idx] = env.obs().to(device, copy=True)[idx]   # new episode's start board
+            if (
+                len(level_counts)
+                and eps_since_new >= max(4096, 4 * len(level_counts))
+            ):
+                break
+    env_perf = float(env.log().get("perf", float("nan")))  # PufferLib's C-aggregated solve mean (num_agents-invariant)
+    env.close()
+
+    keys = list(level_counts.keys())
+    per_frac = [level_solved[h] / level_counts[h] for h in keys]
+    per_n = [level_counts[h] for h in keys]
+    per_c = [level_solved[h] for h in keys]
+    per_level_sha = [hashlib.sha256(h).hexdigest() for h in keys]   # board identity of each held-out level
+    n = len(keys)                                  # distinct held-out levels seen
+    pass_at_1 = sum(per_frac) / max(1, n)          # mean per-level solve fraction (each level weight 1)
+    ci_low, ci_high = _bootstrap_ci(per_frac, seed=eval_seed)
+    se = float(np.std(per_frac) / math.sqrt(max(1, n))) if n else 0.0
+    # Pin the exact eval pool for offline verification.
+    holdout_n_levels = (holdout_bin.stat().st_size // BOXOBAN_PUZZLE_BYTES) if holdout_bin else None
+    if holdout_n_levels and n < holdout_n_levels:
+        print(f"[eval] WARNING: scored {n}/{holdout_n_levels} held-out levels — pool not fully covered")
+    record = {
+        "seed": eval_seed, "run": cfg.run, "step": None, "checkpoint": str(checkpoint),
+        "model": f"ppo-{cfg.arch}-h{cfg.hidden_size}-L{cfg.num_layers}", "eval_data": f"boxoban:{split_label}",
+        "holdout_bin": holdout_bin.name if holdout_bin else None,
+        "holdout_bin_sha256": _file_sha256(holdout_bin) if holdout_bin else None,
+        "holdout_n_levels": holdout_n_levels,
+        "git_commit": _git_commit(), "n_puzzles": n, "k": int(np.median(per_n)) if n else 1,
+        "pass_at_1": pass_at_1, "pass_at_k": {"1": pass_at_1},
+        "solve_rate_episode": env_perf,    # PufferLib env.log()['perf'] cross-check (per-episode mean)
+        "eval_num_agents": int(eval_num_agents),
+        "ci_low": ci_low, "ci_high": ci_high, "se": se,
+        "n_extract_fail": 0, "n_answered": int(sum(per_n)), "n_length_trunc": 0,
+        "answer_rate": 1.0, "solve_given_answer": pass_at_1, "trunc_frac": 0.0,
+        "sampling": {"temperature": None, "top_p": None, "top_k": None, "min_p": 0.0,
+                     "max_tokens": eval_max_episode_steps, "seed": eval_seed,
+                     "greedy": True, "episodes": int(sum(per_n)), "logprobs": 0, "interrupt": None},
+        "per_puzzle_solve_frac": per_frac, "per_puzzle_n": per_n,
+        "per_puzzle_solved_count": per_c, "per_puzzle_answered_count": per_n,
+        "per_puzzle_length_trunc_count": [0] * n,
+        "per_puzzle_level_sha": per_level_sha,
+    }
+    out_dir = (REPO_DIR / cfg.output_dir / cfg.run).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"eval_step000000_seed{eval_seed}.json"
+    out_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    cleared = "CLEARS" if ci_low > target_solve_rate else "DOES NOT CLEAR"
+    print(f"[eval] per-level pass@1={pass_at_1:.4f}  95% CI [{ci_low:.4f}, {ci_high:.4f}]  "
+          f"({n} levels, {int(sum(per_n))} episodes @ {eval_num_agents} agents, ~{sum(per_n)/max(1,n):.0f}/level)  "
+          f"vs target {target_solve_rate}: {cleared}")
+    print(f"[eval] PufferLib env.log perf (per-episode solve, cross-check) = {env_perf:.4f}")
+    print(f"[eval] wrote {out_path}")
+    return record
+
+
+# ============================ CLI ===========================================================
+def _parse_bool(value: str) -> bool:
+    return str(value).lower() not in ("0", "false", "no")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Sokoban Speedrun — non-LLM (PufferLib boxoban + in-file PPO)")
+    p.add_argument("--run", type=str, default=_default_run_name())
+    p.add_argument("--output-dir", type=str, default="outputs")
+    for key, val in RECIPE.items():
+        flag = "--" + key.replace("_", "-")
+        if isinstance(val, bool):
+            p.add_argument(flag, default=val, type=_parse_bool)
+        else:
+            p.add_argument(flag, default=val, type=type(val))
+    p.add_argument("--print-every", type=int, default=10)
+    p.add_argument("--checkpoint-every", type=int, default=0)
+    p.add_argument("--eval-only", action="store_true")
+    p.add_argument("--eval-checkpoint", type=str, default=None)
+    p.add_argument("--no-eval", action="store_true")
+    return p
+
+
+def main(argv: list[str] | None = None) -> None:
+    cfg = build_parser().parse_args(argv)
+    if cfg.eval_only:
+        ckpt = Path(cfg.eval_checkpoint).resolve() if cfg.eval_checkpoint else None
+        if ckpt is None or not ckpt.exists():
+            raise SystemExit(f"--eval-only needs an existing --eval-checkpoint (got {cfg.eval_checkpoint})")
+        evaluate(cfg, ckpt)
+        return
+    final_ckpt = train(cfg)
+    if cfg.no_eval:
+        return
+    # Eval in a FRESH process: the boxoban env caches its level pool in process-global state, so the
+    # held-out pool (a different bin via BOXOBAN_MAP_BIN) only loads cleanly in a new process.
+    cmd = [sys.executable, str(SOURCE_PATH), "--eval-only", "--eval-checkpoint", str(final_ckpt),
+           "--run", cfg.run, "--arch", cfg.arch, "--hidden-size", str(cfg.hidden_size),
+           "--num-layers", str(cfg.num_layers), "--output-dir", cfg.output_dir,
+           "--enc-width", str(cfg.enc_width), "--enc-dim", str(cfg.enc_dim),
+           "--enc-depth", str(cfg.enc_depth), "--enc-stride", str(cfg.enc_stride)]
+    subprocess.run(cmd, check=True)
+
+
+if __name__ == "__main__":
+    main()
+
+====================================================================================================
+python: 3.12.1 (main, Jan 8 2024, 04:46:10) [Clang 17.0.6 ]
+torch: 2.9.0+cu126
+pufferlib: 4.0.0
+git commit: None
+source snapshot: source/speedrun.py sha256:01aa7b225b4733a02b9289dd775c1cee36c423ef19bb3483372a2e74443be214
+Thu Jul  2 11:27:56 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.95.05              Driver Version: 580.95.05      CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA H100 80GB HBM3          On  |   00000000:0B:00.0 Off |                    0 |
+| N/A   38C    P0            115W /  700W |     557MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A               1      C   /bin/dumb-init                          548MiB |
++-----------------------------------------------------------------------------------------+
+
+argv: ['/root/speedrun.py', '--output-dir', '/vol/outputs', '--run', '20260702-noconv-sgpm2-d64-h950-s43', '--arch', 'sgpm2-mingru', '--enc-dim', '64', '--total-timesteps', '498073600', '--seed', '43']
+args: {'run': '20260702-noconv-sgpm2-d64-h950-s43', 'output_dir': '/vol/outputs', 'difficulty': 4, 'num_agents': 8192, 'max_episode_steps': 120, 'holdout_frac': 0.1, 'total_timesteps': 498073600, 'rollout_horizon': 64, 'minibatch_size': 32768, 'replay_ratio': 1.6234, 'gamma': 0.989717, 'gae_lambda': 0.759273, 'vtrace_rho_clip': 3.13347, 'vtrace_c_clip': 2.75328, 'prio_alpha': 0.453827, 'prio_beta0': 0.765589, 'clip_coef': 0.01, 'vf_coef': 5.0, 'vf_clip_coef': 5.0, 'ent_coef': 0.000188411, 'max_grad_norm': 1.20325, 'learning_rate': 0.00134234, 'anneal_lr': True, 'min_lr_ratio': 0.37872, 'beta1': 0.995526, 'weight_decay': 0.0, 'muon_eps': 1e-14, 'arch': 'sgpm2-mingru', 'hidden_size': 256, 'num_layers': 3, 'enc_width': 0, 'enc_dim': 64, 'enc_depth': 0, 'enc_stride': 0, 'bf16': False, 'compile': True, 'compile_mode': 'default', 'seed': 43, 'wandb': False, 'wandb_project': 'sokoban-speedrun-non-llm', 'print_every': 10, 'checkpoint_every': 0, 'eval_only': False, 'eval_checkpoint': None, 'no_eval': False, 'env_config': {'num_agents': 1, 'difficulty': 4, 'int_r_coeff': 0.25, 'target_loss_pen_coeff': 0, 'max_steps': 120, 'eval': 0, 'holdout_frac': 0.1}, 'num_params': 2273542}
+====================================================================================================
+step:1/950 record_time:0.8s step_avg:0.8s reward_mean:0.1987 solved_frac:0.0000 loss:0.0155 grad_norm:0.5889
+step:2/950 record_time:1.7s step_avg:0.8s reward_mean:0.3567 solved_frac:0.0007 loss:0.0054 grad_norm:0.5471
+step:3/950 record_time:2.6s step_avg:0.9s reward_mean:0.3737 solved_frac:0.0005 loss:0.0023 grad_norm:0.4470
+step:4/950 record_time:3.5s step_avg:0.9s reward_mean:0.3775 solved_frac:0.0009 loss:0.0004 grad_norm:0.3370
+step:5/950 record_time:4.3s step_avg:0.9s reward_mean:0.3879 solved_frac:0.0005 loss:0.0015 grad_norm:0.4615
+step:6/950 record_time:5.2s step_avg:0.9s reward_mean:0.3788 solved_frac:0.0002 loss:0.0010 grad_norm:0.4939
+step:7/950 record_time:6.1s step_avg:0.9s reward_mean:0.3965 solved_frac:0.0002 loss:0.0007 grad_norm:0.5870
+step:8/950 record_time:6.9s step_avg:0.9s reward_mean:0.3867 solved_frac:0.0000 loss:0.0007 grad_norm:0.6229
+step:9/950 record_time:7.8s step_avg:0.9s reward_mean:0.4023 solved_frac:0.0009 loss:0.0004 grad_norm:0.6411
+step:10/950 record_time:8.7s step_avg:0.9s reward_mean:0.3892 solved_frac:0.0007 loss:-0.0008 grad_norm:0.6482
+step:11/950 record_time:9.6s step_avg:0.9s reward_mean:0.4022 solved_frac:0.0009 loss:-0.0002 grad_norm:0.6477
+step:12/950 record_time:10.4s step_avg:0.9s reward_mean:0.3810 solved_frac:0.0012 loss:-0.0005 grad_norm:0.5958
+step:13/950 record_time:11.3s step_avg:0.9s reward_mean:0.4015 solved_frac:0.0002 loss:-0.0012 grad_norm:0.5809
+step:14/950 record_time:12.1s step_avg:0.9s reward_mean:0.3909 solved_frac:0.0002 loss:-0.0029 grad_norm:0.5492
+step:15/950 record_time:13.0s step_avg:0.9s reward_mean:0.3815 solved_frac:0.0000 loss:-0.0022 grad_norm:0.5385
+step:16/950 record_time:13.9s step_avg:0.9s reward_mean:0.3826 solved_frac:0.0005 loss:-0.0016 grad_norm:0.5058
+step:17/950 record_time:14.7s step_avg:0.9s reward_mean:0.4043 solved_frac:0.0002 loss:-0.0025 grad_norm:0.4913
+step:18/950 record_time:15.6s step_avg:0.9s reward_mean:0.3942 solved_frac:0.0009 loss:-0.0016 grad_norm:0.4722
+step:19/950 record_time:16.4s step_avg:0.9s reward_mean:0.4021 solved_frac:0.0007 loss:-0.0021 grad_norm:0.4851
+step:20/950 record_time:17.3s step_avg:0.9s reward_mean:0.3998 solved_frac:0.0007 loss:-0.0018 grad_norm:0.4404
+step:21/950 record_time:18.1s step_avg:0.9s reward_mean:0.4125 solved_frac:0.0011 loss:-0.0021 grad_norm:0.4315
+step:22/950 record_time:18.9s step_avg:0.9s reward_mean:0.4183 solved_frac:0.0020 loss:-0.0021 grad_norm:0.4337
+step:23/950 record_time:19.8s step_avg:0.9s reward_mean:0.4108 solved_frac:0.0002 loss:-0.0029 grad_norm:0.4040
+step:24/950 record_time:20.6s step_avg:0.9s reward_mean:0.4385 solved_frac:0.0016 loss:-0.0022 grad_norm:0.4216
+step:25/950 record_time:21.5s step_avg:0.9s reward_mean:0.4106 solved_frac:0.0009 loss:-0.0033 grad_norm:0.4031
+step:26/950 record_time:22.3s step_avg:0.9s reward_mean:0.4246 solved_frac:0.0011 loss:-0.0027 grad_norm:0.3956
+step:27/950 record_time:23.2s step_avg:0.9s reward_mean:0.4336 solved_frac:0.0005 loss:-0.0024 grad_norm:0.3904
+step:28/950 record_time:24.0s step_avg:0.9s reward_mean:0.4590 solved_frac:0.0009 loss:-0.0018 grad_norm:0.3811
+step:29/950 record_time:24.9s step_avg:0.9s reward_mean:0.4473 solved_frac:0.0005 loss:-0.0021 grad_norm:0.3774
+step:30/950 record_time:25.7s step_avg:0.9s reward_mean:0.4651 solved_frac:0.0009 loss:-0.0020 grad_norm:0.3924
+step:31/950 record_time:26.6s step_avg:0.9s reward_mean:0.4764 solved_frac:0.0009 loss:-0.0008 grad_norm:0.3913
+step:32/950 record_time:27.4s step_avg:0.9s reward_mean:0.4558 solved_frac:0.0009 loss:-0.0030 grad_norm:0.3884
+step:33/950 record_time:28.3s step_avg:0.9s reward_mean:0.4755 solved_frac:0.0016 loss:-0.0026 grad_norm:0.4068
+step:34/950 record_time:29.2s step_avg:0.9s reward_mean:0.4821 solved_frac:0.0016 loss:-0.0021 grad_norm:0.4156
+step:35/950 record_time:30.0s step_avg:0.9s reward_mean:0.4963 solved_frac:0.0009 loss:-0.0020 grad_norm:0.3825
+step:36/950 record_time:30.9s step_avg:0.9s reward_mean:0.5007 solved_frac:0.0007 loss:-0.0018 grad_norm:0.3839
+step:37/950 record_time:31.8s step_avg:0.9s reward_mean:0.5060 solved_frac:0.0007 loss:-0.0024 grad_norm:0.3761
+step:38/950 record_time:32.6s step_avg:0.9s reward_mean:0.5179 solved_frac:0.0014 loss:-0.0017 grad_norm:0.4027
+step:39/950 record_time:33.5s step_avg:0.9s reward_mean:0.5134 solved_frac:0.0018 loss:-0.0007 grad_norm:0.3691
+step:40/950 record_time:34.4s step_avg:0.9s reward_mean:0.5192 solved_frac:0.0011 loss:-0.0013 grad_norm:0.3875
+step:41/950 record_time:35.2s step_avg:0.9s reward_mean:0.5486 solved_frac:0.0011 loss:-0.0012 grad_norm:0.3775
+step:42/950 record_time:36.1s step_avg:0.9s reward_mean:0.5505 solved_frac:0.0023 loss:-0.0001 grad_norm:0.3893
+step:43/950 record_time:36.9s step_avg:0.9s reward_mean:0.5557 solved_frac:0.0011 loss:-0.0007 grad_norm:0.3888
+step:44/950 record_time:37.8s step_avg:0.9s reward_mean:0.5614 solved_frac:0.0021 loss:-0.0013 grad_norm:0.3966
+step:45/950 record_time:38.6s step_avg:0.9s reward_mean:0.5704 solved_frac:0.0018 loss:-0.0009 grad_norm:0.4194
+step:46/950 record_time:39.5s step_avg:0.9s reward_mean:0.5722 solved_frac:0.0016 loss:-0.0012 grad_norm:0.4188
+step:47/950 record_time:40.4s step_avg:0.9s reward_mean:0.5807 solved_frac:0.0027 loss:0.0007 grad_norm:0.4182
+step:48/950 record_time:41.2s step_avg:0.9s reward_mean:0.5992 solved_frac:0.0009 loss:-0.0003 grad_norm:0.4328
+step:49/950 record_time:42.0s step_avg:0.9s reward_mean:0.6207 solved_frac:0.0018 loss:0.0004 grad_norm:0.4331
+step:50/950 record_time:42.8s step_avg:0.9s reward_mean:0.5802 solved_frac:0.0011 loss:0.0005 grad_norm:0.4337
+step:51/950 record_time:43.7s step_avg:0.9s reward_mean:0.6446 solved_frac:0.0018 loss:-0.0002 grad_norm:0.4312
+step:52/950 record_time:44.5s step_avg:0.9s reward_mean:0.6365 solved_frac:0.0023 loss:0.0011 grad_norm:0.4370
+step:53/950 record_time:45.3s step_avg:0.9s reward_mean:0.6526 solved_frac:0.0037 loss:0.0009 grad_norm:0.4469
+step:54/950 record_time:46.1s step_avg:0.9s reward_mean:0.6437 solved_frac:0.0016 loss:0.0013 grad_norm:0.4503
+step:55/950 record_time:47.0s step_avg:0.9s reward_mean:0.6696 solved_frac:0.0028 loss:0.0017 grad_norm:0.4608
+step:56/950 record_time:47.8s step_avg:0.9s reward_mean:0.6836 solved_frac:0.0036 loss:0.0032 grad_norm:0.4614
+step:57/950 record_time:48.6s step_avg:0.9s reward_mean:0.6976 solved_frac:0.0016 loss:0.0030 grad_norm:0.4831
+step:58/950 record_time:49.5s step_avg:0.9s reward_mean:0.6936 solved_frac:0.0038 loss:0.0032 grad_norm:0.4838
+step:59/950 record_time:50.3s step_avg:0.9s reward_mean:0.7155 solved_frac:0.0028 loss:0.0038 grad_norm:0.4789
+step:60/950 record_time:51.1s step_avg:0.9s reward_mean:0.7180 solved_frac:0.0041 loss:0.0044 grad_norm:0.4649
+step:61/950 record_time:52.0s step_avg:0.9s reward_mean:0.7394 solved_frac:0.0032 loss:0.0030 grad_norm:0.4827
+step:62/950 record_time:52.8s step_avg:0.9s reward_mean:0.7156 solved_frac:0.0043 loss:0.0046 grad_norm:0.4820
+step:63/950 record_time:53.6s step_avg:0.9s reward_mean:0.7366 solved_frac:0.0037 loss:0.0032 grad_norm:0.4898
+step:64/950 record_time:54.4s step_avg:0.9s reward_mean:0.7451 solved_frac:0.0045 loss:0.0053 grad_norm:0.5019
+step:65/950 record_time:55.2s step_avg:0.8s reward_mean:0.7221 solved_frac:0.0037 loss:0.0041 grad_norm:0.5076
+step:66/950 record_time:56.1s step_avg:0.8s reward_mean:0.7603 solved_frac:0.0039 loss:0.0034 grad_norm:0.5075
+step:67/950 record_time:56.9s step_avg:0.8s reward_mean:0.7870 solved_frac:0.0041 loss:0.0046 grad_norm:0.5126
+step:68/950 record_time:57.7s step_avg:0.8s reward_mean:0.7820 solved_frac:0.0028 loss:0.0037 grad_norm:0.5121
+step:69/950 record_time:58.5s step_avg:0.8s reward_mean:0.7937 solved_frac:0.0025 loss:0.0036 grad_norm:0.5110
+step:70/950 record_time:59.3s step_avg:0.8s reward_mean:0.7831 solved_frac:0.0069 loss:0.0071 grad_norm:0.5052
+step:71/950 record_time:60.2s step_avg:0.8s reward_mean:0.8182 solved_frac:0.0034 loss:0.0044 grad_norm:0.5512
+step:72/950 record_time:61.0s step_avg:0.8s reward_mean:0.8177 solved_frac:0.0055 loss:0.0051 grad_norm:0.5194
+step:73/950 record_time:61.8s step_avg:0.8s reward_mean:0.8042 solved_frac:0.0052 loss:0.0059 grad_norm:0.5413
+step:74/950 record_time:62.7s step_avg:0.8s reward_mean:0.8642 solved_frac:0.0057 loss:0.0055 grad_norm:0.5191
+step:75/950 record_time:63.5s step_avg:0.8s reward_mean:0.8474 solved_frac:0.0050 loss:0.0042 grad_norm:0.5357
+step:76/950 record_time:64.4s step_avg:0.8s reward_mean:0.8267 solved_frac:0.0041 loss:0.0033 grad_norm:0.5433
+step:77/950 record_time:65.2s step_avg:0.8s reward_mean:0.8690 solved_frac:0.0059 loss:0.0036 grad_norm:0.5441
+step:78/950 record_time:66.1s step_avg:0.8s reward_mean:0.8765 solved_frac:0.0064 loss:0.0052 grad_norm:0.5506
+step:79/950 record_time:66.9s step_avg:0.8s reward_mean:0.8798 solved_frac:0.0075 loss:0.0060 grad_norm:0.5313
+step:80/950 record_time:67.8s step_avg:0.8s reward_mean:0.9214 solved_frac:0.0062 loss:0.0048 grad_norm:0.5540
+step:81/950 record_time:68.6s step_avg:0.8s reward_mean:0.8823 solved_frac:0.0062 loss:0.0053 grad_norm:0.5526
+step:82/950 record_time:69.5s step_avg:0.8s reward_mean:0.9235 solved_frac:0.0059 loss:0.0047 grad_norm:0.5660
+step:83/950 record_time:70.4s step_avg:0.8s reward_mean:0.9467 solved_frac:0.0060 loss:0.0065 grad_norm:0.5657
+step:84/950 record_time:71.3s step_avg:0.8s reward_mean:0.9314 solved_frac:0.0047 loss:0.0035 grad_norm:0.5614
+step:85/950 record_time:72.1s step_avg:0.8s reward_mean:0.9805 solved_frac:0.0108 loss:0.0065 grad_norm:0.5683
+step:86/950 record_time:72.9s step_avg:0.8s reward_mean:0.9510 solved_frac:0.0068 loss:0.0079 grad_norm:0.5650
+step:87/950 record_time:73.8s step_avg:0.8s reward_mean:0.9614 solved_frac:0.0074 loss:0.0064 grad_norm:0.5680
+step:88/950 record_time:74.6s step_avg:0.8s reward_mean:0.9549 solved_frac:0.0095 loss:0.0065 grad_norm:0.5961
+step:89/950 record_time:75.4s step_avg:0.8s reward_mean:0.9893 solved_frac:0.0071 loss:0.0068 grad_norm:0.6047
+step:90/950 record_time:76.3s step_avg:0.8s reward_mean:0.9955 solved_frac:0.0093 loss:0.0072 grad_norm:0.5649
+step:91/950 record_time:77.1s step_avg:0.8s reward_mean:0.9874 solved_frac:0.0094 loss:0.0076 grad_norm:0.5766
+step:92/950 record_time:78.0s step_avg:0.8s reward_mean:1.0157 solved_frac:0.0096 loss:0.0066 grad_norm:0.5884
+step:93/950 record_time:78.8s step_avg:0.8s reward_mean:1.0426 solved_frac:0.0120 loss:0.0070 grad_norm:0.6040
+step:94/950 record_time:79.6s step_avg:0.8s reward_mean:1.0161 solved_frac:0.0091 loss:0.0070 grad_norm:0.6140
+step:95/950 record_time:80.5s step_avg:0.8s reward_mean:1.0611 solved_frac:0.0109 loss:0.0065 grad_norm:0.5783
+step:96/950 record_time:81.3s step_avg:0.8s reward_mean:1.0489 solved_frac:0.0134 loss:0.0078 grad_norm:0.6250
+step:97/950 record_time:82.2s step_avg:0.8s reward_mean:1.0412 solved_frac:0.0128 loss:0.0085 grad_norm:0.5836
+step:98/950 record_time:83.0s step_avg:0.8s reward_mean:1.0786 solved_frac:0.0113 loss:0.0068 grad_norm:0.6451
+step:99/950 record_time:83.8s step_avg:0.8s reward_mean:1.0855 solved_frac:0.0132 loss:0.0082 grad_norm:0.6354
+step:100/950 record_time:84.6s step_avg:0.8s reward_mean:1.0999 solved_frac:0.0150 loss:0.0074 grad_norm:0.6218
+step:101/950 record_time:85.4s step_avg:0.8s reward_mean:1.1164 solved_frac:0.0139 loss:0.0086 grad_norm:0.6168
+step:102/950 record_time:86.3s step_avg:0.8s reward_mean:1.1275 solved_frac:0.0184 loss:0.0103 grad_norm:0.6415
+step:103/950 record_time:87.1s step_avg:0.8s reward_mean:1.1197 solved_frac:0.0150 loss:0.0083 grad_norm:0.6612
+step:104/950 record_time:88.0s step_avg:0.8s reward_mean:1.1359 solved_frac:0.0151 loss:0.0095 grad_norm:0.6306
+step:105/950 record_time:88.8s step_avg:0.8s reward_mean:1.1659 solved_frac:0.0174 loss:0.0091 grad_norm:0.6550
+step:106/950 record_time:89.6s step_avg:0.8s reward_mean:1.1785 solved_frac:0.0160 loss:0.0084 grad_norm:0.6368
+step:107/950 record_time:90.5s step_avg:0.8s reward_mean:1.2191 solved_frac:0.0200 loss:0.0086 grad_norm:0.6399
+step:108/950 record_time:91.3s step_avg:0.8s reward_mean:1.2120 solved_frac:0.0158 loss:0.0072 grad_norm:0.6715
+step:109/950 record_time:92.1s step_avg:0.8s reward_mean:1.2275 solved_frac:0.0233 loss:0.0099 grad_norm:0.6523
+step:110/950 record_time:92.9s step_avg:0.8s reward_mean:1.2529 solved_frac:0.0210 loss:0.0109 grad_norm:0.6861
+step:111/950 record_time:93.8s step_avg:0.8s reward_mean:1.2436 solved_frac:0.0235 loss:0.0119 grad_norm:0.6922
+step:112/950 record_time:94.6s step_avg:0.8s reward_mean:1.2343 solved_frac:0.0207 loss:0.0105 grad_norm:0.6982
+step:113/950 record_time:95.4s step_avg:0.8s reward_mean:1.2690 solved_frac:0.0195 loss:0.0077 grad_norm:0.6997
+step:114/950 record_time:96.3s step_avg:0.8s reward_mean:1.2686 solved_frac:0.0186 loss:0.0087 grad_norm:0.6795
+step:115/950 record_time:97.1s step_avg:0.8s reward_mean:1.2826 solved_frac:0.0265 loss:0.0096 grad_norm:0.6916
+step:116/950 record_time:97.9s step_avg:0.8s reward_mean:1.3090 solved_frac:0.0271 loss:0.0109 grad_norm:0.6539
+step:117/950 record_time:98.7s step_avg:0.8s reward_mean:1.3060 solved_frac:0.0242 loss:0.0092 grad_norm:0.7187
+step:118/950 record_time:99.6s step_avg:0.8s reward_mean:1.3094 solved_frac:0.0262 loss:0.0134 grad_norm:0.6795
+step:119/950 record_time:100.4s step_avg:0.8s reward_mean:1.3496 solved_frac:0.0284 loss:0.0124 grad_norm:0.6660
+step:120/950 record_time:101.3s step_avg:0.8s reward_mean:1.3359 solved_frac:0.0280 loss:0.0124 grad_norm:0.6582
+step:121/950 record_time:102.1s step_avg:0.8s reward_mean:1.3692 solved_frac:0.0335 loss:0.0125 grad_norm:0.6494
+step:122/950 record_time:103.0s step_avg:0.8s reward_mean:1.3599 solved_frac:0.0309 loss:0.0106 grad_norm:0.7077
+step:123/950 record_time:103.8s step_avg:0.8s reward_mean:1.3772 solved_frac:0.0307 loss:0.0105 grad_norm:0.6846
+step:124/950 record_time:104.6s step_avg:0.8s reward_mean:1.3896 solved_frac:0.0324 loss:0.0123 grad_norm:0.6891
+step:125/950 record_time:105.5s step_avg:0.8s reward_mean:1.3971 solved_frac:0.0315 loss:0.0121 grad_norm:0.6947
+step:126/950 record_time:106.3s step_avg:0.8s reward_mean:1.4440 solved_frac:0.0334 loss:0.0125 grad_norm:0.7076
+step:127/950 record_time:107.1s step_avg:0.8s reward_mean:1.3972 solved_frac:0.0312 loss:0.0134 grad_norm:0.7085
+step:128/950 record_time:108.0s step_avg:0.8s reward_mean:1.4623 solved_frac:0.0377 loss:0.0144 grad_norm:0.6962
+step:129/950 record_time:108.8s step_avg:0.8s reward_mean:1.4752 solved_frac:0.0394 loss:0.0146 grad_norm:0.6776
+step:130/950 record_time:109.6s step_avg:0.8s reward_mean:1.5066 solved_frac:0.0395 loss:0.0140 grad_norm:0.6523
+step:131/950 record_time:110.5s step_avg:0.8s reward_mean:1.4969 solved_frac:0.0408 loss:0.0140 grad_norm:0.6379
+step:132/950 record_time:111.3s step_avg:0.8s reward_mean:1.5039 solved_frac:0.0410 loss:0.0137 grad_norm:0.7021
+step:133/950 record_time:112.1s step_avg:0.8s reward_mean:1.5480 solved_frac:0.0469 loss:0.0152 grad_norm:0.6836
+step:134/950 record_time:112.9s step_avg:0.8s reward_mean:1.5913 solved_frac:0.0493 loss:0.0166 grad_norm:0.6781
+step:135/950 record_time:113.8s step_avg:0.8s reward_mean:1.5753 solved_frac:0.0455 loss:0.0132 grad_norm:0.7039
+step:136/950 record_time:114.6s step_avg:0.8s reward_mean:1.5981 solved_frac:0.0535 loss:0.0157 grad_norm:0.7245
+step:137/950 record_time:115.4s step_avg:0.8s reward_mean:1.6314 solved_frac:0.0592 loss:0.0179 grad_norm:0.6959
+step:138/950 record_time:116.3s step_avg:0.8s reward_mean:1.6437 solved_frac:0.0610 loss:0.0169 grad_norm:0.7117
+step:139/950 record_time:117.1s step_avg:0.8s reward_mean:1.6554 solved_frac:0.0598 loss:0.0174 grad_norm:0.7305
+step:140/950 record_time:117.9s step_avg:0.8s reward_mean:1.6561 solved_frac:0.0582 loss:0.0182 grad_norm:0.7066
+step:141/950 record_time:118.8s step_avg:0.8s reward_mean:1.6743 solved_frac:0.0665 loss:0.0216 grad_norm:0.7109
+step:142/950 record_time:119.6s step_avg:0.8s reward_mean:1.6827 solved_frac:0.0724 loss:0.0214 grad_norm:0.7227
+step:143/950 record_time:120.4s step_avg:0.8s reward_mean:1.7222 solved_frac:0.0756 loss:0.0222 grad_norm:0.7624
+step:144/950 record_time:121.3s step_avg:0.8s reward_mean:1.7652 solved_frac:0.0764 loss:0.0209 grad_norm:0.7084
+step:145/950 record_time:122.1s step_avg:0.8s reward_mean:1.7792 solved_frac:0.0803 loss:0.0218 grad_norm:0.7679
+step:146/950 record_time:122.9s step_avg:0.8s reward_mean:1.8000 solved_frac:0.0827 loss:0.0212 grad_norm:0.7804
+step:147/950 record_time:123.8s step_avg:0.8s reward_mean:1.8188 solved_frac:0.0909 loss:0.0219 grad_norm:0.7757
+step:148/950 record_time:124.6s step_avg:0.8s reward_mean:1.8574 solved_frac:0.0959 loss:0.0221 grad_norm:0.7531
+step:149/950 record_time:125.4s step_avg:0.8s reward_mean:1.8573 solved_frac:0.1024 loss:0.0253 grad_norm:0.7517
+step:150/950 record_time:126.3s step_avg:0.8s reward_mean:1.8720 solved_frac:0.1044 loss:0.0242 grad_norm:0.7552
+step:151/950 record_time:127.1s step_avg:0.8s reward_mean:1.8939 solved_frac:0.1070 loss:0.0253 grad_norm:0.7667
+step:152/950 record_time:127.9s step_avg:0.8s reward_mean:1.9221 solved_frac:0.1175 loss:0.0270 grad_norm:0.7681
+step:153/950 record_time:128.8s step_avg:0.8s reward_mean:1.9307 solved_frac:0.1054 loss:0.0236 grad_norm:0.7304
+step:154/950 record_time:129.6s step_avg:0.8s reward_mean:1.9609 solved_frac:0.1262 loss:0.0292 grad_norm:0.7828
+step:155/950 record_time:130.4s step_avg:0.8s reward_mean:1.9694 solved_frac:0.1228 loss:0.0295 grad_norm:0.7788
+step:156/950 record_time:131.3s step_avg:0.8s reward_mean:1.9892 solved_frac:0.1278 loss:0.0280 grad_norm:0.7634
+step:157/950 record_time:132.1s step_avg:0.8s reward_mean:2.0275 solved_frac:0.1360 loss:0.0262 grad_norm:0.7457
+step:158/950 record_time:133.0s step_avg:0.8s reward_mean:2.0788 solved_frac:0.1397 loss:0.0280 grad_norm:0.8406
+step:159/950 record_time:133.8s step_avg:0.8s reward_mean:2.0836 solved_frac:0.1474 loss:0.0272 grad_norm:0.8131
+step:160/950 record_time:134.6s step_avg:0.8s reward_mean:2.0753 solved_frac:0.1504 loss:0.0271 grad_norm:0.7364
+step:161/950 record_time:135.4s step_avg:0.8s reward_mean:2.1065 solved_frac:0.1432 loss:0.0268 grad_norm:0.8348
+step:162/950 record_time:136.3s step_avg:0.8s reward_mean:2.1215 solved_frac:0.1556 loss:0.0288 grad_norm:0.8164
+step:163/950 record_time:137.1s step_avg:0.8s reward_mean:2.1613 solved_frac:0.1689 loss:0.0313 grad_norm:0.8617
+step:164/950 record_time:137.9s step_avg:0.8s reward_mean:2.1621 solved_frac:0.1801 loss:0.0342 grad_norm:0.8429
+step:165/950 record_time:138.8s step_avg:0.8s reward_mean:2.1694 solved_frac:0.1684 loss:0.0308 grad_norm:0.8504
+step:166/950 record_time:139.6s step_avg:0.8s reward_mean:2.2292 solved_frac:0.1795 loss:0.0330 grad_norm:0.8022
+step:167/950 record_time:140.4s step_avg:0.8s reward_mean:2.2270 solved_frac:0.1815 loss:0.0323 grad_norm:0.8094
+step:168/950 record_time:141.2s step_avg:0.8s reward_mean:2.2365 solved_frac:0.1863 loss:0.0330 grad_norm:0.8589
+step:169/950 record_time:142.1s step_avg:0.8s reward_mean:2.2557 solved_frac:0.1927 loss:0.0318 grad_norm:0.8286
+step:170/950 record_time:142.9s step_avg:0.8s reward_mean:2.2812 solved_frac:0.1910 loss:0.0323 grad_norm:0.8638
+step:171/950 record_time:143.7s step_avg:0.8s reward_mean:2.3169 solved_frac:0.2144 loss:0.0328 grad_norm:0.8567
+step:172/950 record_time:144.6s step_avg:0.8s reward_mean:2.3017 solved_frac:0.2054 loss:0.0311 grad_norm:0.7772
+step:173/950 record_time:145.4s step_avg:0.8s reward_mean:2.3344 solved_frac:0.2097 loss:0.0320 grad_norm:0.8431
+step:174/950 record_time:146.3s step_avg:0.8s reward_mean:2.3014 solved_frac:0.2108 loss:0.0301 grad_norm:0.7933
+step:175/950 record_time:147.1s step_avg:0.8s reward_mean:2.3192 solved_frac:0.2153 loss:0.0348 grad_norm:0.8405
+step:176/950 record_time:148.0s step_avg:0.8s reward_mean:2.3750 solved_frac:0.2311 loss:0.0370 grad_norm:0.8420
+step:177/950 record_time:148.8s step_avg:0.8s reward_mean:2.3629 solved_frac:0.2317 loss:0.0333 grad_norm:0.8777
+step:178/950 record_time:149.7s step_avg:0.8s reward_mean:2.3996 solved_frac:0.2369 loss:0.0341 grad_norm:0.8959
+step:179/950 record_time:150.5s step_avg:0.8s reward_mean:2.3967 solved_frac:0.2422 loss:0.0325 grad_norm:0.8643
+step:180/950 record_time:151.4s step_avg:0.8s reward_mean:2.4299 solved_frac:0.2518 loss:0.0355 grad_norm:0.8359
+step:181/950 record_time:152.2s step_avg:0.8s reward_mean:2.4513 solved_frac:0.2523 loss:0.0343 grad_norm:0.8547
+step:182/950 record_time:153.0s step_avg:0.8s reward_mean:2.4504 solved_frac:0.2575 loss:0.0343 grad_norm:0.8634
+step:183/950 record_time:153.9s step_avg:0.8s reward_mean:2.4470 solved_frac:0.2534 loss:0.0328 grad_norm:0.8375
+step:184/950 record_time:154.7s step_avg:0.8s reward_mean:2.4724 solved_frac:0.2638 loss:0.0327 grad_norm:0.8525
+step:185/950 record_time:155.6s step_avg:0.8s reward_mean:2.4830 solved_frac:0.2609 loss:0.0306 grad_norm:0.8622
+step:186/950 record_time:156.4s step_avg:0.8s reward_mean:2.4922 solved_frac:0.2715 loss:0.0334 grad_norm:0.8518
+step:187/950 record_time:157.2s step_avg:0.8s reward_mean:2.5040 solved_frac:0.2683 loss:0.0327 grad_norm:0.8267
+step:188/950 record_time:158.1s step_avg:0.8s reward_mean:2.5000 solved_frac:0.2684 loss:0.0327 grad_norm:0.8387
+step:189/950 record_time:158.9s step_avg:0.8s reward_mean:2.5396 solved_frac:0.2869 loss:0.0363 grad_norm:0.8464
+step:190/950 record_time:159.8s step_avg:0.8s reward_mean:2.5461 solved_frac:0.2948 loss:0.0368 grad_norm:0.9286
+step:191/950 record_time:160.6s step_avg:0.8s reward_mean:2.5408 solved_frac:0.2906 loss:0.0350 grad_norm:0.8662
+step:192/950 record_time:161.5s step_avg:0.8s reward_mean:2.5455 solved_frac:0.2962 loss:0.0334 grad_norm:0.8934
+step:193/950 record_time:162.3s step_avg:0.8s reward_mean:2.5834 solved_frac:0.3098 loss:0.0350 grad_norm:0.9375
+step:194/950 record_time:163.2s step_avg:0.8s reward_mean:2.5933 solved_frac:0.2986 loss:0.0332 grad_norm:0.8894
+step:195/950 record_time:164.0s step_avg:0.8s reward_mean:2.6225 solved_frac:0.3147 loss:0.0324 grad_norm:0.8896
+step:196/950 record_time:164.8s step_avg:0.8s reward_mean:2.5809 solved_frac:0.3031 loss:0.0320 grad_norm:0.8418
+step:197/950 record_time:165.7s step_avg:0.8s reward_mean:2.6169 solved_frac:0.3171 loss:0.0364 grad_norm:0.8838
+step:198/950 record_time:166.5s step_avg:0.8s reward_mean:2.6119 solved_frac:0.3112 loss:0.0342 grad_norm:0.8897
+step:199/950 record_time:167.3s step_avg:0.8s reward_mean:2.6388 solved_frac:0.3169 loss:0.0338 grad_norm:0.9648
+step:200/950 record_time:168.2s step_avg:0.8s reward_mean:2.6566 solved_frac:0.3243 loss:0.0335 grad_norm:0.8782
+step:201/950 record_time:169.0s step_avg:0.8s reward_mean:2.6840 solved_frac:0.3440 loss:0.0337 grad_norm:0.8975
+step:202/950 record_time:169.8s step_avg:0.8s reward_mean:2.6543 solved_frac:0.3289 loss:0.0337 grad_norm:0.8849
+step:203/950 record_time:170.7s step_avg:0.8s reward_mean:2.6804 solved_frac:0.3427 loss:0.0349 grad_norm:0.8924
+step:204/950 record_time:171.5s step_avg:0.8s reward_mean:2.6722 solved_frac:0.3422 loss:0.0362 grad_norm:0.8595
+step:205/950 record_time:172.3s step_avg:0.8s reward_mean:2.6957 solved_frac:0.3319 loss:0.0329 grad_norm:0.9446
+step:206/950 record_time:173.2s step_avg:0.8s reward_mean:2.6690 solved_frac:0.3380 loss:0.0340 grad_norm:0.9425
+step:207/950 record_time:174.0s step_avg:0.8s reward_mean:2.7239 solved_frac:0.3520 loss:0.0387 grad_norm:0.9228
+step:208/950 record_time:174.8s step_avg:0.8s reward_mean:2.7074 solved_frac:0.3514 loss:0.0373 grad_norm:0.9282
+step:209/950 record_time:175.6s step_avg:0.8s reward_mean:2.7289 solved_frac:0.3641 loss:0.0405 grad_norm:0.9708
+step:210/950 record_time:176.4s step_avg:0.8s reward_mean:2.6840 solved_frac:0.3490 loss:0.0388 grad_norm:0.9032
+step:211/950 record_time:177.3s step_avg:0.8s reward_mean:2.7162 solved_frac:0.3645 loss:0.0355 grad_norm:0.9640
+step:212/950 record_time:178.1s step_avg:0.8s reward_mean:2.7062 solved_frac:0.3573 loss:0.0371 grad_norm:1.0119
+step:213/950 record_time:178.9s step_avg:0.8s reward_mean:2.7547 solved_frac:0.3759 loss:0.0382 grad_norm:1.0015
+step:214/950 record_time:179.8s step_avg:0.8s reward_mean:2.7430 solved_frac:0.3686 loss:0.0356 grad_norm:0.9594
+step:215/950 record_time:180.6s step_avg:0.8s reward_mean:2.7482 solved_frac:0.3760 loss:0.0353 grad_norm:0.9442
+step:216/950 record_time:181.4s step_avg:0.8s reward_mean:2.7592 solved_frac:0.3795 loss:0.0369 grad_norm:0.9177
+step:217/950 record_time:182.3s step_avg:0.8s reward_mean:2.7561 solved_frac:0.3800 loss:0.0366 grad_norm:0.9733
+step:218/950 record_time:183.1s step_avg:0.8s reward_mean:2.7439 solved_frac:0.3752 loss:0.0353 grad_norm:0.9191
+step:219/950 record_time:183.9s step_avg:0.8s reward_mean:2.7717 solved_frac:0.3813 loss:0.0353 grad_norm:0.9155
+step:220/950 record_time:184.7s step_avg:0.8s reward_mean:2.7792 solved_frac:0.3853 loss:0.0359 grad_norm:0.8403
+step:221/950 record_time:185.5s step_avg:0.8s reward_mean:2.7993 solved_frac:0.3992 loss:0.0349 grad_norm:0.9331
+step:222/950 record_time:186.4s step_avg:0.8s reward_mean:2.7979 solved_frac:0.3975 loss:0.0354 grad_norm:0.9806
+step:223/950 record_time:187.2s step_avg:0.8s reward_mean:2.7888 solved_frac:0.3957 loss:0.0338 grad_norm:0.9249
+step:224/950 record_time:188.0s step_avg:0.8s reward_mean:2.7857 solved_frac:0.3912 loss:0.0330 grad_norm:0.8883
+step:225/950 record_time:188.9s step_avg:0.8s reward_mean:2.8079 solved_frac:0.3938 loss:0.0334 grad_norm:0.9536
+step:226/950 record_time:189.7s step_avg:0.8s reward_mean:2.8060 solved_frac:0.3975 loss:0.0338 grad_norm:0.9276
+step:227/950 record_time:190.5s step_avg:0.8s reward_mean:2.8077 solved_frac:0.4028 loss:0.0331 grad_norm:0.9652
+step:228/950 record_time:191.3s step_avg:0.8s reward_mean:2.8261 solved_frac:0.4153 loss:0.0365 grad_norm:0.9457
+step:229/950 record_time:192.2s step_avg:0.8s reward_mean:2.8454 solved_frac:0.4187 loss:0.0366 grad_norm:0.9337
+step:230/950 record_time:193.0s step_avg:0.8s reward_mean:2.8387 solved_frac:0.4190 loss:0.0355 grad_norm:0.8778
+step:231/950 record_time:193.8s step_avg:0.8s reward_mean:2.8543 solved_frac:0.4280 loss:0.0367 grad_norm:0.9869
+step:232/950 record_time:194.6s step_avg:0.8s reward_mean:2.8696 solved_frac:0.4227 loss:0.0351 grad_norm:0.8759
+step:233/950 record_time:195.5s step_avg:0.8s reward_mean:2.8593 solved_frac:0.4300 loss:0.0354 grad_norm:0.9703
+step:234/950 record_time:196.3s step_avg:0.8s reward_mean:2.8526 solved_frac:0.4244 loss:0.0341 grad_norm:0.9815
+step:235/950 record_time:197.1s step_avg:0.8s reward_mean:2.8630 solved_frac:0.4201 loss:0.0320 grad_norm:0.9366
+step:236/950 record_time:198.0s step_avg:0.8s reward_mean:2.8735 solved_frac:0.4272 loss:0.0334 grad_norm:0.9261
+step:237/950 record_time:198.8s step_avg:0.8s reward_mean:2.8933 solved_frac:0.4369 loss:0.0384 grad_norm:0.8666
+step:238/950 record_time:199.6s step_avg:0.8s reward_mean:2.8963 solved_frac:0.4377 loss:0.0352 grad_norm:0.9298
+step:239/950 record_time:200.4s step_avg:0.8s reward_mean:2.8812 solved_frac:0.4363 loss:0.0372 grad_norm:0.9451
+step:240/950 record_time:201.3s step_avg:0.8s reward_mean:2.9442 solved_frac:0.4644 loss:0.0351 grad_norm:0.8873
+step:241/950 record_time:202.1s step_avg:0.8s reward_mean:2.8858 solved_frac:0.4417 loss:0.0359 grad_norm:0.9540
+step:242/950 record_time:202.9s step_avg:0.8s reward_mean:2.8928 solved_frac:0.4485 loss:0.0337 grad_norm:0.9985
+step:243/950 record_time:203.8s step_avg:0.8s reward_mean:2.9056 solved_frac:0.4470 loss:0.0337 grad_norm:0.9593
+step:244/950 record_time:204.6s step_avg:0.8s reward_mean:2.9048 solved_frac:0.4512 loss:0.0323 grad_norm:0.8277
+step:245/950 record_time:205.4s step_avg:0.8s reward_mean:2.9238 solved_frac:0.4576 loss:0.0320 grad_norm:0.9337
+step:246/950 record_time:206.3s step_avg:0.8s reward_mean:2.9183 solved_frac:0.4554 loss:0.0343 grad_norm:0.9391
+step:247/950 record_time:207.1s step_avg:0.8s reward_mean:2.9013 solved_frac:0.4502 loss:0.0353 grad_norm:0.9578
+step:248/950 record_time:208.0s step_avg:0.8s reward_mean:2.9121 solved_frac:0.4553 loss:0.0353 grad_norm:0.8491
+step:249/950 record_time:208.8s step_avg:0.8s reward_mean:2.9357 solved_frac:0.4682 loss:0.0370 grad_norm:0.9366
+step:250/950 record_time:209.6s step_avg:0.8s reward_mean:2.9261 solved_frac:0.4554 loss:0.0371 grad_norm:0.9325
+step:251/950 record_time:210.4s step_avg:0.8s reward_mean:2.9408 solved_frac:0.4666 loss:0.0379 grad_norm:0.9686
+step:252/950 record_time:211.3s step_avg:0.8s reward_mean:2.9251 solved_frac:0.4640 loss:0.0385 grad_norm:0.9209
+step:253/950 record_time:212.1s step_avg:0.8s reward_mean:2.9588 solved_frac:0.4725 loss:0.0374 grad_norm:0.8649
+step:254/950 record_time:212.9s step_avg:0.8s reward_mean:2.9787 solved_frac:0.4852 loss:0.0358 grad_norm:0.9044
+step:255/950 record_time:213.7s step_avg:0.8s reward_mean:2.9484 solved_frac:0.4726 loss:0.0374 grad_norm:0.8880
+step:256/950 record_time:214.6s step_avg:0.8s reward_mean:2.9457 solved_frac:0.4783 loss:0.0359 grad_norm:0.8928
+step:257/950 record_time:215.4s step_avg:0.8s reward_mean:2.9532 solved_frac:0.4831 loss:0.0377 grad_norm:0.8782
+step:258/950 record_time:216.2s step_avg:0.8s reward_mean:2.9558 solved_frac:0.4854 loss:0.0389 grad_norm:0.8616
+step:259/950 record_time:217.1s step_avg:0.8s reward_mean:2.9603 solved_frac:0.4814 loss:0.0380 grad_norm:0.7893
+step:260/950 record_time:217.9s step_avg:0.8s reward_mean:2.9458 solved_frac:0.4805 loss:0.0378 grad_norm:0.9293
+step:261/950 record_time:218.7s step_avg:0.8s reward_mean:2.9660 solved_frac:0.4896 loss:0.0364 grad_norm:0.7747
+step:262/950 record_time:219.5s step_avg:0.8s reward_mean:2.9633 solved_frac:0.4840 loss:0.0366 grad_norm:0.8719
+step:263/950 record_time:220.4s step_avg:0.8s reward_mean:2.9623 solved_frac:0.4840 loss:0.0355 grad_norm:0.9378
+step:264/950 record_time:221.2s step_avg:0.8s reward_mean:2.9839 solved_frac:0.5049 loss:0.0368 grad_norm:0.9606
+step:265/950 record_time:222.0s step_avg:0.8s reward_mean:2.9891 solved_frac:0.4971 loss:0.0382 grad_norm:0.9541
+step:266/950 record_time:222.8s step_avg:0.8s reward_mean:2.9567 solved_frac:0.4987 loss:0.0390 grad_norm:0.9376
+step:267/950 record_time:223.7s step_avg:0.8s reward_mean:2.9813 solved_frac:0.5012 loss:0.0387 grad_norm:0.9897
+step:268/950 record_time:224.5s step_avg:0.8s reward_mean:2.9528 solved_frac:0.4964 loss:0.0378 grad_norm:0.9154
+step:269/950 record_time:225.3s step_avg:0.8s reward_mean:2.9997 solved_frac:0.5141 loss:0.0379 grad_norm:0.9666
+step:270/950 record_time:226.1s step_avg:0.8s reward_mean:2.9895 solved_frac:0.5033 loss:0.0350 grad_norm:0.9040
+step:271/950 record_time:227.0s step_avg:0.8s reward_mean:2.9688 solved_frac:0.4959 loss:0.0330 grad_norm:0.8872
+step:272/950 record_time:227.8s step_avg:0.8s reward_mean:2.9557 solved_frac:0.4991 loss:0.0335 grad_norm:0.9031
+step:273/950 record_time:228.6s step_avg:0.8s reward_mean:2.9859 solved_frac:0.5020 loss:0.0349 grad_norm:0.8359
+step:274/950 record_time:229.5s step_avg:0.8s reward_mean:2.9861 solved_frac:0.5070 loss:0.0371 grad_norm:0.9146
+step:275/950 record_time:230.3s step_avg:0.8s reward_mean:3.0240 solved_frac:0.5173 loss:0.0361 grad_norm:0.9295
+step:276/950 record_time:231.2s step_avg:0.8s reward_mean:3.0196 solved_frac:0.5152 loss:0.0372 grad_norm:0.8546
+step:277/950 record_time:232.0s step_avg:0.8s reward_mean:2.9995 solved_frac:0.5097 loss:0.0366 grad_norm:0.9386
+step:278/950 record_time:232.8s step_avg:0.8s reward_mean:3.0049 solved_frac:0.5106 loss:0.0378 grad_norm:0.9506
+step:279/950 record_time:233.7s step_avg:0.8s reward_mean:3.0095 solved_frac:0.5150 loss:0.0398 grad_norm:0.8875
+step:280/950 record_time:234.5s step_avg:0.8s reward_mean:3.0012 solved_frac:0.5184 loss:0.0393 grad_norm:0.9415
+step:281/950 record_time:235.4s step_avg:0.8s reward_mean:3.0556 solved_frac:0.5342 loss:0.0360 grad_norm:0.9363
+step:282/950 record_time:236.2s step_avg:0.8s reward_mean:3.0230 solved_frac:0.5284 loss:0.0364 grad_norm:0.9135
+step:283/950 record_time:237.1s step_avg:0.8s reward_mean:3.0201 solved_frac:0.5239 loss:0.0366 grad_norm:0.9641
+step:284/950 record_time:237.9s step_avg:0.8s reward_mean:3.0421 solved_frac:0.5301 loss:0.0365 grad_norm:0.9366
+step:285/950 record_time:238.8s step_avg:0.8s reward_mean:3.0285 solved_frac:0.5254 loss:0.0365 grad_norm:0.9476
+step:286/950 record_time:239.7s step_avg:0.8s reward_mean:3.0367 solved_frac:0.5273 loss:0.0390 grad_norm:0.9455
+step:287/950 record_time:240.5s step_avg:0.8s reward_mean:3.0473 solved_frac:0.5303 loss:0.0371 grad_norm:0.9389
+step:288/950 record_time:241.3s step_avg:0.8s reward_mean:3.0517 solved_frac:0.5340 loss:0.0360 grad_norm:0.8437
+step:289/950 record_time:242.2s step_avg:0.8s reward_mean:3.0319 solved_frac:0.5283 loss:0.0366 grad_norm:0.9179
+step:290/950 record_time:243.0s step_avg:0.8s reward_mean:3.0263 solved_frac:0.5246 loss:0.0368 grad_norm:0.8825
+step:291/950 record_time:243.8s step_avg:0.8s reward_mean:3.0339 solved_frac:0.5323 loss:0.0384 grad_norm:0.8976
+step:292/950 record_time:244.7s step_avg:0.8s reward_mean:3.0172 solved_frac:0.5363 loss:0.0373 grad_norm:0.9184
+step:293/950 record_time:245.5s step_avg:0.8s reward_mean:3.0273 solved_frac:0.5325 loss:0.0357 grad_norm:0.9232
+step:294/950 record_time:246.3s step_avg:0.8s reward_mean:3.0385 solved_frac:0.5340 loss:0.0358 grad_norm:0.9769
+step:295/950 record_time:247.2s step_avg:0.8s reward_mean:3.0101 solved_frac:0.5314 loss:0.0343 grad_norm:0.8974
+step:296/950 record_time:248.0s step_avg:0.8s reward_mean:3.0320 solved_frac:0.5308 loss:0.0348 grad_norm:0.8592
+step:297/950 record_time:248.9s step_avg:0.8s reward_mean:3.0504 solved_frac:0.5440 loss:0.0347 grad_norm:0.8285
+step:298/950 record_time:249.7s step_avg:0.8s reward_mean:3.0492 solved_frac:0.5429 loss:0.0349 grad_norm:0.9422
+step:299/950 record_time:250.6s step_avg:0.8s reward_mean:3.0444 solved_frac:0.5386 loss:0.0328 grad_norm:0.9107
+step:300/950 record_time:251.4s step_avg:0.8s reward_mean:3.0267 solved_frac:0.5327 loss:0.0355 grad_norm:0.8903
+step:301/950 record_time:252.3s step_avg:0.8s reward_mean:3.0624 solved_frac:0.5443 loss:0.0351 grad_norm:0.9013
+step:302/950 record_time:253.1s step_avg:0.8s reward_mean:3.0626 solved_frac:0.5480 loss:0.0348 grad_norm:0.8418
+step:303/950 record_time:253.9s step_avg:0.8s reward_mean:3.0719 solved_frac:0.5516 loss:0.0343 grad_norm:0.9248
+step:304/950 record_time:254.8s step_avg:0.8s reward_mean:3.0699 solved_frac:0.5532 loss:0.0341 grad_norm:0.9289
+step:305/950 record_time:255.6s step_avg:0.8s reward_mean:3.0835 solved_frac:0.5541 loss:0.0373 grad_norm:0.9053
+step:306/950 record_time:256.5s step_avg:0.8s reward_mean:3.0743 solved_frac:0.5521 loss:0.0365 grad_norm:0.8937
+step:307/950 record_time:257.3s step_avg:0.8s reward_mean:3.0458 solved_frac:0.5464 loss:0.0359 grad_norm:0.8591
+step:308/950 record_time:258.1s step_avg:0.8s reward_mean:3.0635 solved_frac:0.5556 loss:0.0386 grad_norm:0.9038
+step:309/950 record_time:259.0s step_avg:0.8s reward_mean:3.0631 solved_frac:0.5510 loss:0.0357 grad_norm:0.8410
+step:310/950 record_time:259.8s step_avg:0.8s reward_mean:3.0573 solved_frac:0.5509 loss:0.0348 grad_norm:0.8736
+step:311/950 record_time:260.7s step_avg:0.8s reward_mean:3.0857 solved_frac:0.5600 loss:0.0330 grad_norm:0.9025
+step:312/950 record_time:261.5s step_avg:0.8s reward_mean:3.0250 solved_frac:0.5341 loss:0.0313 grad_norm:0.9400
+step:313/950 record_time:262.3s step_avg:0.8s reward_mean:3.0600 solved_frac:0.5541 loss:0.0347 grad_norm:0.8441
+step:314/950 record_time:263.2s step_avg:0.8s reward_mean:3.0780 solved_frac:0.5590 loss:0.0348 grad_norm:0.8996
+step:315/950 record_time:264.0s step_avg:0.8s reward_mean:3.0617 solved_frac:0.5538 loss:0.0327 grad_norm:0.8560
+step:316/950 record_time:264.8s step_avg:0.8s reward_mean:3.0538 solved_frac:0.5518 loss:0.0326 grad_norm:0.8609
+step:317/950 record_time:265.7s step_avg:0.8s reward_mean:3.0561 solved_frac:0.5496 loss:0.0329 grad_norm:0.8736
+step:318/950 record_time:266.5s step_avg:0.8s reward_mean:3.0799 solved_frac:0.5667 loss:0.0355 grad_norm:0.8069
+step:319/950 record_time:267.3s step_avg:0.8s reward_mean:3.0649 solved_frac:0.5601 loss:0.0351 grad_norm:0.8488
+step:320/950 record_time:268.1s step_avg:0.8s reward_mean:3.0859 solved_frac:0.5641 loss:0.0342 grad_norm:0.8749
+step:321/950 record_time:269.0s step_avg:0.8s reward_mean:3.0847 solved_frac:0.5660 loss:0.0353 grad_norm:0.7908
+step:322/950 record_time:269.8s step_avg:0.8s reward_mean:3.0965 solved_frac:0.5672 loss:0.0351 grad_norm:0.8449
+step:323/950 record_time:270.7s step_avg:0.8s reward_mean:3.1105 solved_frac:0.5799 loss:0.0341 grad_norm:0.7701
+step:324/950 record_time:271.5s step_avg:0.8s reward_mean:3.0931 solved_frac:0.5678 loss:0.0319 grad_norm:0.8651
+step:325/950 record_time:272.4s step_avg:0.8s reward_mean:3.0578 solved_frac:0.5570 loss:0.0335 grad_norm:0.8234
+step:326/950 record_time:273.2s step_avg:0.8s reward_mean:3.0855 solved_frac:0.5680 loss:0.0338 grad_norm:0.8348
+step:327/950 record_time:274.0s step_avg:0.8s reward_mean:3.0814 solved_frac:0.5696 loss:0.0330 grad_norm:0.8472
+step:328/950 record_time:274.9s step_avg:0.8s reward_mean:3.1167 solved_frac:0.5747 loss:0.0352 grad_norm:0.8033
+step:329/950 record_time:275.7s step_avg:0.8s reward_mean:3.0807 solved_frac:0.5753 loss:0.0330 grad_norm:0.8338
+step:330/950 record_time:276.6s step_avg:0.8s reward_mean:3.1142 solved_frac:0.5772 loss:0.0329 grad_norm:0.8145
+step:331/950 record_time:277.4s step_avg:0.8s reward_mean:3.1127 solved_frac:0.5799 loss:0.0348 grad_norm:0.8161
+step:332/950 record_time:278.2s step_avg:0.8s reward_mean:3.0984 solved_frac:0.5720 loss:0.0330 grad_norm:0.8187
+step:333/950 record_time:279.1s step_avg:0.8s reward_mean:3.1089 solved_frac:0.5769 loss:0.0340 grad_norm:0.8371
+step:334/950 record_time:279.9s step_avg:0.8s reward_mean:3.0968 solved_frac:0.5692 loss:0.0357 grad_norm:0.8644
+step:335/950 record_time:280.8s step_avg:0.8s reward_mean:3.1254 solved_frac:0.5886 loss:0.0350 grad_norm:0.8966
+step:336/950 record_time:281.6s step_avg:0.8s reward_mean:3.1016 solved_frac:0.5799 loss:0.0357 grad_norm:0.8930
+step:337/950 record_time:282.4s step_avg:0.8s reward_mean:3.1277 solved_frac:0.5855 loss:0.0370 grad_norm:0.8700
+step:338/950 record_time:283.3s step_avg:0.8s reward_mean:3.1234 solved_frac:0.5905 loss:0.0388 grad_norm:0.9114
+step:339/950 record_time:284.1s step_avg:0.8s reward_mean:3.0967 solved_frac:0.5788 loss:0.0346 grad_norm:0.8381
+step:340/950 record_time:285.0s step_avg:0.8s reward_mean:3.1096 solved_frac:0.5805 loss:0.0336 grad_norm:0.8660
+step:341/950 record_time:285.8s step_avg:0.8s reward_mean:3.1293 solved_frac:0.5916 loss:0.0349 grad_norm:0.8250
+step:342/950 record_time:286.6s step_avg:0.8s reward_mean:3.1442 solved_frac:0.5975 loss:0.0343 grad_norm:0.9078
+step:343/950 record_time:287.5s step_avg:0.8s reward_mean:3.1199 solved_frac:0.5865 loss:0.0340 grad_norm:0.8595
+step:344/950 record_time:288.3s step_avg:0.8s reward_mean:3.1090 solved_frac:0.5867 loss:0.0360 grad_norm:0.8124
+step:345/950 record_time:289.2s step_avg:0.8s reward_mean:3.1410 solved_frac:0.5964 loss:0.0355 grad_norm:0.8898
+step:346/950 record_time:290.0s step_avg:0.8s reward_mean:3.1277 solved_frac:0.5915 loss:0.0319 grad_norm:0.7873
+step:347/950 record_time:290.8s step_avg:0.8s reward_mean:3.1341 solved_frac:0.5988 loss:0.0315 grad_norm:0.8444
+step:348/950 record_time:291.7s step_avg:0.8s reward_mean:3.1345 solved_frac:0.5971 loss:0.0322 grad_norm:0.8359
+step:349/950 record_time:292.5s step_avg:0.8s reward_mean:3.1330 solved_frac:0.5923 loss:0.0305 grad_norm:0.8630
+step:350/950 record_time:293.3s step_avg:0.8s reward_mean:3.1196 solved_frac:0.5965 loss:0.0339 grad_norm:0.7890
+step:351/950 record_time:294.2s step_avg:0.8s reward_mean:3.1258 solved_frac:0.5928 loss:0.0309 grad_norm:0.8440
+step:352/950 record_time:295.0s step_avg:0.8s reward_mean:3.1122 solved_frac:0.5870 loss:0.0328 grad_norm:0.8597
+step:353/950 record_time:295.8s step_avg:0.8s reward_mean:3.1355 solved_frac:0.5966 loss:0.0327 grad_norm:0.7928
+step:354/950 record_time:296.7s step_avg:0.8s reward_mean:3.1434 solved_frac:0.5971 loss:0.0336 grad_norm:0.7654
+step:355/950 record_time:297.5s step_avg:0.8s reward_mean:3.1483 solved_frac:0.6017 loss:0.0339 grad_norm:0.8178
+step:356/950 record_time:298.3s step_avg:0.8s reward_mean:3.1439 solved_frac:0.5954 loss:0.0312 grad_norm:0.8312
+step:357/950 record_time:299.2s step_avg:0.8s reward_mean:3.1171 solved_frac:0.5928 loss:0.0342 grad_norm:0.8326
+step:358/950 record_time:300.0s step_avg:0.8s reward_mean:3.1388 solved_frac:0.5955 loss:0.0334 grad_norm:0.8531
+step:359/950 record_time:300.9s step_avg:0.8s reward_mean:3.1515 solved_frac:0.6034 loss:0.0332 grad_norm:0.8548
+step:360/950 record_time:301.7s step_avg:0.8s reward_mean:3.1567 solved_frac:0.6093 loss:0.0321 grad_norm:0.7970
+step:361/950 record_time:302.5s step_avg:0.8s reward_mean:3.1189 solved_frac:0.5929 loss:0.0345 grad_norm:0.8076
+step:362/950 record_time:303.4s step_avg:0.8s reward_mean:3.1218 solved_frac:0.5974 loss:0.0344 grad_norm:0.7930
+step:363/950 record_time:304.2s step_avg:0.8s reward_mean:3.1260 solved_frac:0.5992 loss:0.0354 grad_norm:0.7797
+step:364/950 record_time:305.0s step_avg:0.8s reward_mean:3.1430 solved_frac:0.6001 loss:0.0349 grad_norm:0.7638
+step:365/950 record_time:305.9s step_avg:0.8s reward_mean:3.1443 solved_frac:0.6076 loss:0.0334 grad_norm:0.8440
+step:366/950 record_time:306.7s step_avg:0.8s reward_mean:3.1255 solved_frac:0.5946 loss:0.0343 grad_norm:0.8338
+step:367/950 record_time:307.5s step_avg:0.8s reward_mean:3.1285 solved_frac:0.6042 loss:0.0334 grad_norm:0.8266
+step:368/950 record_time:308.4s step_avg:0.8s reward_mean:3.1257 solved_frac:0.5951 loss:0.0321 grad_norm:0.7636
+step:369/950 record_time:309.2s step_avg:0.8s reward_mean:3.1429 solved_frac:0.6086 loss:0.0339 grad_norm:0.7979
+step:370/950 record_time:310.0s step_avg:0.8s reward_mean:3.1585 solved_frac:0.6125 loss:0.0338 grad_norm:0.7342
+step:371/950 record_time:310.9s step_avg:0.8s reward_mean:3.1460 solved_frac:0.6087 loss:0.0325 grad_norm:0.8466
+step:372/950 record_time:311.7s step_avg:0.8s reward_mean:3.1297 solved_frac:0.6017 loss:0.0358 grad_norm:0.7662
+step:373/950 record_time:312.5s step_avg:0.8s reward_mean:3.1532 solved_frac:0.6045 loss:0.0339 grad_norm:0.8454
+step:374/950 record_time:313.4s step_avg:0.8s reward_mean:3.1387 solved_frac:0.6064 loss:0.0332 grad_norm:0.8083
+step:375/950 record_time:314.2s step_avg:0.8s reward_mean:3.1547 solved_frac:0.6107 loss:0.0341 grad_norm:0.8267
+step:376/950 record_time:315.0s step_avg:0.8s reward_mean:3.1528 solved_frac:0.6098 loss:0.0359 grad_norm:0.8138
+step:377/950 record_time:315.9s step_avg:0.8s reward_mean:3.1414 solved_frac:0.6080 loss:0.0336 grad_norm:0.7820
+step:378/950 record_time:316.7s step_avg:0.8s reward_mean:3.1544 solved_frac:0.6179 loss:0.0344 grad_norm:0.7804
+step:379/950 record_time:317.6s step_avg:0.8s reward_mean:3.1380 solved_frac:0.6080 loss:0.0332 grad_norm:0.7194
+step:380/950 record_time:318.4s step_avg:0.8s reward_mean:3.1161 solved_frac:0.5988 loss:0.0341 grad_norm:0.7817
+step:381/950 record_time:319.2s step_avg:0.8s reward_mean:3.1841 solved_frac:0.6229 loss:0.0323 grad_norm:0.6982
+step:382/950 record_time:320.1s step_avg:0.8s reward_mean:3.1242 solved_frac:0.6050 loss:0.0322 grad_norm:0.7818
+step:383/950 record_time:320.9s step_avg:0.8s reward_mean:3.1496 solved_frac:0.6089 loss:0.0323 grad_norm:0.7840
+step:384/950 record_time:321.8s step_avg:0.8s reward_mean:3.1496 solved_frac:0.6179 loss:0.0334 grad_norm:0.7328
+step:385/950 record_time:322.6s step_avg:0.8s reward_mean:3.1605 solved_frac:0.6171 loss:0.0341 grad_norm:0.8022
+step:386/950 record_time:323.4s step_avg:0.8s reward_mean:3.1549 solved_frac:0.6159 loss:0.0342 grad_norm:0.7163
+step:387/950 record_time:324.3s step_avg:0.8s reward_mean:3.1762 solved_frac:0.6236 loss:0.0348 grad_norm:0.7858
+step:388/950 record_time:325.1s step_avg:0.8s reward_mean:3.2029 solved_frac:0.6360 loss:0.0339 grad_norm:0.7089
+step:389/950 record_time:326.0s step_avg:0.8s reward_mean:3.1905 solved_frac:0.6320 loss:0.0337 grad_norm:0.8355
+step:390/950 record_time:326.8s step_avg:0.8s reward_mean:3.1639 solved_frac:0.6219 loss:0.0332 grad_norm:0.8216
+step:391/950 record_time:327.6s step_avg:0.8s reward_mean:3.1841 solved_frac:0.6244 loss:0.0339 grad_norm:0.7707
+step:392/950 record_time:328.5s step_avg:0.8s reward_mean:3.1435 solved_frac:0.6180 loss:0.0353 grad_norm:0.7553
+step:393/950 record_time:329.3s step_avg:0.8s reward_mean:3.1636 solved_frac:0.6215 loss:0.0355 grad_norm:0.7708
+step:394/950 record_time:330.1s step_avg:0.8s reward_mean:3.1470 solved_frac:0.6115 loss:0.0336 grad_norm:0.6755
+step:395/950 record_time:331.0s step_avg:0.8s reward_mean:3.1787 solved_frac:0.6249 loss:0.0331 grad_norm:0.7036
+step:396/950 record_time:331.8s step_avg:0.8s reward_mean:3.1628 solved_frac:0.6201 loss:0.0318 grad_norm:0.8425
+step:397/950 record_time:332.7s step_avg:0.8s reward_mean:3.1682 solved_frac:0.6243 loss:0.0334 grad_norm:0.7783
+step:398/950 record_time:333.5s step_avg:0.8s reward_mean:3.1881 solved_frac:0.6296 loss:0.0336 grad_norm:0.7711
+step:399/950 record_time:334.3s step_avg:0.8s reward_mean:3.2137 solved_frac:0.6388 loss:0.0327 grad_norm:0.7355
+step:400/950 record_time:335.2s step_avg:0.8s reward_mean:3.1613 solved_frac:0.6227 loss:0.0295 grad_norm:0.7699
+step:401/950 record_time:336.0s step_avg:0.8s reward_mean:3.1655 solved_frac:0.6272 loss:0.0301 grad_norm:0.7892
+step:402/950 record_time:336.8s step_avg:0.8s reward_mean:3.1812 solved_frac:0.6285 loss:0.0311 grad_norm:0.7562
+step:403/950 record_time:337.7s step_avg:0.8s reward_mean:3.1769 solved_frac:0.6261 loss:0.0302 grad_norm:0.7217
+step:404/950 record_time:338.5s step_avg:0.8s reward_mean:3.1901 solved_frac:0.6306 loss:0.0296 grad_norm:0.7559
+step:405/950 record_time:339.3s step_avg:0.8s reward_mean:3.1685 solved_frac:0.6291 loss:0.0317 grad_norm:0.7788
+step:406/950 record_time:340.2s step_avg:0.8s reward_mean:3.1913 solved_frac:0.6366 loss:0.0320 grad_norm:0.7442
+step:407/950 record_time:341.0s step_avg:0.8s reward_mean:3.1474 solved_frac:0.6218 loss:0.0327 grad_norm:0.7882
+step:408/950 record_time:341.9s step_avg:0.8s reward_mean:3.1909 solved_frac:0.6317 loss:0.0315 grad_norm:0.7653
+step:409/950 record_time:342.7s step_avg:0.8s reward_mean:3.2051 solved_frac:0.6395 loss:0.0326 grad_norm:0.7938
+step:410/950 record_time:343.5s step_avg:0.8s reward_mean:3.1922 solved_frac:0.6332 loss:0.0347 grad_norm:0.7532
+step:411/950 record_time:344.4s step_avg:0.8s reward_mean:3.1844 solved_frac:0.6300 loss:0.0310 grad_norm:0.7739
+step:412/950 record_time:345.2s step_avg:0.8s reward_mean:3.1901 solved_frac:0.6328 loss:0.0350 grad_norm:0.7600
+step:413/950 record_time:346.1s step_avg:0.8s reward_mean:3.2174 solved_frac:0.6405 loss:0.0318 grad_norm:0.7874
+step:414/950 record_time:346.9s step_avg:0.8s reward_mean:3.2034 solved_frac:0.6376 loss:0.0335 grad_norm:0.7501
+step:415/950 record_time:347.8s step_avg:0.8s reward_mean:3.2091 solved_frac:0.6395 loss:0.0342 grad_norm:0.7454
+step:416/950 record_time:348.6s step_avg:0.8s reward_mean:3.2073 solved_frac:0.6410 loss:0.0334 grad_norm:0.7886
+step:417/950 record_time:349.5s step_avg:0.8s reward_mean:3.1947 solved_frac:0.6276 loss:0.0301 grad_norm:0.7410
+step:418/950 record_time:350.3s step_avg:0.8s reward_mean:3.1973 solved_frac:0.6376 loss:0.0313 grad_norm:0.7756
+step:419/950 record_time:351.2s step_avg:0.8s reward_mean:3.1937 solved_frac:0.6350 loss:0.0308 grad_norm:0.7797
+step:420/950 record_time:352.0s step_avg:0.8s reward_mean:3.2261 solved_frac:0.6468 loss:0.0328 grad_norm:0.7895
+step:421/950 record_time:352.9s step_avg:0.8s reward_mean:3.2148 solved_frac:0.6454 loss:0.0317 grad_norm:0.8281
+step:422/950 record_time:353.7s step_avg:0.8s reward_mean:3.1871 solved_frac:0.6300 loss:0.0316 grad_norm:0.7657
+step:423/950 record_time:354.5s step_avg:0.8s reward_mean:3.1973 solved_frac:0.6363 loss:0.0316 grad_norm:0.8320
+step:424/950 record_time:355.4s step_avg:0.8s reward_mean:3.2020 solved_frac:0.6394 loss:0.0337 grad_norm:0.7847
+step:425/950 record_time:356.2s step_avg:0.8s reward_mean:3.1979 solved_frac:0.6425 loss:0.0318 grad_norm:0.7689
+step:426/950 record_time:357.1s step_avg:0.8s reward_mean:3.2066 solved_frac:0.6382 loss:0.0332 grad_norm:0.7223
+step:427/950 record_time:357.9s step_avg:0.8s reward_mean:3.1958 solved_frac:0.6389 loss:0.0313 grad_norm:0.7122
+step:428/950 record_time:358.8s step_avg:0.8s reward_mean:3.1925 solved_frac:0.6353 loss:0.0299 grad_norm:0.6693
+step:429/950 record_time:359.6s step_avg:0.8s reward_mean:3.2079 solved_frac:0.6426 loss:0.0297 grad_norm:0.7836
+step:430/950 record_time:360.4s step_avg:0.8s reward_mean:3.1984 solved_frac:0.6368 loss:0.0312 grad_norm:0.7862
+step:431/950 record_time:361.3s step_avg:0.8s reward_mean:3.1972 solved_frac:0.6438 loss:0.0324 grad_norm:0.7761
+step:432/950 record_time:362.1s step_avg:0.8s reward_mean:3.2130 solved_frac:0.6491 loss:0.0335 grad_norm:0.7893
+step:433/950 record_time:363.0s step_avg:0.8s reward_mean:3.2080 solved_frac:0.6395 loss:0.0305 grad_norm:0.7515
+step:434/950 record_time:363.8s step_avg:0.8s reward_mean:3.1829 solved_frac:0.6336 loss:0.0315 grad_norm:0.7528
+step:435/950 record_time:364.7s step_avg:0.8s reward_mean:3.2317 solved_frac:0.6501 loss:0.0332 grad_norm:0.8032
+step:436/950 record_time:365.5s step_avg:0.8s reward_mean:3.2277 solved_frac:0.6537 loss:0.0316 grad_norm:0.7522
+step:437/950 record_time:366.4s step_avg:0.8s reward_mean:3.2191 solved_frac:0.6452 loss:0.0330 grad_norm:0.7430
+step:438/950 record_time:367.2s step_avg:0.8s reward_mean:3.2386 solved_frac:0.6546 loss:0.0319 grad_norm:0.7463
+step:439/950 record_time:368.1s step_avg:0.8s reward_mean:3.1852 solved_frac:0.6345 loss:0.0330 grad_norm:0.7101
+step:440/950 record_time:368.9s step_avg:0.8s reward_mean:3.2246 solved_frac:0.6523 loss:0.0348 grad_norm:0.7726
+step:441/950 record_time:369.7s step_avg:0.8s reward_mean:3.2034 solved_frac:0.6425 loss:0.0327 grad_norm:0.7596
+step:442/950 record_time:370.6s step_avg:0.8s reward_mean:3.2129 solved_frac:0.6467 loss:0.0293 grad_norm:0.7905
+step:443/950 record_time:371.4s step_avg:0.8s reward_mean:3.2123 solved_frac:0.6425 loss:0.0335 grad_norm:0.7556
+step:444/950 record_time:372.3s step_avg:0.8s reward_mean:3.2321 solved_frac:0.6568 loss:0.0306 grad_norm:0.7152
+step:445/950 record_time:373.1s step_avg:0.8s reward_mean:3.2128 solved_frac:0.6463 loss:0.0316 grad_norm:0.8042
+step:446/950 record_time:373.9s step_avg:0.8s reward_mean:3.2110 solved_frac:0.6468 loss:0.0311 grad_norm:0.6538
+step:447/950 record_time:374.8s step_avg:0.8s reward_mean:3.2130 solved_frac:0.6454 loss:0.0299 grad_norm:0.7119
+step:448/950 record_time:375.6s step_avg:0.8s reward_mean:3.2141 solved_frac:0.6485 loss:0.0306 grad_norm:0.7339
+step:449/950 record_time:376.4s step_avg:0.8s reward_mean:3.1921 solved_frac:0.6382 loss:0.0288 grad_norm:0.7124
+step:450/950 record_time:377.3s step_avg:0.8s reward_mean:3.2306 solved_frac:0.6530 loss:0.0335 grad_norm:0.7216
+step:451/950 record_time:378.1s step_avg:0.8s reward_mean:3.2252 solved_frac:0.6548 loss:0.0313 grad_norm:0.7166
+step:452/950 record_time:378.9s step_avg:0.8s reward_mean:3.2190 solved_frac:0.6484 loss:0.0330 grad_norm:0.7385
+step:453/950 record_time:379.8s step_avg:0.8s reward_mean:3.2201 solved_frac:0.6485 loss:0.0310 grad_norm:0.7656
+step:454/950 record_time:380.6s step_avg:0.8s reward_mean:3.2096 solved_frac:0.6474 loss:0.0305 grad_norm:0.7365
+step:455/950 record_time:381.5s step_avg:0.8s reward_mean:3.2459 solved_frac:0.6625 loss:0.0329 grad_norm:0.7805
+step:456/950 record_time:382.3s step_avg:0.8s reward_mean:3.2351 solved_frac:0.6513 loss:0.0321 grad_norm:0.7342
+step:457/950 record_time:383.1s step_avg:0.8s reward_mean:3.2342 solved_frac:0.6522 loss:0.0334 grad_norm:0.6954
+step:458/950 record_time:384.0s step_avg:0.8s reward_mean:3.2340 solved_frac:0.6544 loss:0.0345 grad_norm:0.7350
+step:459/950 record_time:384.8s step_avg:0.8s reward_mean:3.2596 solved_frac:0.6665 loss:0.0343 grad_norm:0.6920
+step:460/950 record_time:385.7s step_avg:0.8s reward_mean:3.2431 solved_frac:0.6581 loss:0.0339 grad_norm:0.6591
+step:461/950 record_time:386.5s step_avg:0.8s reward_mean:3.2314 solved_frac:0.6523 loss:0.0318 grad_norm:0.9208
+step:462/950 record_time:387.3s step_avg:0.8s reward_mean:3.2355 solved_frac:0.6560 loss:0.0325 grad_norm:0.7687
+step:463/950 record_time:388.2s step_avg:0.8s reward_mean:3.2381 solved_frac:0.6572 loss:0.0323 grad_norm:0.6773
+step:464/950 record_time:389.0s step_avg:0.8s reward_mean:3.2433 solved_frac:0.6570 loss:0.0335 grad_norm:0.6910
+step:465/950 record_time:389.9s step_avg:0.8s reward_mean:3.2405 solved_frac:0.6619 loss:0.0311 grad_norm:0.7140
+step:466/950 record_time:390.7s step_avg:0.8s reward_mean:3.2313 solved_frac:0.6553 loss:0.0327 grad_norm:0.7099
+step:467/950 record_time:391.5s step_avg:0.8s reward_mean:3.2433 solved_frac:0.6594 loss:0.0322 grad_norm:0.7414
+step:468/950 record_time:392.4s step_avg:0.8s reward_mean:3.2573 solved_frac:0.6645 loss:0.0322 grad_norm:0.7331
+step:469/950 record_time:393.2s step_avg:0.8s reward_mean:3.2462 solved_frac:0.6620 loss:0.0316 grad_norm:0.6990
+step:470/950 record_time:394.1s step_avg:0.8s reward_mean:3.2262 solved_frac:0.6510 loss:0.0321 grad_norm:0.6489
+step:471/950 record_time:394.9s step_avg:0.8s reward_mean:3.2438 solved_frac:0.6596 loss:0.0307 grad_norm:0.7213
+step:472/950 record_time:395.7s step_avg:0.8s reward_mean:3.2373 solved_frac:0.6567 loss:0.0303 grad_norm:0.7353
+step:473/950 record_time:396.6s step_avg:0.8s reward_mean:3.2462 solved_frac:0.6600 loss:0.0319 grad_norm:0.7650
+step:474/950 record_time:397.4s step_avg:0.8s reward_mean:3.2476 solved_frac:0.6610 loss:0.0294 grad_norm:0.7323
+step:475/950 record_time:398.2s step_avg:0.8s reward_mean:3.2634 solved_frac:0.6627 loss:0.0308 grad_norm:0.7056
+step:476/950 record_time:399.1s step_avg:0.8s reward_mean:3.2671 solved_frac:0.6677 loss:0.0304 grad_norm:0.7243
+step:477/950 record_time:399.9s step_avg:0.8s reward_mean:3.2406 solved_frac:0.6600 loss:0.0297 grad_norm:0.7228
+step:478/950 record_time:400.8s step_avg:0.8s reward_mean:3.2483 solved_frac:0.6622 loss:0.0307 grad_norm:0.7120
+step:479/950 record_time:401.6s step_avg:0.8s reward_mean:3.2599 solved_frac:0.6688 loss:0.0309 grad_norm:0.7635
+step:480/950 record_time:402.4s step_avg:0.8s reward_mean:3.2578 solved_frac:0.6609 loss:0.0298 grad_norm:0.7372
+step:481/950 record_time:403.3s step_avg:0.8s reward_mean:3.2754 solved_frac:0.6675 loss:0.0302 grad_norm:0.6986
+step:482/950 record_time:404.1s step_avg:0.8s reward_mean:3.2561 solved_frac:0.6651 loss:0.0310 grad_norm:0.7254
+step:483/950 record_time:404.9s step_avg:0.8s reward_mean:3.2758 solved_frac:0.6746 loss:0.0310 grad_norm:0.7297
+step:484/950 record_time:405.8s step_avg:0.8s reward_mean:3.2884 solved_frac:0.6809 loss:0.0288 grad_norm:0.7494
+step:485/950 record_time:406.6s step_avg:0.8s reward_mean:3.2411 solved_frac:0.6592 loss:0.0305 grad_norm:0.6720
+step:486/950 record_time:407.4s step_avg:0.8s reward_mean:3.2692 solved_frac:0.6718 loss:0.0325 grad_norm:0.7373
+step:487/950 record_time:408.3s step_avg:0.8s reward_mean:3.2771 solved_frac:0.6712 loss:0.0312 grad_norm:0.7668
+step:488/950 record_time:409.1s step_avg:0.8s reward_mean:3.2784 solved_frac:0.6726 loss:0.0316 grad_norm:0.7004
+step:489/950 record_time:410.0s step_avg:0.8s reward_mean:3.2852 solved_frac:0.6694 loss:0.0315 grad_norm:0.7135
+step:490/950 record_time:410.8s step_avg:0.8s reward_mean:3.2665 solved_frac:0.6727 loss:0.0321 grad_norm:0.7870
+step:491/950 record_time:411.6s step_avg:0.8s reward_mean:3.3000 solved_frac:0.6812 loss:0.0307 grad_norm:0.7470
+step:492/950 record_time:412.5s step_avg:0.8s reward_mean:3.2704 solved_frac:0.6698 loss:0.0317 grad_norm:0.6923
+step:493/950 record_time:413.3s step_avg:0.8s reward_mean:3.2874 solved_frac:0.6818 loss:0.0326 grad_norm:0.6761
+step:494/950 record_time:414.1s step_avg:0.8s reward_mean:3.2927 solved_frac:0.6812 loss:0.0302 grad_norm:0.7003
+step:495/950 record_time:415.0s step_avg:0.8s reward_mean:3.2819 solved_frac:0.6692 loss:0.0315 grad_norm:0.7625
+step:496/950 record_time:415.8s step_avg:0.8s reward_mean:3.3063 solved_frac:0.6853 loss:0.0292 grad_norm:0.7098
+step:497/950 record_time:416.6s step_avg:0.8s reward_mean:3.2780 solved_frac:0.6766 loss:0.0300 grad_norm:0.7450
+step:498/950 record_time:417.4s step_avg:0.8s reward_mean:3.3003 solved_frac:0.6806 loss:0.0320 grad_norm:0.6992
+step:499/950 record_time:418.3s step_avg:0.8s reward_mean:3.2858 solved_frac:0.6775 loss:0.0302 grad_norm:0.7150
+step:500/950 record_time:419.1s step_avg:0.8s reward_mean:3.2882 solved_frac:0.6754 loss:0.0330 grad_norm:0.7260
+step:501/950 record_time:419.9s step_avg:0.8s reward_mean:3.2902 solved_frac:0.6786 loss:0.0306 grad_norm:0.7099
+step:502/950 record_time:420.8s step_avg:0.8s reward_mean:3.2654 solved_frac:0.6703 loss:0.0297 grad_norm:0.6665
+step:503/950 record_time:421.6s step_avg:0.8s reward_mean:3.2764 solved_frac:0.6767 loss:0.0304 grad_norm:0.6952
+step:504/950 record_time:422.4s step_avg:0.8s reward_mean:3.2840 solved_frac:0.6718 loss:0.0304 grad_norm:0.6573
+step:505/950 record_time:423.3s step_avg:0.8s reward_mean:3.2963 solved_frac:0.6788 loss:0.0326 grad_norm:0.7072
+step:506/950 record_time:424.1s step_avg:0.8s reward_mean:3.3019 solved_frac:0.6853 loss:0.0308 grad_norm:0.7006
+step:507/950 record_time:424.9s step_avg:0.8s reward_mean:3.2711 solved_frac:0.6677 loss:0.0300 grad_norm:0.6873
+step:508/950 record_time:425.8s step_avg:0.8s reward_mean:3.3143 solved_frac:0.6866 loss:0.0311 grad_norm:0.7412
+step:509/950 record_time:426.6s step_avg:0.8s reward_mean:3.3096 solved_frac:0.6834 loss:0.0311 grad_norm:0.7257
+step:510/950 record_time:427.4s step_avg:0.8s reward_mean:3.2990 solved_frac:0.6789 loss:0.0315 grad_norm:0.7466
+step:511/950 record_time:428.3s step_avg:0.8s reward_mean:3.2943 solved_frac:0.6778 loss:0.0319 grad_norm:0.7160
+step:512/950 record_time:429.1s step_avg:0.8s reward_mean:3.2874 solved_frac:0.6763 loss:0.0327 grad_norm:0.7173
+step:513/950 record_time:430.0s step_avg:0.8s reward_mean:3.2661 solved_frac:0.6704 loss:0.0320 grad_norm:0.7590
+step:514/950 record_time:430.8s step_avg:0.8s reward_mean:3.3032 solved_frac:0.6816 loss:0.0322 grad_norm:0.7139
+step:515/950 record_time:431.7s step_avg:0.8s reward_mean:3.3011 solved_frac:0.6809 loss:0.0314 grad_norm:0.6784
+step:516/950 record_time:432.5s step_avg:0.8s reward_mean:3.2840 solved_frac:0.6760 loss:0.0307 grad_norm:0.7536
+step:517/950 record_time:433.4s step_avg:0.8s reward_mean:3.3091 solved_frac:0.6819 loss:0.0322 grad_norm:0.6830
+step:518/950 record_time:434.2s step_avg:0.8s reward_mean:3.2882 solved_frac:0.6776 loss:0.0285 grad_norm:0.6563
+step:519/950 record_time:435.1s step_avg:0.8s reward_mean:3.2879 solved_frac:0.6795 loss:0.0310 grad_norm:0.7183
+step:520/950 record_time:436.0s step_avg:0.8s reward_mean:3.2966 solved_frac:0.6843 loss:0.0315 grad_norm:0.6764
+step:521/950 record_time:436.8s step_avg:0.8s reward_mean:3.2875 solved_frac:0.6777 loss:0.0299 grad_norm:0.6696
+step:522/950 record_time:437.7s step_avg:0.8s reward_mean:3.2973 solved_frac:0.6830 loss:0.0295 grad_norm:0.7079
+step:523/950 record_time:438.5s step_avg:0.8s reward_mean:3.2727 solved_frac:0.6739 loss:0.0308 grad_norm:0.6804
+step:524/950 record_time:439.4s step_avg:0.8s reward_mean:3.2863 solved_frac:0.6834 loss:0.0297 grad_norm:0.6556
+step:525/950 record_time:440.2s step_avg:0.8s reward_mean:3.3079 solved_frac:0.6847 loss:0.0306 grad_norm:0.7060
+step:526/950 record_time:441.1s step_avg:0.8s reward_mean:3.3067 solved_frac:0.6892 loss:0.0305 grad_norm:0.6775
+step:527/950 record_time:441.9s step_avg:0.8s reward_mean:3.3086 solved_frac:0.6899 loss:0.0299 grad_norm:0.6673
+step:528/950 record_time:442.8s step_avg:0.8s reward_mean:3.3137 solved_frac:0.6913 loss:0.0300 grad_norm:0.6920
+step:529/950 record_time:443.6s step_avg:0.8s reward_mean:3.3170 solved_frac:0.6886 loss:0.0287 grad_norm:0.6533
+step:530/950 record_time:444.5s step_avg:0.8s reward_mean:3.3388 solved_frac:0.6992 loss:0.0304 grad_norm:0.7040
+step:531/950 record_time:445.3s step_avg:0.8s reward_mean:3.3096 solved_frac:0.6871 loss:0.0291 grad_norm:0.6678
+step:532/950 record_time:446.1s step_avg:0.8s reward_mean:3.3030 solved_frac:0.6839 loss:0.0296 grad_norm:0.7330
+step:533/950 record_time:447.0s step_avg:0.8s reward_mean:3.3184 solved_frac:0.6906 loss:0.0305 grad_norm:0.6857
+step:534/950 record_time:447.8s step_avg:0.8s reward_mean:3.3108 solved_frac:0.6907 loss:0.0277 grad_norm:0.6854
+step:535/950 record_time:448.7s step_avg:0.8s reward_mean:3.3265 solved_frac:0.6953 loss:0.0290 grad_norm:0.7694
+step:536/950 record_time:449.5s step_avg:0.8s reward_mean:3.3147 solved_frac:0.6860 loss:0.0305 grad_norm:0.7327
+step:537/950 record_time:450.4s step_avg:0.8s reward_mean:3.3271 solved_frac:0.6898 loss:0.0295 grad_norm:0.7436
+step:538/950 record_time:451.2s step_avg:0.8s reward_mean:3.3215 solved_frac:0.6934 loss:0.0310 grad_norm:0.6975
+step:539/950 record_time:452.0s step_avg:0.8s reward_mean:3.3281 solved_frac:0.6947 loss:0.0289 grad_norm:0.7175
+step:540/950 record_time:452.9s step_avg:0.8s reward_mean:3.3178 solved_frac:0.6924 loss:0.0298 grad_norm:0.7300
+step:541/950 record_time:453.7s step_avg:0.8s reward_mean:3.3034 solved_frac:0.6845 loss:0.0299 grad_norm:0.7095
+step:542/950 record_time:454.6s step_avg:0.8s reward_mean:3.3098 solved_frac:0.6869 loss:0.0289 grad_norm:0.7172
+step:543/950 record_time:455.4s step_avg:0.8s reward_mean:3.3192 solved_frac:0.6915 loss:0.0308 grad_norm:0.6876
+step:544/950 record_time:456.3s step_avg:0.8s reward_mean:3.3434 solved_frac:0.6952 loss:0.0315 grad_norm:0.6656
+step:545/950 record_time:457.1s step_avg:0.8s reward_mean:3.3370 solved_frac:0.6954 loss:0.0295 grad_norm:0.6466
+step:546/950 record_time:457.9s step_avg:0.8s reward_mean:3.3387 solved_frac:0.6992 loss:0.0283 grad_norm:0.6935
+step:547/950 record_time:458.8s step_avg:0.8s reward_mean:3.3315 solved_frac:0.6921 loss:0.0292 grad_norm:0.6698
+step:548/950 record_time:459.6s step_avg:0.8s reward_mean:3.3266 solved_frac:0.6885 loss:0.0292 grad_norm:0.6612
+step:549/950 record_time:460.5s step_avg:0.8s reward_mean:3.3458 solved_frac:0.7008 loss:0.0297 grad_norm:0.6815
+step:550/950 record_time:461.3s step_avg:0.8s reward_mean:3.3415 solved_frac:0.6969 loss:0.0287 grad_norm:0.7207
+step:551/950 record_time:462.2s step_avg:0.8s reward_mean:3.3224 solved_frac:0.6868 loss:0.0280 grad_norm:0.6872
+step:552/950 record_time:463.0s step_avg:0.8s reward_mean:3.3044 solved_frac:0.6772 loss:0.0276 grad_norm:0.6779
+step:553/950 record_time:463.9s step_avg:0.8s reward_mean:3.3311 solved_frac:0.6918 loss:0.0297 grad_norm:0.6994
+step:554/950 record_time:464.7s step_avg:0.8s reward_mean:3.3393 solved_frac:0.6946 loss:0.0300 grad_norm:0.7106
+step:555/950 record_time:465.6s step_avg:0.8s reward_mean:3.3403 solved_frac:0.6980 loss:0.0312 grad_norm:0.7180
+step:556/950 record_time:466.4s step_avg:0.8s reward_mean:3.3541 solved_frac:0.6971 loss:0.0300 grad_norm:0.7349
+step:557/950 record_time:467.3s step_avg:0.8s reward_mean:3.3257 solved_frac:0.6905 loss:0.0282 grad_norm:0.6864
+step:558/950 record_time:468.1s step_avg:0.8s reward_mean:3.3280 solved_frac:0.6945 loss:0.0306 grad_norm:0.6811
+step:559/950 record_time:469.0s step_avg:0.8s reward_mean:3.3652 solved_frac:0.7039 loss:0.0311 grad_norm:0.7004
+step:560/950 record_time:469.8s step_avg:0.8s reward_mean:3.3408 solved_frac:0.6936 loss:0.0291 grad_norm:0.6994
+step:561/950 record_time:470.6s step_avg:0.8s reward_mean:3.3268 solved_frac:0.6936 loss:0.0296 grad_norm:0.6477
+step:562/950 record_time:471.5s step_avg:0.8s reward_mean:3.3327 solved_frac:0.6939 loss:0.0302 grad_norm:0.7857
+step:563/950 record_time:472.3s step_avg:0.8s reward_mean:3.3430 solved_frac:0.6993 loss:0.0295 grad_norm:0.6982
+step:564/950 record_time:473.1s step_avg:0.8s reward_mean:3.3309 solved_frac:0.6949 loss:0.0295 grad_norm:0.6594
+step:565/950 record_time:474.0s step_avg:0.8s reward_mean:3.3357 solved_frac:0.7004 loss:0.0275 grad_norm:0.6734
+step:566/950 record_time:474.8s step_avg:0.8s reward_mean:3.3700 solved_frac:0.7072 loss:0.0284 grad_norm:0.6510
+step:567/950 record_time:475.7s step_avg:0.8s reward_mean:3.3372 solved_frac:0.6940 loss:0.0282 grad_norm:0.6773
+step:568/950 record_time:476.5s step_avg:0.8s reward_mean:3.3433 solved_frac:0.6998 loss:0.0290 grad_norm:0.7419
+step:569/950 record_time:477.3s step_avg:0.8s reward_mean:3.3438 solved_frac:0.7002 loss:0.0278 grad_norm:0.6893
+step:570/950 record_time:478.2s step_avg:0.8s reward_mean:3.3234 solved_frac:0.6905 loss:0.0290 grad_norm:0.7236
+step:571/950 record_time:479.0s step_avg:0.8s reward_mean:3.3491 solved_frac:0.6985 loss:0.0311 grad_norm:0.6903
+step:572/950 record_time:479.9s step_avg:0.8s reward_mean:3.3568 solved_frac:0.7000 loss:0.0277 grad_norm:0.6858
+step:573/950 record_time:480.7s step_avg:0.8s reward_mean:3.3366 solved_frac:0.6948 loss:0.0299 grad_norm:0.6419
+step:574/950 record_time:481.6s step_avg:0.8s reward_mean:3.3341 solved_frac:0.6925 loss:0.0282 grad_norm:0.6662
+step:575/950 record_time:482.4s step_avg:0.8s reward_mean:3.3196 solved_frac:0.6865 loss:0.0260 grad_norm:0.7106
+step:576/950 record_time:483.3s step_avg:0.8s reward_mean:3.3526 solved_frac:0.7016 loss:0.0282 grad_norm:0.6750
+step:577/950 record_time:484.1s step_avg:0.8s reward_mean:3.3272 solved_frac:0.6931 loss:0.0301 grad_norm:0.7397
+step:578/950 record_time:484.9s step_avg:0.8s reward_mean:3.3457 solved_frac:0.7008 loss:0.0270 grad_norm:0.6549
+step:579/950 record_time:485.8s step_avg:0.8s reward_mean:3.3476 solved_frac:0.6992 loss:0.0287 grad_norm:0.6911
+step:580/950 record_time:486.6s step_avg:0.8s reward_mean:3.3394 solved_frac:0.7008 loss:0.0264 grad_norm:0.7454
+step:581/950 record_time:487.5s step_avg:0.8s reward_mean:3.3331 solved_frac:0.6929 loss:0.0269 grad_norm:0.6475
+step:582/950 record_time:488.3s step_avg:0.8s reward_mean:3.3477 solved_frac:0.6992 loss:0.0257 grad_norm:0.6697
+step:583/950 record_time:489.2s step_avg:0.8s reward_mean:3.3578 solved_frac:0.7039 loss:0.0275 grad_norm:0.6688
+step:584/950 record_time:490.0s step_avg:0.8s reward_mean:3.3616 solved_frac:0.7047 loss:0.0278 grad_norm:0.6744
+step:585/950 record_time:490.8s step_avg:0.8s reward_mean:3.3496 solved_frac:0.7022 loss:0.0282 grad_norm:0.7546
+step:586/950 record_time:491.7s step_avg:0.8s reward_mean:3.3492 solved_frac:0.7030 loss:0.0294 grad_norm:0.6728
+step:587/950 record_time:492.5s step_avg:0.8s reward_mean:3.3400 solved_frac:0.6935 loss:0.0286 grad_norm:0.6441
+step:588/950 record_time:493.3s step_avg:0.8s reward_mean:3.3566 solved_frac:0.7033 loss:0.0286 grad_norm:0.6840
+step:589/950 record_time:494.2s step_avg:0.8s reward_mean:3.3591 solved_frac:0.7039 loss:0.0291 grad_norm:0.6775
+step:590/950 record_time:495.0s step_avg:0.8s reward_mean:3.3661 solved_frac:0.7072 loss:0.0292 grad_norm:0.6821
+step:591/950 record_time:495.8s step_avg:0.8s reward_mean:3.3486 solved_frac:0.6996 loss:0.0301 grad_norm:0.7099
+step:592/950 record_time:496.7s step_avg:0.8s reward_mean:3.3792 solved_frac:0.7134 loss:0.0280 grad_norm:0.7188
+step:593/950 record_time:497.5s step_avg:0.8s reward_mean:3.3549 solved_frac:0.7044 loss:0.0270 grad_norm:0.6806
+step:594/950 record_time:498.4s step_avg:0.8s reward_mean:3.3865 solved_frac:0.7174 loss:0.0290 grad_norm:0.8239
+step:595/950 record_time:499.2s step_avg:0.8s reward_mean:3.3528 solved_frac:0.7028 loss:0.0265 grad_norm:0.6852
+step:596/950 record_time:500.0s step_avg:0.8s reward_mean:3.3694 solved_frac:0.7079 loss:0.0273 grad_norm:0.6861
+step:597/950 record_time:500.9s step_avg:0.8s reward_mean:3.3578 solved_frac:0.7026 loss:0.0302 grad_norm:0.6613
+step:598/950 record_time:501.7s step_avg:0.8s reward_mean:3.3613 solved_frac:0.7078 loss:0.0298 grad_norm:0.7304
+step:599/950 record_time:502.6s step_avg:0.8s reward_mean:3.3778 solved_frac:0.7135 loss:0.0287 grad_norm:0.6748
+step:600/950 record_time:503.4s step_avg:0.8s reward_mean:3.3888 solved_frac:0.7154 loss:0.0261 grad_norm:0.6861
+step:601/950 record_time:504.2s step_avg:0.8s reward_mean:3.3729 solved_frac:0.7098 loss:0.0278 grad_norm:0.6333
+step:602/950 record_time:505.1s step_avg:0.8s reward_mean:3.3790 solved_frac:0.7102 loss:0.0273 grad_norm:0.6598
+step:603/950 record_time:505.9s step_avg:0.8s reward_mean:3.3606 solved_frac:0.7069 loss:0.0290 grad_norm:0.7082
+step:604/950 record_time:506.7s step_avg:0.8s reward_mean:3.3891 solved_frac:0.7179 loss:0.0274 grad_norm:0.8537
+step:605/950 record_time:507.6s step_avg:0.8s reward_mean:3.3852 solved_frac:0.7148 loss:0.0263 grad_norm:0.6635
+step:606/950 record_time:508.4s step_avg:0.8s reward_mean:3.3661 solved_frac:0.7075 loss:0.0276 grad_norm:0.6768
+step:607/950 record_time:509.3s step_avg:0.8s reward_mean:3.3669 solved_frac:0.7081 loss:0.0276 grad_norm:0.7305
+step:608/950 record_time:510.1s step_avg:0.8s reward_mean:3.3869 solved_frac:0.7141 loss:0.0289 grad_norm:0.6759
+step:609/950 record_time:510.9s step_avg:0.8s reward_mean:3.4095 solved_frac:0.7232 loss:0.0287 grad_norm:0.6787
+step:610/950 record_time:511.8s step_avg:0.8s reward_mean:3.3748 solved_frac:0.7117 loss:0.0280 grad_norm:0.7066
+step:611/950 record_time:512.6s step_avg:0.8s reward_mean:3.3873 solved_frac:0.7185 loss:0.0291 grad_norm:0.6370
+step:612/950 record_time:513.5s step_avg:0.8s reward_mean:3.3704 solved_frac:0.7119 loss:0.0285 grad_norm:0.7006
+step:613/950 record_time:514.3s step_avg:0.8s reward_mean:3.3765 solved_frac:0.7093 loss:0.0276 grad_norm:0.6365
+step:614/950 record_time:515.1s step_avg:0.8s reward_mean:3.3831 solved_frac:0.7151 loss:0.0280 grad_norm:0.6898
+step:615/950 record_time:516.0s step_avg:0.8s reward_mean:3.3818 solved_frac:0.7135 loss:0.0288 grad_norm:0.6892
+step:616/950 record_time:516.8s step_avg:0.8s reward_mean:3.3726 solved_frac:0.7067 loss:0.0272 grad_norm:0.6869
+step:617/950 record_time:517.7s step_avg:0.8s reward_mean:3.3838 solved_frac:0.7128 loss:0.0283 grad_norm:0.7488
+step:618/950 record_time:518.5s step_avg:0.8s reward_mean:3.4072 solved_frac:0.7197 loss:0.0276 grad_norm:0.6425
+step:619/950 record_time:519.4s step_avg:0.8s reward_mean:3.3804 solved_frac:0.7121 loss:0.0269 grad_norm:0.6901
+step:620/950 record_time:520.2s step_avg:0.8s reward_mean:3.3931 solved_frac:0.7148 loss:0.0272 grad_norm:0.6539
+step:621/950 record_time:521.0s step_avg:0.8s reward_mean:3.3678 solved_frac:0.7059 loss:0.0276 grad_norm:0.6685
+step:622/950 record_time:521.9s step_avg:0.8s reward_mean:3.3952 solved_frac:0.7196 loss:0.0269 grad_norm:0.6664
+step:623/950 record_time:522.7s step_avg:0.8s reward_mean:3.3657 solved_frac:0.7060 loss:0.0273 grad_norm:0.6445
+step:624/950 record_time:523.6s step_avg:0.8s reward_mean:3.3830 solved_frac:0.7135 loss:0.0290 grad_norm:0.6765
+step:625/950 record_time:524.5s step_avg:0.8s reward_mean:3.3850 solved_frac:0.7152 loss:0.0280 grad_norm:0.7097
+step:626/950 record_time:525.4s step_avg:0.8s reward_mean:3.3485 solved_frac:0.7030 loss:0.0285 grad_norm:0.6655
+step:627/950 record_time:526.3s step_avg:0.8s reward_mean:3.3891 solved_frac:0.7169 loss:0.0277 grad_norm:0.6326
+step:628/950 record_time:527.2s step_avg:0.8s reward_mean:3.3963 solved_frac:0.7194 loss:0.0292 grad_norm:0.6563
+step:629/950 record_time:528.1s step_avg:0.8s reward_mean:3.4059 solved_frac:0.7233 loss:0.0268 grad_norm:0.6807
+step:630/950 record_time:528.9s step_avg:0.8s reward_mean:3.3875 solved_frac:0.7130 loss:0.0290 grad_norm:0.6592
+step:631/950 record_time:529.8s step_avg:0.8s reward_mean:3.3864 solved_frac:0.7155 loss:0.0283 grad_norm:0.7225
+step:632/950 record_time:530.6s step_avg:0.8s reward_mean:3.3805 solved_frac:0.7119 loss:0.0254 grad_norm:0.6442
+step:633/950 record_time:531.5s step_avg:0.8s reward_mean:3.4113 solved_frac:0.7222 loss:0.0292 grad_norm:0.6675
+step:634/950 record_time:532.3s step_avg:0.8s reward_mean:3.3878 solved_frac:0.7101 loss:0.0288 grad_norm:0.6713
+step:635/950 record_time:533.2s step_avg:0.8s reward_mean:3.4027 solved_frac:0.7174 loss:0.0275 grad_norm:0.6899
+step:636/950 record_time:534.1s step_avg:0.8s reward_mean:3.3843 solved_frac:0.7123 loss:0.0269 grad_norm:0.6686
+step:637/950 record_time:535.1s step_avg:0.8s reward_mean:3.3855 solved_frac:0.7087 loss:0.0302 grad_norm:0.6498
+step:638/950 record_time:536.0s step_avg:0.8s reward_mean:3.4018 solved_frac:0.7181 loss:0.0303 grad_norm:0.6812
+step:639/950 record_time:536.8s step_avg:0.8s reward_mean:3.4005 solved_frac:0.7174 loss:0.0297 grad_norm:0.6171
+step:640/950 record_time:537.7s step_avg:0.8s reward_mean:3.4058 solved_frac:0.7231 loss:0.0273 grad_norm:0.6494
+step:641/950 record_time:538.6s step_avg:0.8s reward_mean:3.3930 solved_frac:0.7160 loss:0.0273 grad_norm:0.6497
+step:642/950 record_time:539.4s step_avg:0.8s reward_mean:3.3896 solved_frac:0.7132 loss:0.0279 grad_norm:0.6664
+step:643/950 record_time:540.3s step_avg:0.8s reward_mean:3.3863 solved_frac:0.7137 loss:0.0283 grad_norm:0.6392
+step:644/950 record_time:541.1s step_avg:0.8s reward_mean:3.3961 solved_frac:0.7198 loss:0.0289 grad_norm:0.6811
+step:645/950 record_time:542.0s step_avg:0.8s reward_mean:3.3778 solved_frac:0.7102 loss:0.0284 grad_norm:0.6205
+step:646/950 record_time:542.9s step_avg:0.8s reward_mean:3.4004 solved_frac:0.7213 loss:0.0280 grad_norm:0.6813
+step:647/950 record_time:543.7s step_avg:0.8s reward_mean:3.3956 solved_frac:0.7223 loss:0.0260 grad_norm:0.6875
+step:648/950 record_time:544.6s step_avg:0.8s reward_mean:3.3855 solved_frac:0.7146 loss:0.0252 grad_norm:0.6200
+step:649/950 record_time:545.4s step_avg:0.8s reward_mean:3.3701 solved_frac:0.7125 loss:0.0270 grad_norm:0.6468
+step:650/950 record_time:546.3s step_avg:0.8s reward_mean:3.3703 solved_frac:0.7154 loss:0.0257 grad_norm:0.6485
+step:651/950 record_time:547.1s step_avg:0.8s reward_mean:3.3846 solved_frac:0.7158 loss:0.0267 grad_norm:0.6439
+step:652/950 record_time:547.9s step_avg:0.8s reward_mean:3.3721 solved_frac:0.7106 loss:0.0277 grad_norm:0.6843
+step:653/950 record_time:548.8s step_avg:0.8s reward_mean:3.3636 solved_frac:0.7079 loss:0.0266 grad_norm:0.6305
+step:654/950 record_time:549.6s step_avg:0.8s reward_mean:3.3555 solved_frac:0.7069 loss:0.0290 grad_norm:0.6352
+step:655/950 record_time:550.5s step_avg:0.8s reward_mean:3.3957 solved_frac:0.7204 loss:0.0298 grad_norm:0.6390
+step:656/950 record_time:551.3s step_avg:0.8s reward_mean:3.3762 solved_frac:0.7141 loss:0.0281 grad_norm:0.6828
+step:657/950 record_time:552.2s step_avg:0.8s reward_mean:3.3882 solved_frac:0.7137 loss:0.0265 grad_norm:0.6518
+step:658/950 record_time:553.0s step_avg:0.8s reward_mean:3.3787 solved_frac:0.7192 loss:0.0271 grad_norm:0.6590
+step:659/950 record_time:553.9s step_avg:0.8s reward_mean:3.4078 solved_frac:0.7272 loss:0.0282 grad_norm:0.6223
+step:660/950 record_time:554.7s step_avg:0.8s reward_mean:3.3950 solved_frac:0.7223 loss:0.0282 grad_norm:0.6817
+step:661/950 record_time:555.6s step_avg:0.8s reward_mean:3.3851 solved_frac:0.7132 loss:0.0264 grad_norm:0.6552
+step:662/950 record_time:556.4s step_avg:0.8s reward_mean:3.3946 solved_frac:0.7204 loss:0.0303 grad_norm:0.6186
+step:663/950 record_time:557.3s step_avg:0.8s reward_mean:3.3927 solved_frac:0.7198 loss:0.0286 grad_norm:0.6336
+step:664/950 record_time:558.1s step_avg:0.8s reward_mean:3.3938 solved_frac:0.7193 loss:0.0303 grad_norm:0.7629
+step:665/950 record_time:558.9s step_avg:0.8s reward_mean:3.3784 solved_frac:0.7155 loss:0.0265 grad_norm:0.6586
+step:666/950 record_time:559.8s step_avg:0.8s reward_mean:3.3987 solved_frac:0.7211 loss:0.0269 grad_norm:0.6488
+step:667/950 record_time:560.6s step_avg:0.8s reward_mean:3.4165 solved_frac:0.7300 loss:0.0286 grad_norm:0.6902
+step:668/950 record_time:561.5s step_avg:0.8s reward_mean:3.3834 solved_frac:0.7178 loss:0.0288 grad_norm:0.6588
+step:669/950 record_time:562.3s step_avg:0.8s reward_mean:3.4141 solved_frac:0.7236 loss:0.0266 grad_norm:0.6311
+step:670/950 record_time:563.2s step_avg:0.8s reward_mean:3.3874 solved_frac:0.7184 loss:0.0285 grad_norm:0.6409
+step:671/950 record_time:564.0s step_avg:0.8s reward_mean:3.3876 solved_frac:0.7162 loss:0.0264 grad_norm:0.6376
+step:672/950 record_time:564.8s step_avg:0.8s reward_mean:3.3968 solved_frac:0.7213 loss:0.0271 grad_norm:0.6631
+step:673/950 record_time:565.7s step_avg:0.8s reward_mean:3.4109 solved_frac:0.7241 loss:0.0269 grad_norm:0.6618
+step:674/950 record_time:566.5s step_avg:0.8s reward_mean:3.4240 solved_frac:0.7293 loss:0.0267 grad_norm:0.6833
+step:675/950 record_time:567.4s step_avg:0.8s reward_mean:3.4102 solved_frac:0.7287 loss:0.0273 grad_norm:0.6561
+step:676/950 record_time:568.2s step_avg:0.8s reward_mean:3.3917 solved_frac:0.7236 loss:0.0258 grad_norm:0.6555
+step:677/950 record_time:569.1s step_avg:0.8s reward_mean:3.3883 solved_frac:0.7175 loss:0.0261 grad_norm:0.6210
+step:678/950 record_time:569.9s step_avg:0.8s reward_mean:3.3989 solved_frac:0.7189 loss:0.0273 grad_norm:0.6891
+step:679/950 record_time:570.8s step_avg:0.8s reward_mean:3.4016 solved_frac:0.7196 loss:0.0255 grad_norm:0.6754
+step:680/950 record_time:571.6s step_avg:0.8s reward_mean:3.4085 solved_frac:0.7285 loss:0.0256 grad_norm:0.6119
+step:681/950 record_time:572.4s step_avg:0.8s reward_mean:3.4012 solved_frac:0.7227 loss:0.0277 grad_norm:0.6448
+step:682/950 record_time:573.3s step_avg:0.8s reward_mean:3.4013 solved_frac:0.7223 loss:0.0287 grad_norm:0.6366
+step:683/950 record_time:574.1s step_avg:0.8s reward_mean:3.4050 solved_frac:0.7234 loss:0.0260 grad_norm:0.6153
+step:684/950 record_time:574.9s step_avg:0.8s reward_mean:3.4130 solved_frac:0.7231 loss:0.0279 grad_norm:0.6458
+step:685/950 record_time:575.8s step_avg:0.8s reward_mean:3.4050 solved_frac:0.7262 loss:0.0266 grad_norm:0.6431
+step:686/950 record_time:576.6s step_avg:0.8s reward_mean:3.4151 solved_frac:0.7281 loss:0.0259 grad_norm:0.6417
+step:687/950 record_time:577.5s step_avg:0.8s reward_mean:3.3896 solved_frac:0.7194 loss:0.0229 grad_norm:0.6514
+step:688/950 record_time:578.3s step_avg:0.8s reward_mean:3.4046 solved_frac:0.7267 loss:0.0285 grad_norm:0.6136
+step:689/950 record_time:579.1s step_avg:0.8s reward_mean:3.4064 solved_frac:0.7216 loss:0.0269 grad_norm:0.6595
+step:690/950 record_time:580.0s step_avg:0.8s reward_mean:3.4065 solved_frac:0.7230 loss:0.0263 grad_norm:0.6168
+step:691/950 record_time:580.8s step_avg:0.8s reward_mean:3.3983 solved_frac:0.7198 loss:0.0258 grad_norm:0.6553
+step:692/950 record_time:581.6s step_avg:0.8s reward_mean:3.4046 solved_frac:0.7245 loss:0.0257 grad_norm:0.6375
+step:693/950 record_time:582.5s step_avg:0.8s reward_mean:3.4220 solved_frac:0.7339 loss:0.0268 grad_norm:0.6884
+step:694/950 record_time:583.3s step_avg:0.8s reward_mean:3.4016 solved_frac:0.7253 loss:0.0242 grad_norm:0.7333
+step:695/950 record_time:584.2s step_avg:0.8s reward_mean:3.4254 solved_frac:0.7292 loss:0.0261 grad_norm:0.6481
+step:696/950 record_time:585.0s step_avg:0.8s reward_mean:3.4290 solved_frac:0.7295 loss:0.0265 grad_norm:0.6262
+step:697/950 record_time:585.8s step_avg:0.8s reward_mean:3.4231 solved_frac:0.7322 loss:0.0279 grad_norm:0.6206
+step:698/950 record_time:586.7s step_avg:0.8s reward_mean:3.4004 solved_frac:0.7218 loss:0.0259 grad_norm:0.6762
+step:699/950 record_time:587.5s step_avg:0.8s reward_mean:3.4290 solved_frac:0.7308 loss:0.0262 grad_norm:0.6691
+step:700/950 record_time:588.4s step_avg:0.8s reward_mean:3.4207 solved_frac:0.7291 loss:0.0264 grad_norm:0.6750
+step:701/950 record_time:589.2s step_avg:0.8s reward_mean:3.4077 solved_frac:0.7221 loss:0.0280 grad_norm:0.6853
+step:702/950 record_time:590.0s step_avg:0.8s reward_mean:3.4156 solved_frac:0.7298 loss:0.0259 grad_norm:0.6164
+step:703/950 record_time:590.9s step_avg:0.8s reward_mean:3.4350 solved_frac:0.7368 loss:0.0267 grad_norm:0.6683
+step:704/950 record_time:591.7s step_avg:0.8s reward_mean:3.4131 solved_frac:0.7260 loss:0.0273 grad_norm:0.6145
+step:705/950 record_time:592.5s step_avg:0.8s reward_mean:3.4018 solved_frac:0.7226 loss:0.0257 grad_norm:0.6276
+step:706/950 record_time:593.4s step_avg:0.8s reward_mean:3.4072 solved_frac:0.7218 loss:0.0252 grad_norm:0.6845
+step:707/950 record_time:594.2s step_avg:0.8s reward_mean:3.4132 solved_frac:0.7253 loss:0.0271 grad_norm:0.6434
+step:708/950 record_time:595.1s step_avg:0.8s reward_mean:3.4303 solved_frac:0.7324 loss:0.0264 grad_norm:0.6364
+step:709/950 record_time:595.9s step_avg:0.8s reward_mean:3.4253 solved_frac:0.7329 loss:0.0270 grad_norm:0.6016
+step:710/950 record_time:596.8s step_avg:0.8s reward_mean:3.4382 solved_frac:0.7380 loss:0.0278 grad_norm:0.6790
+step:711/950 record_time:597.6s step_avg:0.8s reward_mean:3.4312 solved_frac:0.7333 loss:0.0269 grad_norm:0.6654
+step:712/950 record_time:598.5s step_avg:0.8s reward_mean:3.3933 solved_frac:0.7188 loss:0.0242 grad_norm:0.6307
+step:713/950 record_time:599.3s step_avg:0.8s reward_mean:3.4312 solved_frac:0.7334 loss:0.0269 grad_norm:0.6451
+step:714/950 record_time:600.2s step_avg:0.8s reward_mean:3.4237 solved_frac:0.7285 loss:0.0264 grad_norm:0.6609
+step:715/950 record_time:601.0s step_avg:0.8s reward_mean:3.4443 solved_frac:0.7414 loss:0.0278 grad_norm:0.6571
+step:716/950 record_time:601.8s step_avg:0.8s reward_mean:3.4224 solved_frac:0.7286 loss:0.0280 grad_norm:0.6304
+step:717/950 record_time:602.7s step_avg:0.8s reward_mean:3.4077 solved_frac:0.7238 loss:0.0243 grad_norm:0.6201
+step:718/950 record_time:603.5s step_avg:0.8s reward_mean:3.4315 solved_frac:0.7332 loss:0.0252 grad_norm:0.6547
+step:719/950 record_time:604.4s step_avg:0.8s reward_mean:3.4146 solved_frac:0.7241 loss:0.0280 grad_norm:0.6517
+step:720/950 record_time:605.2s step_avg:0.8s reward_mean:3.4233 solved_frac:0.7310 loss:0.0260 grad_norm:0.6402
+step:721/950 record_time:606.0s step_avg:0.8s reward_mean:3.4203 solved_frac:0.7299 loss:0.0283 grad_norm:0.6655
+step:722/950 record_time:606.9s step_avg:0.8s reward_mean:3.4371 solved_frac:0.7348 loss:0.0276 grad_norm:0.6481
+step:723/950 record_time:607.7s step_avg:0.8s reward_mean:3.4469 solved_frac:0.7365 loss:0.0271 grad_norm:0.6688
+step:724/950 record_time:608.6s step_avg:0.8s reward_mean:3.4247 solved_frac:0.7328 loss:0.0274 grad_norm:0.6647
+step:725/950 record_time:609.4s step_avg:0.8s reward_mean:3.4511 solved_frac:0.7394 loss:0.0272 grad_norm:0.6656
+step:726/950 record_time:610.3s step_avg:0.8s reward_mean:3.4229 solved_frac:0.7283 loss:0.0294 grad_norm:0.6420
+step:727/950 record_time:611.1s step_avg:0.8s reward_mean:3.4260 solved_frac:0.7349 loss:0.0269 grad_norm:0.5870
+step:728/950 record_time:612.0s step_avg:0.8s reward_mean:3.4341 solved_frac:0.7344 loss:0.0279 grad_norm:0.6662
+step:729/950 record_time:612.8s step_avg:0.8s reward_mean:3.4417 solved_frac:0.7354 loss:0.0271 grad_norm:0.6482
+step:730/950 record_time:613.7s step_avg:0.8s reward_mean:3.4547 solved_frac:0.7405 loss:0.0254 grad_norm:0.6740
+step:731/950 record_time:614.5s step_avg:0.8s reward_mean:3.4452 solved_frac:0.7374 loss:0.0265 grad_norm:0.6646
+step:732/950 record_time:615.3s step_avg:0.8s reward_mean:3.4450 solved_frac:0.7349 loss:0.0272 grad_norm:0.6754
+step:733/950 record_time:616.2s step_avg:0.8s reward_mean:3.4633 solved_frac:0.7457 loss:0.0278 grad_norm:0.6080
+step:734/950 record_time:617.0s step_avg:0.8s reward_mean:3.4558 solved_frac:0.7400 loss:0.0282 grad_norm:0.6403
+step:735/950 record_time:617.9s step_avg:0.8s reward_mean:3.4428 solved_frac:0.7349 loss:0.0268 grad_norm:0.6417
+step:736/950 record_time:618.7s step_avg:0.8s reward_mean:3.4328 solved_frac:0.7308 loss:0.0264 grad_norm:0.6942
+step:737/950 record_time:619.5s step_avg:0.8s reward_mean:3.4500 solved_frac:0.7407 loss:0.0261 grad_norm:0.6405
+step:738/950 record_time:620.4s step_avg:0.8s reward_mean:3.4233 solved_frac:0.7276 loss:0.0260 grad_norm:0.6439
+step:739/950 record_time:621.2s step_avg:0.8s reward_mean:3.4266 solved_frac:0.7349 loss:0.0283 grad_norm:0.6712
+step:740/950 record_time:622.0s step_avg:0.8s reward_mean:3.4426 solved_frac:0.7399 loss:0.0274 grad_norm:0.6538
+step:741/950 record_time:622.9s step_avg:0.8s reward_mean:3.4367 solved_frac:0.7353 loss:0.0277 grad_norm:0.6828
+step:742/950 record_time:623.7s step_avg:0.8s reward_mean:3.4236 solved_frac:0.7292 loss:0.0267 grad_norm:0.6697
+step:743/950 record_time:624.6s step_avg:0.8s reward_mean:3.4431 solved_frac:0.7367 loss:0.0268 grad_norm:0.6475
+step:744/950 record_time:625.4s step_avg:0.8s reward_mean:3.4537 solved_frac:0.7408 loss:0.0269 grad_norm:0.6254
+step:745/950 record_time:626.2s step_avg:0.8s reward_mean:3.4331 solved_frac:0.7391 loss:0.0287 grad_norm:0.6414
+step:746/950 record_time:627.1s step_avg:0.8s reward_mean:3.4172 solved_frac:0.7309 loss:0.0276 grad_norm:0.6708
+step:747/950 record_time:627.9s step_avg:0.8s reward_mean:3.4373 solved_frac:0.7360 loss:0.0277 grad_norm:0.6416
+step:748/950 record_time:628.8s step_avg:0.8s reward_mean:3.4587 solved_frac:0.7494 loss:0.0265 grad_norm:0.6181
+step:749/950 record_time:629.6s step_avg:0.8s reward_mean:3.4549 solved_frac:0.7381 loss:0.0275 grad_norm:0.7684
+step:750/950 record_time:630.4s step_avg:0.8s reward_mean:3.4405 solved_frac:0.7351 loss:0.0248 grad_norm:0.6639
+step:751/950 record_time:631.3s step_avg:0.8s reward_mean:3.4281 solved_frac:0.7301 loss:0.0288 grad_norm:0.6306
+step:752/950 record_time:632.1s step_avg:0.8s reward_mean:3.4428 solved_frac:0.7374 loss:0.0258 grad_norm:0.6122
+step:753/950 record_time:633.0s step_avg:0.8s reward_mean:3.4292 solved_frac:0.7320 loss:0.0283 grad_norm:0.6825
+step:754/950 record_time:633.8s step_avg:0.8s reward_mean:3.4606 solved_frac:0.7478 loss:0.0261 grad_norm:0.6952
+step:755/950 record_time:634.7s step_avg:0.8s reward_mean:3.4497 solved_frac:0.7411 loss:0.0252 grad_norm:0.6602
+step:756/950 record_time:635.5s step_avg:0.8s reward_mean:3.4636 solved_frac:0.7474 loss:0.0261 grad_norm:0.6637
+step:757/950 record_time:636.4s step_avg:0.8s reward_mean:3.4582 solved_frac:0.7446 loss:0.0257 grad_norm:0.6647
+step:758/950 record_time:637.3s step_avg:0.8s reward_mean:3.4648 solved_frac:0.7484 loss:0.0278 grad_norm:0.6202
+step:759/950 record_time:638.1s step_avg:0.8s reward_mean:3.4639 solved_frac:0.7434 loss:0.0259 grad_norm:0.6885
+step:760/950 record_time:639.0s step_avg:0.8s reward_mean:3.4605 solved_frac:0.7433 loss:0.0259 grad_norm:0.6405
+step:761/950 record_time:639.9s step_avg:0.8s reward_mean:3.4692 solved_frac:0.7481 loss:0.0261 grad_norm:0.6704
+step:762/950 record_time:640.7s step_avg:0.8s reward_mean:3.4659 solved_frac:0.7475 loss:0.0245 grad_norm:0.6400
+step:763/950 record_time:641.6s step_avg:0.8s reward_mean:3.4580 solved_frac:0.7455 loss:0.0269 grad_norm:0.6601
+step:764/950 record_time:642.5s step_avg:0.8s reward_mean:3.4307 solved_frac:0.7317 loss:0.0258 grad_norm:0.6670
+step:765/950 record_time:643.4s step_avg:0.8s reward_mean:3.4315 solved_frac:0.7326 loss:0.0266 grad_norm:0.6633
+step:766/950 record_time:644.2s step_avg:0.8s reward_mean:3.4466 solved_frac:0.7397 loss:0.0270 grad_norm:0.6983
+step:767/950 record_time:645.1s step_avg:0.8s reward_mean:3.4526 solved_frac:0.7404 loss:0.0271 grad_norm:0.6128
+step:768/950 record_time:645.9s step_avg:0.8s reward_mean:3.4682 solved_frac:0.7470 loss:0.0258 grad_norm:0.6612
+step:769/950 record_time:646.8s step_avg:0.8s reward_mean:3.4590 solved_frac:0.7483 loss:0.0276 grad_norm:0.6860
+step:770/950 record_time:647.6s step_avg:0.8s reward_mean:3.4534 solved_frac:0.7439 loss:0.0257 grad_norm:0.6468
+step:771/950 record_time:648.5s step_avg:0.8s reward_mean:3.4470 solved_frac:0.7363 loss:0.0265 grad_norm:0.6464
+step:772/950 record_time:649.3s step_avg:0.8s reward_mean:3.4560 solved_frac:0.7443 loss:0.0254 grad_norm:0.6716
+step:773/950 record_time:650.2s step_avg:0.8s reward_mean:3.4583 solved_frac:0.7462 loss:0.0252 grad_norm:0.6790
+step:774/950 record_time:651.0s step_avg:0.8s reward_mean:3.4638 solved_frac:0.7488 loss:0.0241 grad_norm:0.6473
+step:775/950 record_time:651.8s step_avg:0.8s reward_mean:3.4488 solved_frac:0.7427 loss:0.0254 grad_norm:0.6883
+step:776/950 record_time:652.7s step_avg:0.8s reward_mean:3.4589 solved_frac:0.7482 loss:0.0244 grad_norm:0.6592
+step:777/950 record_time:653.5s step_avg:0.8s reward_mean:3.4576 solved_frac:0.7450 loss:0.0274 grad_norm:0.6406
+step:778/950 record_time:654.4s step_avg:0.8s reward_mean:3.4685 solved_frac:0.7509 loss:0.0264 grad_norm:0.6222
+step:779/950 record_time:655.2s step_avg:0.8s reward_mean:3.4368 solved_frac:0.7355 loss:0.0253 grad_norm:0.6949
+step:780/950 record_time:656.1s step_avg:0.8s reward_mean:3.4683 solved_frac:0.7491 loss:0.0286 grad_norm:0.6552
+step:781/950 record_time:656.9s step_avg:0.8s reward_mean:3.4665 solved_frac:0.7477 loss:0.0254 grad_norm:0.6779
+step:782/950 record_time:657.8s step_avg:0.8s reward_mean:3.4605 solved_frac:0.7450 loss:0.0255 grad_norm:0.6986
+step:783/950 record_time:658.6s step_avg:0.8s reward_mean:3.4261 solved_frac:0.7335 loss:0.0268 grad_norm:0.6740
+step:784/950 record_time:659.5s step_avg:0.8s reward_mean:3.4592 solved_frac:0.7452 loss:0.0241 grad_norm:0.6311
+step:785/950 record_time:660.3s step_avg:0.8s reward_mean:3.4449 solved_frac:0.7408 loss:0.0246 grad_norm:0.6840
+step:786/950 record_time:661.1s step_avg:0.8s reward_mean:3.4446 solved_frac:0.7405 loss:0.0248 grad_norm:0.6799
+step:787/950 record_time:662.0s step_avg:0.8s reward_mean:3.4640 solved_frac:0.7458 loss:0.0259 grad_norm:0.6490
+step:788/950 record_time:662.8s step_avg:0.8s reward_mean:3.4370 solved_frac:0.7363 loss:0.0249 grad_norm:0.6507
+step:789/950 record_time:663.7s step_avg:0.8s reward_mean:3.4309 solved_frac:0.7333 loss:0.0264 grad_norm:0.6255
+step:790/950 record_time:664.5s step_avg:0.8s reward_mean:3.4512 solved_frac:0.7427 loss:0.0262 grad_norm:0.6351
+step:791/950 record_time:665.4s step_avg:0.8s reward_mean:3.4556 solved_frac:0.7443 loss:0.0279 grad_norm:0.6926
+step:792/950 record_time:666.2s step_avg:0.8s reward_mean:3.4606 solved_frac:0.7455 loss:0.0266 grad_norm:0.6297
+step:793/950 record_time:667.0s step_avg:0.8s reward_mean:3.4652 solved_frac:0.7486 loss:0.0254 grad_norm:0.6827
+step:794/950 record_time:667.9s step_avg:0.8s reward_mean:3.4480 solved_frac:0.7450 loss:0.0246 grad_norm:0.6967
+step:795/950 record_time:668.7s step_avg:0.8s reward_mean:3.4698 solved_frac:0.7495 loss:0.0271 grad_norm:0.6625
+step:796/950 record_time:669.6s step_avg:0.8s reward_mean:3.4502 solved_frac:0.7439 loss:0.0254 grad_norm:0.6246
+step:797/950 record_time:670.4s step_avg:0.8s reward_mean:3.4574 solved_frac:0.7439 loss:0.0271 grad_norm:0.6105
+step:798/950 record_time:671.3s step_avg:0.8s reward_mean:3.4557 solved_frac:0.7434 loss:0.0273 grad_norm:0.6279
+step:799/950 record_time:672.1s step_avg:0.8s reward_mean:3.4680 solved_frac:0.7522 loss:0.0251 grad_norm:0.6714
+step:800/950 record_time:672.9s step_avg:0.8s reward_mean:3.4566 solved_frac:0.7464 loss:0.0254 grad_norm:0.6334
+step:801/950 record_time:673.8s step_avg:0.8s reward_mean:3.4474 solved_frac:0.7439 loss:0.0244 grad_norm:0.6675
+step:802/950 record_time:674.6s step_avg:0.8s reward_mean:3.4559 solved_frac:0.7455 loss:0.0274 grad_norm:0.6409
+step:803/950 record_time:675.4s step_avg:0.8s reward_mean:3.4669 solved_frac:0.7497 loss:0.0261 grad_norm:0.6875
+step:804/950 record_time:676.3s step_avg:0.8s reward_mean:3.4604 solved_frac:0.7436 loss:0.0251 grad_norm:0.6733
+step:805/950 record_time:677.1s step_avg:0.8s reward_mean:3.4503 solved_frac:0.7466 loss:0.0261 grad_norm:0.6315
+step:806/950 record_time:678.0s step_avg:0.8s reward_mean:3.4874 solved_frac:0.7588 loss:0.0256 grad_norm:0.6458
+step:807/950 record_time:678.8s step_avg:0.8s reward_mean:3.4565 solved_frac:0.7438 loss:0.0237 grad_norm:0.6800
+step:808/950 record_time:679.6s step_avg:0.8s reward_mean:3.4521 solved_frac:0.7451 loss:0.0269 grad_norm:0.6279
+step:809/950 record_time:680.5s step_avg:0.8s reward_mean:3.4493 solved_frac:0.7440 loss:0.0262 grad_norm:0.6510
+step:810/950 record_time:681.3s step_avg:0.8s reward_mean:3.4523 solved_frac:0.7476 loss:0.0252 grad_norm:0.6245
+step:811/950 record_time:682.1s step_avg:0.8s reward_mean:3.4814 solved_frac:0.7557 loss:0.0257 grad_norm:0.6263
+step:812/950 record_time:683.0s step_avg:0.8s reward_mean:3.4622 solved_frac:0.7453 loss:0.0245 grad_norm:0.7016
+step:813/950 record_time:683.8s step_avg:0.8s reward_mean:3.4631 solved_frac:0.7504 loss:0.0248 grad_norm:0.6756
+step:814/950 record_time:684.7s step_avg:0.8s reward_mean:3.4682 solved_frac:0.7507 loss:0.0251 grad_norm:0.6788
+step:815/950 record_time:685.5s step_avg:0.8s reward_mean:3.4400 solved_frac:0.7410 loss:0.0261 grad_norm:0.6717
+step:816/950 record_time:686.3s step_avg:0.8s reward_mean:3.4804 solved_frac:0.7595 loss:0.0260 grad_norm:0.7244
+step:817/950 record_time:687.2s step_avg:0.8s reward_mean:3.4621 solved_frac:0.7501 loss:0.0263 grad_norm:0.6645
+step:818/950 record_time:688.0s step_avg:0.8s reward_mean:3.4658 solved_frac:0.7505 loss:0.0255 grad_norm:0.6669
+step:819/950 record_time:688.8s step_avg:0.8s reward_mean:3.4636 solved_frac:0.7488 loss:0.0250 grad_norm:0.6543
+step:820/950 record_time:689.7s step_avg:0.8s reward_mean:3.4323 solved_frac:0.7366 loss:0.0257 grad_norm:0.6629
+step:821/950 record_time:690.5s step_avg:0.8s reward_mean:3.4715 solved_frac:0.7532 loss:0.0269 grad_norm:0.6176
+step:822/950 record_time:691.3s step_avg:0.8s reward_mean:3.4462 solved_frac:0.7433 loss:0.0252 grad_norm:0.6468
+step:823/950 record_time:692.2s step_avg:0.8s reward_mean:3.4664 solved_frac:0.7517 loss:0.0278 grad_norm:0.6287
+step:824/950 record_time:693.0s step_avg:0.8s reward_mean:3.4625 solved_frac:0.7451 loss:0.0267 grad_norm:0.6596
+step:825/950 record_time:693.9s step_avg:0.8s reward_mean:3.4860 solved_frac:0.7585 loss:0.0262 grad_norm:0.6616
+step:826/950 record_time:694.7s step_avg:0.8s reward_mean:3.4574 solved_frac:0.7444 loss:0.0276 grad_norm:0.6533
+step:827/950 record_time:695.5s step_avg:0.8s reward_mean:3.4741 solved_frac:0.7540 loss:0.0285 grad_norm:0.6860
+step:828/950 record_time:696.4s step_avg:0.8s reward_mean:3.4754 solved_frac:0.7515 loss:0.0249 grad_norm:0.6581
+step:829/950 record_time:697.2s step_avg:0.8s reward_mean:3.4555 solved_frac:0.7492 loss:0.0262 grad_norm:0.6423
+step:830/950 record_time:698.0s step_avg:0.8s reward_mean:3.4464 solved_frac:0.7432 loss:0.0245 grad_norm:0.6643
+step:831/950 record_time:698.9s step_avg:0.8s reward_mean:3.4744 solved_frac:0.7558 loss:0.0273 grad_norm:0.6377
+step:832/950 record_time:699.7s step_avg:0.8s reward_mean:3.4655 solved_frac:0.7490 loss:0.0278 grad_norm:0.6719
+step:833/950 record_time:700.6s step_avg:0.8s reward_mean:3.4606 solved_frac:0.7476 loss:0.0268 grad_norm:0.6901
+step:834/950 record_time:701.4s step_avg:0.8s reward_mean:3.4454 solved_frac:0.7438 loss:0.0255 grad_norm:0.6446
+step:835/950 record_time:702.2s step_avg:0.8s reward_mean:3.4595 solved_frac:0.7452 loss:0.0258 grad_norm:0.6806
+step:836/950 record_time:703.1s step_avg:0.8s reward_mean:3.4848 solved_frac:0.7587 loss:0.0275 grad_norm:0.6768
+step:837/950 record_time:703.9s step_avg:0.8s reward_mean:3.4723 solved_frac:0.7511 loss:0.0262 grad_norm:0.6475
+step:838/950 record_time:704.8s step_avg:0.8s reward_mean:3.4647 solved_frac:0.7509 loss:0.0248 grad_norm:0.6540
+step:839/950 record_time:705.6s step_avg:0.8s reward_mean:3.4444 solved_frac:0.7408 loss:0.0264 grad_norm:0.6563
+step:840/950 record_time:706.4s step_avg:0.8s reward_mean:3.4996 solved_frac:0.7647 loss:0.0239 grad_norm:0.6182
+step:841/950 record_time:707.3s step_avg:0.8s reward_mean:3.4755 solved_frac:0.7545 loss:0.0258 grad_norm:0.6770
+step:842/950 record_time:708.1s step_avg:0.8s reward_mean:3.4907 solved_frac:0.7609 loss:0.0249 grad_norm:0.6586
+step:843/950 record_time:709.0s step_avg:0.8s reward_mean:3.4735 solved_frac:0.7543 loss:0.0242 grad_norm:0.6627
+step:844/950 record_time:709.8s step_avg:0.8s reward_mean:3.4785 solved_frac:0.7560 loss:0.0236 grad_norm:0.6328
+step:845/950 record_time:710.6s step_avg:0.8s reward_mean:3.4536 solved_frac:0.7454 loss:0.0243 grad_norm:0.6552
+step:846/950 record_time:711.5s step_avg:0.8s reward_mean:3.4603 solved_frac:0.7478 loss:0.0245 grad_norm:0.6780
+step:847/950 record_time:712.3s step_avg:0.8s reward_mean:3.4694 solved_frac:0.7491 loss:0.0236 grad_norm:0.6750
+step:848/950 record_time:713.1s step_avg:0.8s reward_mean:3.4629 solved_frac:0.7477 loss:0.0265 grad_norm:0.6709
+step:849/950 record_time:714.0s step_avg:0.8s reward_mean:3.4753 solved_frac:0.7536 loss:0.0253 grad_norm:0.6535
+step:850/950 record_time:714.8s step_avg:0.8s reward_mean:3.4635 solved_frac:0.7518 loss:0.0248 grad_norm:0.6371
+step:851/950 record_time:715.7s step_avg:0.8s reward_mean:3.4686 solved_frac:0.7500 loss:0.0269 grad_norm:0.6344
+step:852/950 record_time:716.5s step_avg:0.8s reward_mean:3.4748 solved_frac:0.7544 loss:0.0241 grad_norm:0.6682
+step:853/950 record_time:717.3s step_avg:0.8s reward_mean:3.4712 solved_frac:0.7501 loss:0.0252 grad_norm:0.6628
+step:854/950 record_time:718.2s step_avg:0.8s reward_mean:3.4851 solved_frac:0.7613 loss:0.0259 grad_norm:0.6804
+step:855/950 record_time:719.0s step_avg:0.8s reward_mean:3.4780 solved_frac:0.7541 loss:0.0247 grad_norm:0.6766
+step:856/950 record_time:719.9s step_avg:0.8s reward_mean:3.4714 solved_frac:0.7503 loss:0.0245 grad_norm:0.6491
+step:857/950 record_time:720.7s step_avg:0.8s reward_mean:3.4824 solved_frac:0.7553 loss:0.0256 grad_norm:0.6631
+step:858/950 record_time:721.5s step_avg:0.8s reward_mean:3.4852 solved_frac:0.7563 loss:0.0237 grad_norm:0.6360
+step:859/950 record_time:722.4s step_avg:0.8s reward_mean:3.4903 solved_frac:0.7615 loss:0.0253 grad_norm:0.6673
+step:860/950 record_time:723.2s step_avg:0.8s reward_mean:3.4833 solved_frac:0.7551 loss:0.0247 grad_norm:0.6391
+step:861/950 record_time:724.1s step_avg:0.8s reward_mean:3.4774 solved_frac:0.7530 loss:0.0275 grad_norm:0.6682
+step:862/950 record_time:724.9s step_avg:0.8s reward_mean:3.5051 solved_frac:0.7649 loss:0.0239 grad_norm:0.6808
+step:863/950 record_time:725.7s step_avg:0.8s reward_mean:3.4686 solved_frac:0.7529 loss:0.0240 grad_norm:0.6187
+step:864/950 record_time:726.6s step_avg:0.8s reward_mean:3.4858 solved_frac:0.7548 loss:0.0257 grad_norm:0.6462
+step:865/950 record_time:727.4s step_avg:0.8s reward_mean:3.4876 solved_frac:0.7580 loss:0.0246 grad_norm:0.6505
+step:866/950 record_time:728.3s step_avg:0.8s reward_mean:3.4811 solved_frac:0.7544 loss:0.0225 grad_norm:0.6628
+step:867/950 record_time:729.1s step_avg:0.8s reward_mean:3.4810 solved_frac:0.7524 loss:0.0247 grad_norm:0.6422
+step:868/950 record_time:729.9s step_avg:0.8s reward_mean:3.5108 solved_frac:0.7637 loss:0.0237 grad_norm:0.6603
+step:869/950 record_time:730.8s step_avg:0.8s reward_mean:3.4851 solved_frac:0.7599 loss:0.0258 grad_norm:0.6348
+step:870/950 record_time:731.6s step_avg:0.8s reward_mean:3.4664 solved_frac:0.7510 loss:0.0256 grad_norm:0.6886
+step:871/950 record_time:732.5s step_avg:0.8s reward_mean:3.4890 solved_frac:0.7537 loss:0.0238 grad_norm:0.6779
+step:872/950 record_time:733.3s step_avg:0.8s reward_mean:3.4809 solved_frac:0.7558 loss:0.0272 grad_norm:0.6628
+step:873/950 record_time:734.2s step_avg:0.8s reward_mean:3.4589 solved_frac:0.7458 loss:0.0246 grad_norm:0.6285
+step:874/950 record_time:735.1s step_avg:0.8s reward_mean:3.4803 solved_frac:0.7528 loss:0.0249 grad_norm:0.6639
+step:875/950 record_time:735.9s step_avg:0.8s reward_mean:3.4726 solved_frac:0.7487 loss:0.0247 grad_norm:0.6872
+step:876/950 record_time:736.8s step_avg:0.8s reward_mean:3.4878 solved_frac:0.7553 loss:0.0263 grad_norm:0.6452
+step:877/950 record_time:737.6s step_avg:0.8s reward_mean:3.4893 solved_frac:0.7583 loss:0.0250 grad_norm:0.7061
+step:878/950 record_time:738.5s step_avg:0.8s reward_mean:3.4778 solved_frac:0.7553 loss:0.0242 grad_norm:0.6601
+step:879/950 record_time:739.3s step_avg:0.8s reward_mean:3.5069 solved_frac:0.7659 loss:0.0249 grad_norm:0.7192
+step:880/950 record_time:740.2s step_avg:0.8s reward_mean:3.5038 solved_frac:0.7644 loss:0.0232 grad_norm:0.6661
+step:881/950 record_time:741.0s step_avg:0.8s reward_mean:3.4756 solved_frac:0.7510 loss:0.0259 grad_norm:0.6308
+step:882/950 record_time:741.8s step_avg:0.8s reward_mean:3.4915 solved_frac:0.7587 loss:0.0260 grad_norm:0.6420
+step:883/950 record_time:742.7s step_avg:0.8s reward_mean:3.4844 solved_frac:0.7527 loss:0.0258 grad_norm:0.6190
+step:884/950 record_time:743.5s step_avg:0.8s reward_mean:3.4822 solved_frac:0.7573 loss:0.0248 grad_norm:0.6961
+step:885/950 record_time:744.3s step_avg:0.8s reward_mean:3.4816 solved_frac:0.7512 loss:0.0246 grad_norm:0.6425
+step:886/950 record_time:745.2s step_avg:0.8s reward_mean:3.4952 solved_frac:0.7556 loss:0.0237 grad_norm:0.6433
+step:887/950 record_time:746.0s step_avg:0.8s reward_mean:3.4813 solved_frac:0.7517 loss:0.0251 grad_norm:0.6626
+step:888/950 record_time:746.9s step_avg:0.8s reward_mean:3.4875 solved_frac:0.7572 loss:0.0253 grad_norm:0.6400
+step:889/950 record_time:747.7s step_avg:0.8s reward_mean:3.4855 solved_frac:0.7545 loss:0.0252 grad_norm:0.6359
+step:890/950 record_time:748.5s step_avg:0.8s reward_mean:3.5155 solved_frac:0.7664 loss:0.0243 grad_norm:0.6269
+step:891/950 record_time:749.4s step_avg:0.8s reward_mean:3.4968 solved_frac:0.7576 loss:0.0217 grad_norm:0.6842
+step:892/950 record_time:750.2s step_avg:0.8s reward_mean:3.4932 solved_frac:0.7559 loss:0.0234 grad_norm:0.6985
+step:893/950 record_time:751.0s step_avg:0.8s reward_mean:3.4883 solved_frac:0.7606 loss:0.0238 grad_norm:0.6717
+step:894/950 record_time:751.9s step_avg:0.8s reward_mean:3.4984 solved_frac:0.7622 loss:0.0240 grad_norm:0.6902
+step:895/950 record_time:752.7s step_avg:0.8s reward_mean:3.4923 solved_frac:0.7604 loss:0.0227 grad_norm:0.6572
+step:896/950 record_time:753.5s step_avg:0.8s reward_mean:3.4717 solved_frac:0.7471 loss:0.0254 grad_norm:0.6768
+step:897/950 record_time:754.4s step_avg:0.8s reward_mean:3.4958 solved_frac:0.7598 loss:0.0257 grad_norm:0.6451
+step:898/950 record_time:755.2s step_avg:0.8s reward_mean:3.5055 solved_frac:0.7616 loss:0.0234 grad_norm:0.7027
+step:899/950 record_time:756.1s step_avg:0.8s reward_mean:3.4940 solved_frac:0.7575 loss:0.0236 grad_norm:0.6561
+step:900/950 record_time:756.9s step_avg:0.8s reward_mean:3.4850 solved_frac:0.7552 loss:0.0221 grad_norm:0.6339
+step:901/950 record_time:757.7s step_avg:0.8s reward_mean:3.4855 solved_frac:0.7543 loss:0.0241 grad_norm:0.6808
+step:902/950 record_time:758.6s step_avg:0.8s reward_mean:3.4780 solved_frac:0.7563 loss:0.0236 grad_norm:0.6445
+step:903/950 record_time:759.4s step_avg:0.8s reward_mean:3.5069 solved_frac:0.7637 loss:0.0254 grad_norm:0.6481
+step:904/950 record_time:760.3s step_avg:0.8s reward_mean:3.4913 solved_frac:0.7582 loss:0.0253 grad_norm:0.6730
+step:905/950 record_time:761.1s step_avg:0.8s reward_mean:3.5082 solved_frac:0.7654 loss:0.0225 grad_norm:0.6874
+step:906/950 record_time:762.0s step_avg:0.8s reward_mean:3.4870 solved_frac:0.7579 loss:0.0242 grad_norm:0.6596
+step:907/950 record_time:762.8s step_avg:0.8s reward_mean:3.4934 solved_frac:0.7569 loss:0.0217 grad_norm:0.6509
+step:908/950 record_time:763.7s step_avg:0.8s reward_mean:3.5121 solved_frac:0.7666 loss:0.0238 grad_norm:0.6835
+step:909/950 record_time:764.5s step_avg:0.8s reward_mean:3.4992 solved_frac:0.7616 loss:0.0223 grad_norm:0.6529
+step:910/950 record_time:765.4s step_avg:0.8s reward_mean:3.5003 solved_frac:0.7626 loss:0.0242 grad_norm:0.6453
+step:911/950 record_time:766.2s step_avg:0.8s reward_mean:3.4816 solved_frac:0.7551 loss:0.0223 grad_norm:0.6378
+step:912/950 record_time:767.1s step_avg:0.8s reward_mean:3.4835 solved_frac:0.7542 loss:0.0237 grad_norm:0.6821
+step:913/950 record_time:767.9s step_avg:0.8s reward_mean:3.5069 solved_frac:0.7664 loss:0.0231 grad_norm:0.6474
+step:914/950 record_time:768.8s step_avg:0.8s reward_mean:3.4967 solved_frac:0.7644 loss:0.0230 grad_norm:0.6651
+step:915/950 record_time:769.6s step_avg:0.8s reward_mean:3.5001 solved_frac:0.7591 loss:0.0242 grad_norm:0.6349
+step:916/950 record_time:770.5s step_avg:0.8s reward_mean:3.4966 solved_frac:0.7627 loss:0.0242 grad_norm:0.6665
+step:917/950 record_time:771.3s step_avg:0.8s reward_mean:3.4961 solved_frac:0.7610 loss:0.0254 grad_norm:0.6827
+step:918/950 record_time:772.1s step_avg:0.8s reward_mean:3.4808 solved_frac:0.7548 loss:0.0224 grad_norm:0.6455
+step:919/950 record_time:773.0s step_avg:0.8s reward_mean:3.4949 solved_frac:0.7611 loss:0.0239 grad_norm:0.6381
+step:920/950 record_time:773.8s step_avg:0.8s reward_mean:3.5035 solved_frac:0.7671 loss:0.0218 grad_norm:0.6754
+step:921/950 record_time:774.6s step_avg:0.8s reward_mean:3.4897 solved_frac:0.7581 loss:0.0226 grad_norm:0.6996
+step:922/950 record_time:775.5s step_avg:0.8s reward_mean:3.4982 solved_frac:0.7609 loss:0.0208 grad_norm:0.6190
+step:923/950 record_time:776.3s step_avg:0.8s reward_mean:3.4921 solved_frac:0.7619 loss:0.0242 grad_norm:0.6403
+step:924/950 record_time:777.2s step_avg:0.8s reward_mean:3.4845 solved_frac:0.7563 loss:0.0237 grad_norm:0.7083
+step:925/950 record_time:778.0s step_avg:0.8s reward_mean:3.4966 solved_frac:0.7612 loss:0.0233 grad_norm:0.6545
+step:926/950 record_time:778.8s step_avg:0.8s reward_mean:3.4799 solved_frac:0.7522 loss:0.0242 grad_norm:0.6434
+step:927/950 record_time:779.7s step_avg:0.8s reward_mean:3.4944 solved_frac:0.7603 loss:0.0241 grad_norm:0.6800
+step:928/950 record_time:780.5s step_avg:0.8s reward_mean:3.5045 solved_frac:0.7647 loss:0.0241 grad_norm:0.6804
+step:929/950 record_time:781.3s step_avg:0.8s reward_mean:3.5068 solved_frac:0.7636 loss:0.0218 grad_norm:0.6985
+step:930/950 record_time:782.2s step_avg:0.8s reward_mean:3.5021 solved_frac:0.7627 loss:0.0231 grad_norm:0.6540
+step:931/950 record_time:783.0s step_avg:0.8s reward_mean:3.5002 solved_frac:0.7630 loss:0.0237 grad_norm:0.6579
+step:932/950 record_time:783.9s step_avg:0.8s reward_mean:3.5024 solved_frac:0.7633 loss:0.0230 grad_norm:0.6839
+step:933/950 record_time:784.7s step_avg:0.8s reward_mean:3.4948 solved_frac:0.7625 loss:0.0239 grad_norm:0.7012
+step:934/950 record_time:785.5s step_avg:0.8s reward_mean:3.4848 solved_frac:0.7582 loss:0.0236 grad_norm:0.6348
+step:935/950 record_time:786.4s step_avg:0.8s reward_mean:3.5232 solved_frac:0.7676 loss:0.0234 grad_norm:0.6424
+step:936/950 record_time:787.2s step_avg:0.8s reward_mean:3.5077 solved_frac:0.7642 loss:0.0230 grad_norm:0.6889
+step:937/950 record_time:788.0s step_avg:0.8s reward_mean:3.5003 solved_frac:0.7617 loss:0.0251 grad_norm:0.6409
+step:938/950 record_time:788.9s step_avg:0.8s reward_mean:3.5265 solved_frac:0.7713 loss:0.0257 grad_norm:0.6434
+step:939/950 record_time:789.7s step_avg:0.8s reward_mean:3.5085 solved_frac:0.7663 loss:0.0245 grad_norm:0.6619
+step:940/950 record_time:790.5s step_avg:0.8s reward_mean:3.4938 solved_frac:0.7612 loss:0.0260 grad_norm:0.6367
+step:941/950 record_time:791.4s step_avg:0.8s reward_mean:3.5071 solved_frac:0.7671 loss:0.0263 grad_norm:0.6862
+step:942/950 record_time:792.2s step_avg:0.8s reward_mean:3.5191 solved_frac:0.7696 loss:0.0261 grad_norm:0.6883
+step:943/950 record_time:793.0s step_avg:0.8s reward_mean:3.5073 solved_frac:0.7617 loss:0.0242 grad_norm:0.6547
+step:944/950 record_time:793.9s step_avg:0.8s reward_mean:3.5137 solved_frac:0.7663 loss:0.0223 grad_norm:0.6786
+step:945/950 record_time:794.7s step_avg:0.8s reward_mean:3.5065 solved_frac:0.7652 loss:0.0244 grad_norm:0.6170
+step:946/950 record_time:795.5s step_avg:0.8s reward_mean:3.5245 solved_frac:0.7722 loss:0.0225 grad_norm:0.6526
+step:947/950 record_time:796.4s step_avg:0.8s reward_mean:3.5239 solved_frac:0.7713 loss:0.0239 grad_norm:0.6994
+step:948/950 record_time:797.2s step_avg:0.8s reward_mean:3.5077 solved_frac:0.7637 loss:0.0241 grad_norm:0.6554
+step:949/950 record_time:798.0s step_avg:0.8s reward_mean:3.5192 solved_frac:0.7723 loss:0.0228 grad_norm:0.6769
+step:950/950 record_time:798.9s step_avg:0.8s reward_mean:3.5084 solved_frac:0.7688 loss:0.0228 grad_norm:0.6603
+final_checkpoint:/__modal/volumes/vo-KshNjK9zoDi5RS9HAfjKEV/outputs/20260702-noconv-sgpm2-d64-h950-s43/final.pt record_time:798.9s
