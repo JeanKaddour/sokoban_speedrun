@@ -91,14 +91,11 @@ RECIPE = {
     "weight_decay": 0.0,
     "muon_eps": 1e-14,
     # --- model ---
-    # cnn-mingru = spatial conv encoder + recurrent core.
-    "arch": "sgpm2-mingru",     # cnn | mingru|lstm|gru|mlp | {cnn,gemmconv,shiftconv,sgp,sgpm,sgpm2,sgpt,sgpmt,lmixer,mlp,emb,axial,mixer,attn}-{mingru,lstm,gru}
+    # sgpm2-mingru = conv-free shift+pooled-global encoder + recurrent core (the record recipe).
+    "arch": "sgpm2-mingru",     # the only arch in-tree; other archs live in records/*/source snapshots
     "hidden_size": 256,
     "num_layers": 3,            # recurrent (planning) depth — deeper generalizes better on official sets
-    "enc_width": 0,             # mlp encoder hidden width (0 = arch default)
-    "enc_dim": 64,              # per-cell channel dim for emb/axial/mixer/attn/sgp* (0 = arch default)
-    "enc_depth": 0,             # block count for axial/mixer/attn/shiftconv (0 = arch default)
-    "enc_stride": 0,            # shiftconv last-layer stride (0 = arch default 1)
+    "enc_dim": 64,              # sgpm2 per-cell channel dim (0 = arch default)
     "bf16": False,              # fp32 by default
     "compile": True,            # torch.compile the policy for train-bound fwd/bwd kernel fusion.
     "compile_mode": "default",  # default | reduce-overhead (CUDA graphs) | max-autotune
@@ -546,400 +543,59 @@ def compute_advantages(values, rewards, terminals, importance, gamma, gae_lambda
 
 
 # ============================ policy network (hackable) =====================================
-class ActorCritic(nn.Module):
-    """Small conv actor-critic over the 4x10x10 Sokoban board. forward()/forward_eval() return the
-    same shapes as pufferlib.models.Policy so this plugs into the train step."""
+class ShiftGlobalPoolEncoder(nn.Module):
+    """sgpm2: conv-free local 3x3 shift-mix + broadcast global context. One shift layer for local
+    perception (pad once, gather the 9 neighbor slices, one dense GEMM), a mean+max-pooled
+    squeeze-excite-style global vector concatenated back per cell, a second channel mix, then a
+    second pooled-global round appended to the flatten readout. All channel-side GEMMs
+    (efficient K) plus pooling kernels — the cheapest way to give every cell board-global
+    information without token mixing."""
 
-    def __init__(self, hidden_size: int = 256):
+    def __init__(self, obs_size: int, hidden_size: int, dim: int = 48):
         super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Conv2d(OBS_CHANNELS, 32, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, 3, padding=1),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(64 * GRID_CELLS, hidden_size),
-            nn.ReLU(),
-        )
-        self.actor = nn.Linear(hidden_size, NUM_ACTIONS)
-        self.critic = nn.Linear(hidden_size, 1)
-        self.apply(self._init)
-        nn.init.orthogonal_(self.actor.weight, 0.01)
-        nn.init.zeros_(self.actor.bias)
-        nn.init.orthogonal_(self.critic.weight, 1.0)
-        nn.init.zeros_(self.critic.bias)
-
-    @staticmethod
-    def _init(m: nn.Module) -> None:
-        if isinstance(m, (nn.Conv2d, nn.Linear)):
-            nn.init.orthogonal_(m.weight, math.sqrt(2))
-            nn.init.zeros_(m.bias)
-
-    def _encode(self, obs_flat: torch.Tensor) -> torch.Tensor:
-        return self.encoder(obs_flat.view(-1, OBS_CHANNELS, GRID, GRID).float())
-
-    def initial_state(self, batch_size: int, device):
-        return ()  # feedforward: fully-observable board, no recurrence
-
-    def forward(self, x: torch.Tensor):
-        """Training call: x (B, T, obs_size) -> logits (B*T, num_actions), values (B, T)."""
-        B, T = x.shape[:2]
-        h = self._encode(x.reshape(B * T, -1))
-        return self.actor(h), self.critic(h).reshape(B, T)
-
-    def forward_eval(self, x: torch.Tensor, state):
-        """Rollout call: x (A, obs_size) -> logits (A, num_actions), values (A,), state."""
-        h = self._encode(x)
-        return self.actor(h), self.critic(h).squeeze(-1), state
-
-
-class ConvEncoder(nn.Module):
-    """Spatial conv encoder for the 4x10x10 board, drop-in for pufferlib.models.Policy (whose forward
-    hands the encoder a flattened (N, obs_size) batch). Keeps the board's spatial structure that the
-    linear DefaultEncoder throws away — the key lever for Sokoban perception."""
-
-    def __init__(self, obs_size: int, hidden_size: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(OBS_CHANNELS, 32, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, 3, padding=1),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(64 * GRID_CELLS, hidden_size),
-            nn.ReLU(),
-        )
-        for m in self.modules():
-            if isinstance(m, (nn.Conv2d, nn.Linear)):
-                nn.init.orthogonal_(m.weight, math.sqrt(2))
-                nn.init.zeros_(m.bias)
-
-    def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        x = observations.view(observations.shape[0], OBS_CHANNELS, GRID, GRID).float()
-        return self.net(x)
-
-
-class GemmConvEncoder(nn.Module):
-    """ConvEncoder with the 3x3 convs computed as im2col (unfold) + GEMM. Same function class and
-    init as ConvEncoder — only the kernels differ: 3x3 convs on a 10x10 board are cudnn
-    latency-bound, while unfold+matmul runs them as tensor-core GEMMs."""
-
-    def __init__(self, obs_size: int, hidden_size: int):
-        super().__init__()
-        self.conv1 = nn.Conv2d(OBS_CHANNELS, 32, 3, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
-        self.proj = nn.Linear(64 * GRID_CELLS, hidden_size)
-        for m in self.modules():
-            if isinstance(m, (nn.Conv2d, nn.Linear)):
-                nn.init.orthogonal_(m.weight, math.sqrt(2))
-                nn.init.zeros_(m.bias)
-
-    @staticmethod
-    def _conv3x3_gemm(x: torch.Tensor, conv: nn.Conv2d) -> torch.Tensor:
-        patches = F.unfold(x, 3, padding=1)                 # (N, Cin*9, 100)
-        w = conv.weight.view(conv.out_channels, -1)         # (Cout, Cin*9)
-        h = w @ patches + conv.bias[:, None]                # (N, Cout, 100)
-        return h.view(x.shape[0], conv.out_channels, GRID, GRID)
-
-    def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        x = observations.view(observations.shape[0], OBS_CHANNELS, GRID, GRID).float()
-        h = torch.relu(self._conv3x3_gemm(x, self.conv1))
-        h = torch.relu(self._conv3x3_gemm(h, self.conv2))
-        return torch.relu(self.proj(h.flatten(1)))
-
-
-class MLPEncoder(nn.Module):
-    """Dense MLP encoder. On a fixed 10x10 board a dense linear subsumes any conv, so this trades
-    the CNN's weight sharing (sample efficiency / equivariance) for pure GEMMs."""
-
-    def __init__(self, obs_size: int, hidden_size: int, width: int = 1024):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_size, width), nn.ReLU(),
-            nn.Linear(width, hidden_size), nn.ReLU(),
-        )
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, math.sqrt(2))
-                nn.init.zeros_(m.bias)
-
-    def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        return self.net(observations.view(observations.shape[0], -1).float())
-
-
-class EmbedEncoder(nn.Module):
-    """Cell-state embedding + learned position embedding. The 4 binary channels per cell form a
-    16-state vocabulary (~7 legal combos), so perception becomes a gather + one projection."""
-
-    def __init__(self, obs_size: int, hidden_size: int, dim: int = 32):
-        super().__init__()
-        self.embed = nn.Embedding(16, dim)
-        self.pos = nn.Parameter(torch.zeros(GRID_CELLS, dim))
-        self.proj = nn.Linear(GRID_CELLS * dim, hidden_size)
-        nn.init.normal_(self.pos, std=0.02)
-        nn.init.orthogonal_(self.proj.weight, math.sqrt(2))
-        nn.init.zeros_(self.proj.bias)
-
-    def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        x = observations.view(observations.shape[0], OBS_CHANNELS, GRID_CELLS).long()
-        idx = x[:, 0] + 2 * x[:, 1] + 4 * x[:, 2] + 8 * x[:, 3]
-        h = self.embed(idx) + self.pos
-        return torch.relu(self.proj(h.flatten(1)))
-
-
-class _AxialBlock(nn.Module):
-    def __init__(self, dim: int):
-        super().__init__()
-        self.col_mix = nn.Linear(GRID, GRID)
-        self.row_mix = nn.Linear(GRID, GRID)
-        self.chan = nn.Linear(dim, dim)
-
-    def forward(self, h: torch.Tensor) -> torch.Tensor:                             # (N, H, W, d)
-        h = h + torch.relu(self.col_mix(h.transpose(2, 3)).transpose(2, 3))         # mix along W
-        h = h + torch.relu(self.row_mix(h.permute(0, 3, 2, 1)).permute(0, 3, 2, 1))  # mix along H
-        return h + torch.relu(self.chan(h))
-
-
-class AxialEncoder(nn.Module):
-    """Row/column axial mixing: linears shared along each board axis give a full receptive field
-    and translation-style weight sharing in tiny GEMMs — no conv kernels. Residual blocks."""
-
-    def __init__(self, obs_size: int, hidden_size: int, dim: int = 64, depth: int = 1):
-        super().__init__()
-        self.cell = nn.Linear(OBS_CHANNELS, dim)
-        self.blocks = nn.Sequential(*[_AxialBlock(dim) for _ in range(depth)])
-        self.proj = nn.Linear(GRID_CELLS * dim, hidden_size)
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, math.sqrt(2))
-                nn.init.zeros_(m.bias)
-
-    def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        n = observations.shape[0]
-        x = observations.view(n, OBS_CHANNELS, GRID, GRID).float()
-        h = self.blocks(torch.relu(self.cell(x.permute(0, 2, 3, 1))))               # (N, H, W, d)
-        return torch.relu(self.proj(h.reshape(n, -1)))
-
-
-class ShiftConvEncoder(nn.Module):
-    """3x3 zero-padded convs computed channels-last: pad once, gather the 9 neighbor slices, run one
-    (N*cells, 9*Cin)x(9*Cin, Cout) GEMM per layer. Unlike the unfold/bmm route (gemmconv — 7x SLOWER
-    than cudnn in practice), this shape is a single dense tensor-core GEMM.
-    depth=2, stride=1 is the CNN's exact function (verified bitwise vs ConvEncoder).
-    depth=1: single wider (9*Cin -> 64) layer. stride=2 on the LAST layer: 3x3 neighborhoods sampled
-    on a 5x5 grid, shrinking the flatten-projection 4x (the single largest FLOP block)."""
-
-    def __init__(self, obs_size: int, hidden_size: int, depth: int = 2, stride: int = 1):
-        super().__init__()
-        out_grid = (GRID + stride - 1) // stride
-        chans = [32, 64] if depth == 2 else [64]
-        self.stride = stride
-        self.mixes = nn.ModuleList()
-        cin = OBS_CHANNELS
-        for c in chans:
-            self.mixes.append(nn.Linear(9 * cin, c))
-            cin = c
-        self.proj = nn.Linear(chans[-1] * out_grid * out_grid, hidden_size)
+        self.mix1 = nn.Linear(9 * OBS_CHANNELS, dim)
+        self.glob = nn.Linear(2 * dim, dim)
+        self.mix2 = nn.Linear(2 * dim, 64)
+        self.glob2 = nn.Linear(2 * 64, 64)
+        self.proj = nn.Linear(64 * GRID_CELLS + 64, hidden_size)
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.orthogonal_(m.weight, math.sqrt(2))
                 nn.init.zeros_(m.bias)
 
     @staticmethod
-    def _neighbors(h: torch.Tensor, stride: int = 1) -> torch.Tensor:
-        """(N, H, W, C) -> (N, H/stride, W/stride, 9C): 3x3 neighborhoods, zero-padded borders."""
+    def _neighbors(h: torch.Tensor) -> torch.Tensor:
+        """(N, H, W, C) -> (N, H, W, 9C): 3x3 neighborhoods, zero-padded borders."""
         p = F.pad(h, (0, 0, 1, 1, 1, 1))
-        return torch.cat([p[:, dr:dr + GRID:stride, dc:dc + GRID:stride]
+        return torch.cat([p[:, dr:dr + GRID, dc:dc + GRID]
                           for dr in range(3) for dc in range(3)], dim=-1)
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         n = observations.shape[0]
-        h = observations.view(n, OBS_CHANNELS, GRID, GRID).float().permute(0, 2, 3, 1)  # (N,H,W,C)
-        for i, mix in enumerate(self.mixes):
-            last = i == len(self.mixes) - 1
-            h = torch.relu(mix(self._neighbors(h, self.stride if last else 1)))
-        return torch.relu(self.proj(h.reshape(n, -1)))
-
-
-class ShiftGlobalPoolEncoder(nn.Module):
-    """Local 3x3 shift-mix + broadcast global context: one shift layer for local perception, a
-    mean-pooled squeeze-excite-style global vector concatenated back per cell, then a second
-    channel mix. All channel-side GEMMs (efficient K), two pooling kernels — the cheapest way to
-    give every cell board-global information without token mixing."""
-
-    def __init__(self, obs_size: int, hidden_size: int, dim: int = 48,
-                 pool: str = "mean", rank: int = 0, stage2: bool = False):
-        super().__init__()
-        self.pool = pool
-        self.rank = rank
-        self.stage2 = stage2
-        self.mix1 = nn.Linear(9 * OBS_CHANNELS, dim)
-        if rank:  # low-rank positional token mix: the mixer ingredient a pooled global lacks
-            self.tok_down = nn.Linear(GRID_CELLS, rank)
-            self.tok_up = nn.Linear(rank, GRID_CELLS)
-        self.glob = nn.Linear((2 if pool == "meanmax" else 1) * dim, dim)
-        self.mix2 = nn.Linear(2 * dim, 64)
-        if stage2:  # second pooled-global round after mix2, appended to the flatten readout
-            self.glob2 = nn.Linear(2 * 64, 64)
-        self.proj = nn.Linear(64 * GRID_CELLS + (64 if stage2 else 0), hidden_size)
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, math.sqrt(2))
-                nn.init.zeros_(m.bias)
-
-    def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        n = observations.shape[0]
         x = observations.view(n, OBS_CHANNELS, GRID, GRID).float().permute(0, 2, 3, 1)   # (N,H,W,C)
-        h = torch.relu(self.mix1(ShiftConvEncoder._neighbors(x)))                        # (N,H,W,d)
-        if self.rank:
-            t = h.reshape(n, GRID_CELLS, -1).transpose(1, 2)                             # (N,d,100)
-            h = h + self.tok_up(torch.relu(self.tok_down(t))).transpose(1, 2).reshape(h.shape)
-        g = h.mean(dim=(1, 2))
-        if self.pool == "meanmax":
-            g = torch.cat([g, h.amax(dim=(1, 2))], dim=-1)
+        h = torch.relu(self.mix1(self._neighbors(x)))                                    # (N,H,W,d)
+        g = torch.cat([h.mean(dim=(1, 2)), h.amax(dim=(1, 2))], dim=-1)
         g = torch.relu(self.glob(g))                                                     # (N,d)
         g = g[:, None, None, :].expand(-1, GRID, GRID, -1)
         h = torch.relu(self.mix2(torch.cat([h, g], dim=-1)))                             # (N,H,W,64)
-        flat = h.reshape(n, -1)
-        if self.stage2:
-            g2 = torch.relu(self.glob2(torch.cat([h.mean(dim=(1, 2)), h.amax(dim=(1, 2))], dim=-1)))
-            flat = torch.cat([flat, g2], dim=-1)
-        return torch.relu(self.proj(flat))
-
-
-class LeanMixerEncoder(nn.Module):
-    """Kernel-lean mixer: one block, no LayerNorm, ReLU, low-rank token mix (100 -> rank -> 100).
-    Keeps the mixer's positional global mixing (its accuracy edge over cnn) at a fraction of the
-    kernel launches and FLOPs."""
-
-    def __init__(self, obs_size: int, hidden_size: int, dim: int = 32, rank: int = 32):
-        super().__init__()
-        self.cell = nn.Linear(OBS_CHANNELS, dim)
-        self.tok_down = nn.Linear(GRID_CELLS, rank)
-        self.tok_up = nn.Linear(rank, GRID_CELLS)
-        self.chan = nn.Sequential(nn.Linear(dim, 4 * dim), nn.ReLU(), nn.Linear(4 * dim, dim))
-        self.proj = nn.Linear(GRID_CELLS * dim, hidden_size)
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, math.sqrt(2))
-                nn.init.zeros_(m.bias)
-
-    def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        n = observations.shape[0]
-        x = observations.view(n, OBS_CHANNELS, GRID_CELLS).float().transpose(1, 2)  # (N, 100, 4)
-        h = torch.relu(self.cell(x))                                                # (N, 100, d)
-        t = h.transpose(1, 2)                                                       # (N, d, 100)
-        h = h + self.tok_up(torch.relu(self.tok_down(t))).transpose(1, 2)           # token mix
-        h = h + self.chan(h)                                                        # channel mix
-        return torch.relu(self.proj(h.reshape(n, -1)))
-
-
-class _MixerBlock(nn.Module):
-    def __init__(self, tokens: int, dim: int, token_hidden: int, chan_hidden: int):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.token = nn.Sequential(nn.Linear(tokens, token_hidden), nn.GELU(),
-                                   nn.Linear(token_hidden, tokens))
-        self.norm2 = nn.LayerNorm(dim)
-        self.chan = nn.Sequential(nn.Linear(dim, chan_hidden), nn.GELU(),
-                                  nn.Linear(chan_hidden, dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:                # (N, tokens, dim)
-        x = x + self.token(self.norm1(x).transpose(1, 2)).transpose(1, 2)
-        return x + self.chan(self.norm2(x))
-
-
-class MixerEncoder(nn.Module):
-    """MLP-Mixer over the 100 board cells: token-mix + channel-mix blocks give a global receptive
-    field per block, all GEMMs. Position is encoded by the per-position token-mix weights."""
-
-    def __init__(self, obs_size: int, hidden_size: int, dim: int = 64, depth: int = 2):
-        super().__init__()
-        self.cell = nn.Linear(OBS_CHANNELS, dim)
-        self.blocks = nn.Sequential(*[_MixerBlock(GRID_CELLS, dim, 4 * dim, 4 * dim)
-                                      for _ in range(depth)])
-        self.proj = nn.Linear(GRID_CELLS * dim, hidden_size)
-        for m in (self.cell, self.proj):
-            nn.init.orthogonal_(m.weight, math.sqrt(2))
-            nn.init.zeros_(m.bias)
-
-    def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        n = observations.shape[0]
-        x = observations.view(n, OBS_CHANNELS, GRID_CELLS).float().transpose(1, 2)  # (N, 100, 4)
-        h = self.blocks(self.cell(x))
-        return torch.relu(self.proj(h.reshape(n, -1)))
-
-
-class AttnEncoder(nn.Module):
-    """Tiny pre-norm transformer over the 100 cell tokens (SDPA). Relational attention matches the
-    box<->target pairing structure of Sokoban; all GEMMs, no conv."""
-
-    def __init__(self, obs_size: int, hidden_size: int, dim: int = 128, depth: int = 2, heads: int = 4):
-        super().__init__()
-        self.cell = nn.Linear(OBS_CHANNELS, dim)
-        self.pos = nn.Parameter(torch.zeros(GRID_CELLS, dim))
-        layer = nn.TransformerEncoderLayer(dim, heads, dim_feedforward=4 * dim, dropout=0.0,
-                                           batch_first=True, norm_first=True)
-        self.blocks = nn.TransformerEncoder(layer, depth, enable_nested_tensor=False)
-        self.proj = nn.Linear(GRID_CELLS * dim, hidden_size)
-        nn.init.normal_(self.pos, std=0.02)
-        nn.init.orthogonal_(self.proj.weight, math.sqrt(2))
-        nn.init.zeros_(self.proj.bias)
-
-    def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        n = observations.shape[0]
-        x = observations.view(n, OBS_CHANNELS, GRID_CELLS).float().transpose(1, 2)  # (N, 100, 4)
-        h = self.blocks(self.cell(x) + self.pos)
-        return torch.relu(self.proj(h.reshape(n, -1)))
+        g2 = torch.relu(self.glob2(torch.cat([h.mean(dim=(1, 2)), h.amax(dim=(1, 2))], dim=-1)))
+        return torch.relu(self.proj(torch.cat([h.reshape(n, -1), g2], dim=-1)))
 
 
 def build_policy(cfg: argparse.Namespace, env: "BoxobanVecEnv", device: str) -> nn.Module:
-    """Policy factory. Arch options:
-      cnn                    - in-file feedforward conv actor-critic (no recurrence)
-      {mingru,lstm,gru,mlp}  - PufferLib's linear DefaultEncoder + that core (their tuned recipe)
-      <enc>-{mingru,lstm,gru} - encoder + recurrent core, enc one of:
-        cnn      spatial conv encoder (the record recipe)
-        gemmconv ConvEncoder computed as im2col+GEMM (same function, no cudnn conv kernels)
-        mlp      dense 400->1024->hidden MLP
-        emb      cell-state embedding + position embedding
-        axial    row/column axial-mixing linears
-        mixer    MLP-Mixer over the 100 cells
-        attn     2-layer transformer over the 100 cells
-    All expose forward()/forward_eval()/initial_state() the matched train step needs."""
-    if cfg.arch == "cnn":
-        policy = ActorCritic(cfg.hidden_size).to(device)
-    else:
-        import pufferlib.models as pm
-        nets = {"mingru": pm.MinGRU, "lstm": pm.LSTM, "gru": pm.GRU, "mlp": pm.MLP}
-        encoders = {"linear": pm.DefaultEncoder, "cnn": ConvEncoder, "gemmconv": GemmConvEncoder,
-                    "shiftconv": ShiftConvEncoder, "sgp": ShiftGlobalPoolEncoder,
-                    "sgpm": lambda o, h, **kw: ShiftGlobalPoolEncoder(o, h, pool="meanmax", **kw),
-                    "sgpm2": lambda o, h, **kw: ShiftGlobalPoolEncoder(o, h, pool="meanmax",
-                                                                       stage2=True, **kw),
-                    "sgpt": lambda o, h, **kw: ShiftGlobalPoolEncoder(o, h, rank=16, **kw),
-                    "sgpmt": lambda o, h, **kw: ShiftGlobalPoolEncoder(o, h, pool="meanmax", rank=16, **kw),
-                    "lmixer": LeanMixerEncoder, "mlp": MLPEncoder, "emb": EmbedEncoder,
-                    "axial": AxialEncoder, "mixer": MixerEncoder, "attn": AttnEncoder}
-        enc_name, net_name = cfg.arch.split("-", 1) if "-" in cfg.arch else ("linear", cfg.arch)
-        if net_name not in nets or enc_name not in encoders:
-            enc_opts = "|".join(k for k in encoders if k != "linear")
-            raise SystemExit(f"unknown --arch {cfg.arch!r} (cnn | {'|'.join(nets)} | "
-                             f"{{{enc_opts}}}-{{mingru,lstm,gru}})")
-        # Optional size overrides (0 = keep the arch's default), so sweeps need no code edits.
-        enc_kwargs = {}
-        if getattr(cfg, "enc_width", 0) and enc_name == "mlp":
-            enc_kwargs["width"] = int(cfg.enc_width)
-        if getattr(cfg, "enc_dim", 0) and enc_name in ("emb", "axial", "mixer", "attn", "sgp",
-                                                       "sgpm", "sgpm2", "sgpt", "sgpmt", "lmixer"):
-            enc_kwargs["dim"] = int(cfg.enc_dim)
-        if getattr(cfg, "enc_depth", 0) and enc_name in ("axial", "mixer", "attn", "shiftconv"):
-            enc_kwargs["depth"] = int(cfg.enc_depth)
-        if getattr(cfg, "enc_stride", 0) and enc_name == "shiftconv":
-            enc_kwargs["stride"] = int(cfg.enc_stride)
-        encoder = encoders[enc_name](env.obs_size, cfg.hidden_size, **enc_kwargs)
-        decoder = pm.DefaultDecoder(env.act_sizes, cfg.hidden_size)
-        network = nets[net_name](cfg.hidden_size, num_layers=int(cfg.num_layers))
-        policy = pm.Policy(encoder, decoder, network).to(device)
+    """Policy factory. Single arch: sgpm2-mingru — the conv-free shift+pooled-global encoder plus
+    PufferLib's MinGRU recurrent core (the record recipe). Other archs from earlier records and
+    sweeps live in each record's source snapshot. Exposes forward()/forward_eval()/initial_state()
+    the matched train step needs."""
+    if cfg.arch != "sgpm2-mingru":
+        raise SystemExit(f"unknown --arch {cfg.arch!r} (only 'sgpm2-mingru' is in-tree; "
+                         "other archs live in records/*/source snapshots)")
+    import pufferlib.models as pm
+    enc_kwargs = {"dim": int(cfg.enc_dim)} if getattr(cfg, "enc_dim", 0) else {}
+    encoder = ShiftGlobalPoolEncoder(env.obs_size, cfg.hidden_size, **enc_kwargs)
+    decoder = pm.DefaultDecoder(env.act_sizes, cfg.hidden_size)
+    network = pm.MinGRU(cfg.hidden_size, num_layers=int(cfg.num_layers))
+    policy = pm.Policy(encoder, decoder, network).to(device)
     if not getattr(cfg, "compile", False):
         return policy
     mode = getattr(cfg, "compile_mode", "default")
@@ -1523,8 +1179,7 @@ def main(argv: list[str] | None = None) -> None:
     cmd = [sys.executable, str(SOURCE_PATH), "--eval-only", "--eval-checkpoint", str(final_ckpt),
            "--run", cfg.run, "--arch", cfg.arch, "--hidden-size", str(cfg.hidden_size),
            "--num-layers", str(cfg.num_layers), "--output-dir", cfg.output_dir,
-           "--enc-width", str(cfg.enc_width), "--enc-dim", str(cfg.enc_dim),
-           "--enc-depth", str(cfg.enc_depth), "--enc-stride", str(cfg.enc_stride)]
+           "--enc-dim", str(cfg.enc_dim)]
     subprocess.run(cmd, check=True)
 
 

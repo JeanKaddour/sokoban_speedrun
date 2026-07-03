@@ -146,7 +146,7 @@ def main() -> None:
     # SMOKE: measure H100 speed. Default to the winning config on difficulty 0 (basic = procedural,
     # no big download), 8192 agents — directly comparable to the 3090's 172k env-steps/s.
     cfg_args = ["--difficulty", os.environ.get("DIFFICULTY", "0"),
-                "--arch", os.environ.get("ARCH", "cnn-mingru"),
+                "--arch", os.environ.get("ARCH", "sgpm2-mingru"),
                 "--num-layers", os.environ.get("NUM_LAYERS", "3"),
                 "--hidden-size", os.environ.get("HIDDEN_SIZE", "256"),
                 "--num-agents", os.environ.get("NUM_AGENTS", "8192")]

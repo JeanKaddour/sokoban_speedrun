@@ -123,10 +123,10 @@ Standalone `speedrun.py` snapshots are saved per run and checked against the emb
 ## Reproduce
 
 ```bash
-# train (recipe defaults live in speedrun.py RECIPE)
-RUN_NAME=<run> DIFFICULTY=4 TOTAL_TIMESTEPS=<steps> uv run modal run --detach modal_app_non_llm.py
-# eval the final checkpoint; reuse the same EXTRA_ARGS when training used non-default config
-EVAL_CHECKPOINT=/vol/outputs/<run>/final.pt DIFFICULTY=4 uv run modal run modal_app_non_llm.py
+# train (the record recipe is baked into speedrun.py's RECIPE — no recipe flags or env needed)
+RUN_NAME=<run> uv run modal run --detach modal_app_non_llm.py
+# eval the final checkpoint (model config comes from RECIPE too)
+EVAL_CHECKPOINT=/vol/outputs/<run>/final.pt uv run modal run modal_app_non_llm.py
 # verify offline (re-derives pass@1/CI + checks the eval bin); maintainers also rerun at a 2nd seed
 uv run python verify_record.py records/2026-07-02_02_non_llm
 ```
