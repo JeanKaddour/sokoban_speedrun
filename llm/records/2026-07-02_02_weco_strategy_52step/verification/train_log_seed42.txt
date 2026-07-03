@@ -79,9 +79,9 @@ WANDB_PROJECT = "sokoban-speedrun-llm"
 # ============================ RUN RECIPE (single source of truth) ============================
 # The benchmark sprint recipe lives here as a top-level constant. main() PREPENDS it to the CLI
 # args, so the same hyperparameters apply to local launches and Modal. Any flag passed on the CLI
-# appears AFTER the recipe and therefore OVERRIDES the recipe value (argparse last-wins). --run and
-# --seed are deliberately NOT here (they vary per launch); --max-steps IS here (= the current
-# record's step count) so it stays a CLI override for probes and longer runs.
+# appears AFTER the recipe and therefore OVERRIDES the recipe value (argparse last-wins). --run is
+# deliberately NOT here (it varies per launch); --max-steps IS here (75 = the record's step count)
+# so it stays a CLI override for probes and longer runs.
 # --eval-data stays in the recipe because --verify-datasets-only validates both train and eval sets.
 # TRAINER COUNT: the 8-GPU node runs NTRAINERS=3 (3 trainer ranks + 5 vLLM generators) — the sweet
 # spot: generation keeps the async buffer full while the trainer is compute-bound, and a 4th trainer
@@ -110,14 +110,9 @@ RECIPE = [
     "--warmup-steps", "5",
     "--lr-schedule", "linear",
     "--min-lr-frac", "0.15",
-    "--lr-decay-steps", "60",
-    "--max-steps", "52",          # the record's step count; override on the CLI for probes/longer runs
+    "--lr-decay-steps", "90",
+    "--max-steps", "75",          # the record's step count; override on the CLI for probes/longer runs
     "--grad-clip", "1.0",
-    "--loss-fn", "grpo",          # record 4: PPO-clip GRPO (advantage-mode auto-resolves to 'grpo')
-    "--adv-centered-blend", "0.04",    # record 4: Weco advantage shaping (see shape_group_advantages)
-    "--adv-difficulty-weight", "0.18",
-    "--adv-difficulty-ramp", "1.0",
-    "--adv-variance-boost", "1.1",
     "--cispo-eps", "4.0",
     "--loss-normalization", "sequence",  # sample-level (GRPO).
     "--max-staleness", "4",          # less off-policy than ScaleRL's 8; a proven stability lever
@@ -4083,3 +4078,117 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
+
+====================================================================================================
+python: 3.11.10 (main, Sep 7 2024, 18:35:41) [GCC 11.4.0]
+torch: 2.11.0+cu130
+transformers: 5.8.1
+vllm: 0.22.0
+git commit: 2a690ec04f448c956a970ff9e30de5ec5a77c089
+GENERATOR_GC_COLLECT_EVERY: 4
+source snapshot: source/speedrun.py sha256:069e2743cd8f4ddc94d012112f1f9d21dc8b6e349f57fe1cd17c6ee46f5ee270
+Thu Jul  2 23:05:48 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.126.09             Driver Version: 580.126.09     CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA H100 80GB HBM3          On  |   00000000:19:00.0 Off |                    0 |
+| N/A   49C    P0            129W /  700W |   16865MiB /  81559MiB |     15%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA H100 80GB HBM3          On  |   00000000:3B:00.0 Off |                    0 |
+| N/A   39C    P0            119W /  700W |   16869MiB /  81559MiB |     34%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA H100 80GB HBM3          On  |   00000000:4C:00.0 Off |                    0 |
+| N/A   38C    P0            121W /  700W |   16465MiB /  81559MiB |     13%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA H100 80GB HBM3          On  |   00000000:5D:00.0 Off |                    0 |
+| N/A   48C    P0             75W /  700W |       4MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   4  NVIDIA H100 80GB HBM3          On  |   00000000:9B:00.0 Off |                    0 |
+| N/A   46C    P0             74W /  700W |       4MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   5  NVIDIA H100 80GB HBM3          On  |   00000000:BB:00.0 Off |                    0 |
+| N/A   37C    P0             70W /  700W |       4MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   6  NVIDIA H100 80GB HBM3          On  |   00000000:CB:00.0 Off |                    0 |
+| N/A   46C    P0             76W /  700W |       4MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   7  NVIDIA H100 80GB HBM3          On  |   00000000:DB:00.0 Off |                    0 |
+| N/A   36C    P0             70W /  700W |       4MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+
+argv: ['/workspace/sokoban_speedrun/llm/speedrun.py', '--run', 'weco52-seed42', '--max-steps', '52', '--seed', '42', '--loss-fn', 'grpo', '--lr-decay-steps', '60', '--adv-centered-blend', '0.04', '--adv-difficulty-weight', '0.18', '--adv-variance-boost', '1.1', '--no-wandb', '--no-save-rollouts', '--final-rollout-steps', '0']
+args: {'model': 'Qwen/Qwen3-4B-Instruct-2507', 'trust_remote_code': False, 'device': '', 'train_data': PosixPath('datasets/sokoban_train.jsonl'), 'eval_data': PosixPath('datasets/sokoban_eval.jsonl'), 'verify_datasets_only': False, 'dtype': 'float32', 'run': 'weco52-seed42', 'wandb': False, 'output_dir': PosixPath('outputs'), 'seed': 42, 'num_epochs': 1, 'max_steps': 52, 'device_batch_size': 2, 'examples_per_step': 16, 'num_samples': 8, 'max_new_tokens': 5632, 'interruption': True, 'interrupt_answer_tokens': 512, 'interrupt_min_tokens': None, 'interrupt_max_tokens': None, 'interrupt_temperature': None, 'interrupt_top_p': None, 'interrupt_top_k': None, 'temperature': 0.8, 'top_k': 0, 'top_p': 0.95, 'learning_rate': 1.6e-06, 'optimizer': 'adamw', 'adam_eps': 1e-15, 'weight_decay': 0.01, 'init_lr_frac': 0.05, 'warmup_steps': 5, 'lr_schedule': 'linear', 'min_lr_frac': 0.15, 'lr_decay_steps': 60, 'lr_decay_start': None, 'grad_clip': 1.0, 'loss_normalization': 'sequence', 'gradient_checkpointing': True, 'compile': False, 'attn_implementation': 'flash_attention_2', 'enable_thinking': False, 'save_every': 0, 'save_final': True, 'trim_after_answer': True, 'vllm_gpu_mem_util': 0.9, 'vllm_enforce_eager': False, 'vllm_max_num_seqs': 512, 'vllm_max_num_batched_tokens': 8192, 'vllm_max_num_scheduled_tokens': None, 'vllm_max_num_partial_prefills': None, 'vllm_max_long_partial_prefills': None, 'vllm_long_prefill_token_threshold': None, 'vllm_enable_chunked_prefill': None, 'vllm_scheduler_reserve_full_isl': None, 'vllm_stream_interval': 8, 'vllm_performance_mode': None, 'inflight_requests': 64, 'max_staleness': 4, 'logits_chunk_size': 2048, 'log_entropy': False, 'train_autocast_dtype': 'bfloat16', 'debug_assert_replica_sync': False, 'loss_fn': 'grpo', 'advantage_mode': 'grpo', 'adv_centered_blend': 0.04, 'adv_difficulty_weight': 0.18, 'adv_difficulty_ramp': 1.0, 'adv_variance_boost': 1.1, 'entropy_coef': 0.0, 'cispo_eps': 4.0, 'clip_eps_low': 0.2, 'clip_eps_high': 0.2, 'clip_ratio_c': 3.0, 'kl_tau': 0.0, 'max_model_len': 7168, 'zero_variance_filter': True, 'save_rollouts': False, 'wandb_rollout_samples': 20, 'final_rollout_steps': 0, 'rollout_flush_every': 10, 'auto_run_name': False}
+====================================================================================================
+step:1/52 record_time:134.9s step_avg:134.9s reward_mean:0.5625 solved_frac:0.4375 loss:0.0001 grad_norm:0.3699
+step:2/52 record_time:168.8s step_avg:84.4s reward_mean:0.6992 solved_frac:0.5781 loss:0.0001 grad_norm:0.3901
+step:3/52 record_time:207.4s step_avg:69.1s reward_mean:0.6094 solved_frac:0.4922 loss:0.0002 grad_norm:0.4623
+step:4/52 record_time:248.0s step_avg:62.0s reward_mean:0.4453 solved_frac:0.3281 loss:0.0001 grad_norm:0.3456
+step:5/52 record_time:284.4s step_avg:56.9s reward_mean:0.5430 solved_frac:0.4453 loss:0.0000 grad_norm:0.4196
+step:6/52 record_time:322.2s step_avg:53.7s reward_mean:0.5547 solved_frac:0.4688 loss:-0.0000 grad_norm:0.3939
+step:7/52 record_time:359.3s step_avg:51.3s reward_mean:0.6719 solved_frac:0.5781 loss:-0.0002 grad_norm:0.3309
+step:8/52 record_time:395.8s step_avg:49.5s reward_mean:0.5703 solved_frac:0.4922 loss:-0.0000 grad_norm:0.3480
+step:9/52 record_time:430.9s step_avg:47.9s reward_mean:0.5508 solved_frac:0.4609 loss:-0.0001 grad_norm:0.3397
+step:10/52 record_time:465.2s step_avg:46.5s reward_mean:0.6055 solved_frac:0.5156 loss:-0.0002 grad_norm:0.3282
+step:11/52 record_time:508.7s step_avg:46.2s reward_mean:0.5586 solved_frac:0.4375 loss:-0.0002 grad_norm:0.3164
+step:12/52 record_time:543.2s step_avg:45.3s reward_mean:0.5547 solved_frac:0.4922 loss:-0.0000 grad_norm:0.3773
+step:13/52 record_time:578.1s step_avg:44.5s reward_mean:0.5664 solved_frac:0.5078 loss:0.0001 grad_norm:0.3411
+step:14/52 record_time:615.2s step_avg:43.9s reward_mean:0.5898 solved_frac:0.5156 loss:-0.0004 grad_norm:0.3207
+step:15/52 record_time:651.9s step_avg:43.5s reward_mean:0.5352 solved_frac:0.4688 loss:-0.0002 grad_norm:0.3141
+step:16/52 record_time:686.0s step_avg:42.9s reward_mean:0.7383 solved_frac:0.6719 loss:-0.0001 grad_norm:0.3541
+step:17/52 record_time:722.5s step_avg:42.5s reward_mean:0.5625 solved_frac:0.5234 loss:-0.0003 grad_norm:0.3417
+step:18/52 record_time:754.7s step_avg:41.9s reward_mean:0.7031 solved_frac:0.6328 loss:-0.0001 grad_norm:0.3797
+step:19/52 record_time:793.1s step_avg:41.7s reward_mean:0.6484 solved_frac:0.5156 loss:-0.0003 grad_norm:0.3168
+step:20/52 record_time:829.9s step_avg:41.5s reward_mean:0.5664 solved_frac:0.4922 loss:-0.0002 grad_norm:0.3918
+step:21/52 record_time:867.4s step_avg:41.3s reward_mean:0.6680 solved_frac:0.5703 loss:-0.0001 grad_norm:0.2981
+step:22/52 record_time:906.0s step_avg:41.2s reward_mean:0.5781 solved_frac:0.4922 loss:-0.0002 grad_norm:0.4554
+step:23/52 record_time:941.9s step_avg:41.0s reward_mean:0.7070 solved_frac:0.6250 loss:-0.0001 grad_norm:0.3729
+step:24/52 record_time:977.0s step_avg:40.7s reward_mean:0.6562 solved_frac:0.6328 loss:-0.0003 grad_norm:1.5253
+step:25/52 record_time:1012.5s step_avg:40.5s reward_mean:0.6406 solved_frac:0.5781 loss:-0.0002 grad_norm:0.3606
+step:26/52 record_time:1048.8s step_avg:40.3s reward_mean:0.6172 solved_frac:0.5547 loss:-0.0001 grad_norm:0.3290
+step:27/52 record_time:1084.4s step_avg:40.2s reward_mean:0.7539 solved_frac:0.6797 loss:-0.0002 grad_norm:1.7704
+step:28/52 record_time:1122.7s step_avg:40.1s reward_mean:0.6758 solved_frac:0.5938 loss:-0.0002 grad_norm:0.3257
+step:29/52 record_time:1159.0s step_avg:40.0s reward_mean:0.7773 solved_frac:0.7344 loss:-0.0002 grad_norm:0.3022
+step:30/52 record_time:1195.1s step_avg:39.8s reward_mean:0.7500 solved_frac:0.6875 loss:-0.0000 grad_norm:0.3971
+step:31/52 record_time:1229.8s step_avg:39.7s reward_mean:0.7500 solved_frac:0.7109 loss:-0.0001 grad_norm:0.3606
+step:32/52 record_time:1268.3s step_avg:39.6s reward_mean:0.6328 solved_frac:0.5625 loss:-0.0001 grad_norm:0.8099
+step:33/52 record_time:1303.6s step_avg:39.5s reward_mean:0.7617 solved_frac:0.7109 loss:-0.0001 grad_norm:0.3196
+step:34/52 record_time:1339.8s step_avg:39.4s reward_mean:0.7930 solved_frac:0.7266 loss:-0.0002 grad_norm:0.3236
+step:35/52 record_time:1375.8s step_avg:39.3s reward_mean:0.6914 solved_frac:0.6172 loss:-0.0003 grad_norm:0.3999
+step:36/52 record_time:1426.3s step_avg:39.6s reward_mean:0.6445 solved_frac:0.5938 loss:-0.0001 grad_norm:0.3077
+step:37/52 record_time:1465.5s step_avg:39.6s reward_mean:0.6836 solved_frac:0.6094 loss:-0.0001 grad_norm:0.2965
+step:38/52 record_time:1500.6s step_avg:39.5s reward_mean:0.8008 solved_frac:0.7266 loss:-0.0002 grad_norm:0.3054
+step:39/52 record_time:1539.0s step_avg:39.5s reward_mean:0.6875 solved_frac:0.6172 loss:-0.0001 grad_norm:0.3460
+step:40/52 record_time:1574.5s step_avg:39.4s reward_mean:0.7344 solved_frac:0.6562 loss:-0.0003 grad_norm:0.3261
+step:41/52 record_time:1613.2s step_avg:39.3s reward_mean:0.7148 solved_frac:0.6406 loss:-0.0004 grad_norm:0.3204
+step:42/52 record_time:1653.7s step_avg:39.4s reward_mean:0.7461 solved_frac:0.6797 loss:-0.0003 grad_norm:0.3319
+step:43/52 record_time:1690.1s step_avg:39.3s reward_mean:0.7617 solved_frac:0.7109 loss:-0.0001 grad_norm:0.3306
+step:44/52 record_time:1724.5s step_avg:39.2s reward_mean:0.7812 solved_frac:0.7266 loss:-0.0002 grad_norm:0.3907
+step:45/52 record_time:1763.3s step_avg:39.2s reward_mean:0.7344 solved_frac:0.6875 loss:-0.0002 grad_norm:0.3276
+step:46/52 record_time:1800.5s step_avg:39.1s reward_mean:0.7891 solved_frac:0.7344 loss:-0.0002 grad_norm:0.3055
+step:47/52 record_time:1840.0s step_avg:39.1s reward_mean:0.6836 solved_frac:0.6250 loss:-0.0002 grad_norm:0.9278
+step:48/52 record_time:1880.2s step_avg:39.2s reward_mean:0.7266 solved_frac:0.6484 loss:-0.0002 grad_norm:0.3929
+step:49/52 record_time:1921.5s step_avg:39.2s reward_mean:0.7070 solved_frac:0.6641 loss:-0.0001 grad_norm:0.3360
+step:50/52 record_time:1967.0s step_avg:39.3s reward_mean:0.7070 solved_frac:0.6562 loss:-0.0001 grad_norm:0.3824
+step:51/52 record_time:2019.0s step_avg:39.6s reward_mean:0.6914 solved_frac:0.6641 loss:-0.0001 grad_norm:0.3333
+step:52/52 record_time:2056.3s step_avg:39.5s reward_mean:0.6562 solved_frac:0.5938 loss:-0.0001 grad_norm:0.3870
+final_checkpoint:outputs/weco52-seed42/step_000051 record_time:2056.3s

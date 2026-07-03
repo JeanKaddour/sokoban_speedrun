@@ -59,7 +59,8 @@ STEP_RE = re.compile(
 # Key hyperparameters surfaced in the README config table; the full args dict goes in <details>.
 HEADLINE_ARGS = [
     "learning_rate", "lr_schedule", "min_lr_frac", "lr_decay_steps", "warmup_steps",
-    "cispo_eps", "loss_normalization", "examples_per_step", "num_samples",
+    "cispo_eps", "loss_normalization", "adv_centered_blend", "adv_difficulty_weight",
+    "adv_difficulty_ramp", "adv_variance_boost", "examples_per_step", "num_samples",
     "max_new_tokens", "temperature", "top_p", "max_staleness", "inflight_requests",
     "interruption", "interrupt_answer_tokens", "max_steps", "seed",
 ]
@@ -531,9 +532,9 @@ TRACKS = {
         "lb_metric": "Held-out pass@1",
         "lb_out": "assets/llm_records.png",
         "reproduce": [
-            "# train on one 8xH100 node (recipe defaults live in speedrun.py RECIPE)",
+            "# train on one 8xH100 node (the recipe is baked into speedrun.py's RECIPE — no recipe flags)",
             "NODE_GPUS=8 uv run torchrun --standalone --nproc_per_node=3 -m speedrun -- "
-            "--run <run> --max-steps 75 --loss-fn grpo --seed <seed> --lr-decay-steps 75",
+            "--run <run> --seed <seed> --no-wandb --no-save-rollouts --final-rollout-steps 0",
             "# eval the final checkpoint under the leaderboard protocol, then verify offline",
             "uv run python -m eval_speedrun --run <run>-final-eval "
             "--eval-checkpoint outputs/<run>/step_<final> --eval-k 8 --eval-seed 12345 "
