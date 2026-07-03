@@ -56,6 +56,7 @@ This track uses [PufferLib's](https://github.com/pufferai/pufferlib) Boxoban env
 | 2 | 21:00 | same recipe as #1, earliest clearing checkpoint | 2026-06-29 | [non_llm/records/2026-06-29_01](non_llm/records/2026-06-29_01_non_llm/) | 0.727 (CI [0.70, 0.75]) | @JeanKaddour |
 | 3 | 15:55 | torch.compile + steps-matched-anneal | 2026-06-30 | [non_llm/records/2026-06-30_01](non_llm/records/2026-06-30_01_non_llm/) | 0.748 (CI [0.72, 0.77]) | @JeanKaddour |
 | 4 | 14:42 | anneal horizon tuned 1300→1200 steps | 2026-07-02 | [non_llm/records/2026-07-02_01](non_llm/records/2026-07-02_01_non_llm/) | 0.736 (CI [0.71, 0.76]) | @JeanKaddour |
+| 5 | 12:38 | conv-free shift + pooled-global encoder (`sgpm2`), 950-step anneal | 2026-07-02 | [non_llm/records/2026-07-02_02](non_llm/records/2026-07-02_02_non_llm/) | 0.741 (CI [0.72, 0.77]) | @srijanpatel |
 
 
 ### Rules
