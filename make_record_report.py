@@ -342,6 +342,16 @@ def load_record(record_dir: Path) -> dict:
     return {"logs": logs, "evals": evals, "name": record_dir.name}
 
 
+def load_metrics_frames(record_dir: Path, seeds: list[str]) -> list[pd.DataFrame] | None:
+    """Per-seed metrics_seed<seed>.jsonl written by speedrun.py's RunLogger — the offline
+    stand-in for fetch_wandb_history (record runs are --no-wandb). All-or-nothing: every
+    seed log must have its metrics file, else fall back to the filtered step: lines."""
+    paths = [record_dir / f"metrics_{seed}.jsonl" for seed in seeds]
+    if not paths or not all(p.exists() for p in paths):
+        return None
+    return [normalize_online_frame(pd.read_json(p, lines=True)) for p in paths]
+
+
 def fetch_wandb_history(run_paths: list[str]) -> list[pd.DataFrame]:
     """One normalized DataFrame per run with step + train solve rate."""
     import wandb
@@ -893,6 +903,10 @@ def main() -> None:
         online_frames = fetch_wandb_history([r.strip() for r in args.wandb_runs.split(",")])
         if len(online_frames) != len(seeds):
             raise SystemExit(f"got {len(online_frames)} W&B runs for {len(seeds)} seed logs")
+    else:
+        online_frames = load_metrics_frames(args.record_dir, seeds)
+        if online_frames is not None:
+            print(f"using metrics_seed*.jsonl for the online train metric ({len(seeds)} seed(s))")
 
     plot_training(record, online_frames, plots / "training.png", target)
     plot_stability(record, plots / "stability.png")

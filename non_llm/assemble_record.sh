@@ -109,6 +109,11 @@ if fetch "source/speedrun.py" 2>/dev/null; then
 else
   echo ">> source snapshot not found in run output; report generation will backfill from train log"
 fi
+if fetch "metrics.jsonl" 2>/dev/null; then
+  echo ">> got metrics.jsonl"
+else
+  echo ">> metrics.jsonl not found in run output (pre-metrics run); plots fall back to step: lines"
+fi
 
 # Label files with the run's actual training seed (from the log's args attestation) unless TRAIN_SEED
 # was set explicitly. Verification just needs a different seed than the submission — no flag required.
@@ -125,6 +130,8 @@ fi
 mkdir -p "$DEST"
 cp "$stage/$log_name"  "$DEST/train_log_seed${TRAIN_SEED}.txt"
 cp "$stage/$eval_json" "$DEST/eval_seed${TRAIN_SEED}.json"
+[ -f "$stage/metrics.jsonl" ] && \
+  cp "$stage/metrics.jsonl" "$DEST/metrics_seed${TRAIN_SEED}.jsonl"
 if [ -f "$stage/source/speedrun.py" ]; then
   mkdir -p "$DEST/source"
   cp "$stage/source/speedrun.py" "$DEST/source/speedrun_seed${TRAIN_SEED}.py"

@@ -821,6 +821,7 @@ class RunLogger:
     def __init__(self, run_dir: Path, args_dict: dict):
         self.path = None
         self._fh = None
+        self._metrics_fh = None
         self._t0 = None
         self._t1 = None
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -830,6 +831,9 @@ class RunLogger:
         self._fh = self.path.open("w", encoding="utf-8")
         self._fh.write(self._header(args_dict, source, sha))
         self._fh.flush()
+        # Append (not truncate): a relaunch reusing the run name keeps the crashed
+        # attempt's rows for autopsies; consumers dedupe on step (keep="last").
+        self._metrics_fh = (run_dir / "metrics.jsonl").open("a", encoding="utf-8")
         print(f"RunLogger: writing record log to {self.path}")
 
     @staticmethod
@@ -887,6 +891,27 @@ class RunLogger:
                     f"reward_mean:{max(0.0, reward_mean):.4f} solved_frac:{solved_frac:.4f} "
                     f"loss:{loss:.4f} grad_norm:{grad_norm:.4f}")
 
+    def log_metrics(self, step, metrics: dict):
+        """Append one JSON row of per-step metrics (W&B key names) to metrics.jsonl.
+
+        Record runs are --no-wandb, so this file is the offline metrics channel: the
+        report tooling prefers it over the coarser step: lines. Fail-open: a write
+        error warns once and disables the stream, never the run."""
+        if self._metrics_fh is None:
+            return
+        # Injected keys last so the one-based step (matching the step: lines) wins.
+        row = {**metrics, "step": step + 1, "record_time_s": self.record_time()}
+        try:
+            self._metrics_fh.write(json.dumps(row, default=float) + "\n")
+            self._metrics_fh.flush()
+        except Exception as exc:
+            print(f"RunLogger metrics stream disabled (write failed): {exc!r}")
+            try:
+                self._metrics_fh.close()
+            except Exception:
+                pass
+            self._metrics_fh = None
+
     def log_final_checkpoint(self, path):
         self._write(f"final_checkpoint:{path} record_time:{self.record_time():.1f}s")
 
@@ -894,6 +919,9 @@ class RunLogger:
         if self._fh is not None:
             self._fh.close()
             self._fh = None
+        if self._metrics_fh is not None:
+            self._metrics_fh.close()
+            self._metrics_fh = None
 
 
 # ============================ training ======================================================
@@ -994,8 +1022,11 @@ def train(cfg: argparse.Namespace) -> Path:
                         solved_frac=solved, loss=float(stats["policy"] + cfg.vf_coef * stats["value"]),
                         grad_norm=float(stats["grad_norm"]))
         sps = global_step / max(1e-6, logger.record_time())
-        wandb_run.log({
+        metrics = {
             "train/solved_frac": solved,
+            # Alias recognized by make_record_report's ONLINE_METRIC_ALIASES — this
+            # track's solve rate is unfiltered (every episode counts), so it IS online.
+            "online_solved_frac": solved,
             "train/targets_hit": float(elog.get("targets_hit", 0.0)),
             "train/episode_return": float(elog.get("episode_return", 0.0)),
             "loss/policy": stats["policy"], "loss/value": stats["value"], "loss/entropy": stats["entropy"],
@@ -1003,7 +1034,9 @@ def train(cfg: argparse.Namespace) -> Path:
             "opt/grad_norm": stats["grad_norm"], "opt/lr": optimizer.param_groups[0]["lr"],
             "perf/sps": sps, "perf/record_time_s": logger.record_time(),
             "epoch": it + 1,
-        }, step=global_step)
+        }
+        wandb_run.log(metrics, step=global_step)
+        logger.log_metrics(it, metrics)
         if it % max(1, cfg.print_every) == 0 or it == total_iters - 1:
             print(f"  iter {it + 1}/{total_iters} gstep={global_step:,} solved={solved:.3f} "
                   f"ent={stats['entropy']:.3f} kl={stats['approx_kl']:.4f} gnorm={stats['grad_norm']:.2f} "

@@ -2208,6 +2208,7 @@ class RunLogger:
 
     def __init__(self, run_dir: Path, args: argparse.Namespace, enabled: bool) -> None:
         self._fh = None
+        self._metrics_fh = None
         self._queue: queue.Queue[str | object] | None = None
         self._thread: threading.Thread | None = None
         self._t0: float | None = None
@@ -2222,6 +2223,9 @@ class RunLogger:
             self._fh = self.path.open("w", encoding="utf-8")
             self._fh.write(self._header(args, source, source_sha256))
             self._fh.flush()
+            # Append (not truncate): a relaunch reusing the run name keeps the crashed
+            # attempt's rows for autopsies; consumers dedupe on step (keep="last").
+            self._metrics_fh = (run_dir / "metrics.jsonl").open("a", encoding="utf-8")
             self._queue = queue.Queue()
             self._thread = threading.Thread(target=self._writer_main, name="runlogger-writer", daemon=True)
             self._thread.start()
@@ -2348,8 +2352,32 @@ class RunLogger:
             f"reward_mean:{metrics.get('reward/mean', float('nan')):.4f} "
             f"solved_frac:{metrics.get('reward/solved_frac', float('nan')):.4f} "
             f"loss:{metrics.get('loss', float('nan')):.4f} "
-            f"grad_norm:{metrics.get('grad_norm', float('nan')):.4f}"
+            f"grad_norm:{metrics.get('grad_norm', float('nan')):.4f} "
+            f"online_solved:{metrics.get('reward/online_solved_frac_unfiltered', float('nan')):.4f}"
         )
+
+    def log_metrics(self, step: int, metrics: dict) -> None:
+        """Append one JSON row of per-step metrics (W&B key names) to metrics.jsonl.
+
+        Record runs are --no-wandb, so this file is the offline metrics channel: the
+        report tooling prefers it over the coarser step: lines (which only carry the
+        filtered accepted-batch diagnostic). Fail-open like the text log: a write
+        error warns once and disables the stream, never the run."""
+        fh = self._metrics_fh
+        if fh is None:
+            return
+        # Injected keys last so the one-based step (matching the step: lines) wins.
+        row = {**metrics, "step": step + 1, "record_time_s": self.record_time()}
+        try:
+            fh.write(json.dumps(row, default=float) + "\n")
+            fh.flush()
+        except Exception as exc:
+            print0(f"RunLogger metrics stream disabled (write failed): {exc!r}")
+            try:
+                fh.close()
+            except Exception:
+                pass
+            self._metrics_fh = None
 
     def log_final_checkpoint(self, checkpoint_dir: Path) -> None:
         self._write(f"final_checkpoint:{checkpoint_dir} record_time:{self.record_time():.1f}s")
@@ -2374,6 +2402,12 @@ class RunLogger:
             except Exception:
                 pass
             self._fh = None
+        if self._metrics_fh is not None:
+            try:
+                self._metrics_fh.close()
+            except Exception:
+                pass
+            self._metrics_fh = None
 
 
 # ============================ TRAINING PIPELINE ============================
@@ -3176,6 +3210,7 @@ def run_pipeline(
             _stream_flush_pending()
         wandb_run.log(metrics)
         run_logger.log_step(step, num_steps, metrics)
+        run_logger.log_metrics(step, metrics)
         if should_save_checkpoint_for_step(step, num_steps, args.save_every, args.save_final):
             checkpoint_dir = save_hf_checkpoint(model, tokenizer, run_dir, step)
             print0(f"Saved checkpoint to {checkpoint_dir}")
