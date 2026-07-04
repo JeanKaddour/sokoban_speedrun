@@ -4,12 +4,13 @@
 One figure per track, single panel: train solve rate vs record clock (the
 speedrun axis). Solve rate is the one metric with the same meaning in both
 tracks' logs (the LLM track's shaped reward_mean and the non-LLM track's
-boxes-on-target proxy are not comparable). Per seed, the series is the
-unfiltered online solve rate from metrics_seed<seed>.jsonl when the record
-ships it; older records fall back to the log's solved_frac, which on the LLM
-track is the filtered accepted-batch diagnostic (post-dynamic-sampling) —
-mixed eras are marked with a legend dagger. The non-LLM log's solved_frac is
-already the true unfiltered episode solve rate, so its fallback is lossless.
+boxes-on-target proxy are not comparable). A record plots the unfiltered
+online solve rate when every seed ships a usable metrics_seed<seed>.jsonl
+covering its log (all-or-nothing, so one curve never mixes metrics); older or
+partial records fall back to the log's solved_frac, which on the LLM track is
+the filtered accepted-batch diagnostic (post-dynamic-sampling) — mixed eras
+are marked with a legend dagger. The non-LLM log's solved_frac is already the
+true unfiltered episode solve rate, so its fallback is lossless.
 
 Each record is one color; the line is the 2-seed mean of the smoothed solve
 rate and the shaded band spans the two seeds (submission run + verification
@@ -29,6 +30,7 @@ number / description / time. Writes:
 
 from __future__ import annotations
 
+import itertools
 import re
 from pathlib import Path
 
@@ -39,8 +41,8 @@ import matplotlib.pyplot as plt  # noqa: E402
 import pandas as pd  # noqa: E402
 
 from make_record_report import (  # noqa: E402
-    ONLINE_METRIC, REPO_ROOT, SMOOTH, normalize_online_frame, parse_train_log, pct_axis,
-    set_leaderboard_style, train_log_paths,
+    ONLINE_METRIC, REPO_ROOT, SMOOTH, load_metrics_frame, parse_leaderboard, parse_train_log,
+    pct_axis, set_leaderboard_style, train_log_paths,
 )
 
 # One color per RECORD, in leaderboard order — Okabe-Ito (the standard
@@ -55,10 +57,12 @@ PLOTS = {
         "lb_section": "LLM Track",
         "records_dir": REPO_ROOT / "llm" / "records",
         "title": "LLM track  ·  train solve rate",
-        # fallback label: records predating metrics_seed*.jsonl only log the filtered
-        # accepted-batch diagnostic; online label: the unbiased pre-filter solve rate
-        "ylabel": "train solve rate (accepted batches)",
-        "ylabel_online": "train solve rate",
+        "ylabel": "train solve rate",
+        # This track's step:-line fallback is a DIFFERENT metric (the filtered
+        # accepted-batch diagnostic), so all-fallback plots relabel the axis and
+        # mixed eras dagger the fallback records.
+        "fallback_is_filtered": True,
+        "ylabel_fallback": "train solve rate (accepted batches)",
         "out": REPO_ROOT / "assets" / "llm_train_solve_rate.png",
     },
     "non-llm": {
@@ -67,33 +71,15 @@ PLOTS = {
         "title": "Non-LLM track  ·  train solve rate",
         # same metric either way (every episode counts) — no dagger era for this track
         "ylabel": "train solve rate (episodes)",
-        "ylabel_online": "train solve rate (episodes)",
+        "fallback_is_filtered": False,
         "out": REPO_ROOT / "assets" / "non_llm_train_solve_rate.png",
     },
 }
 
 
 def leaderboard_rows(section: str) -> dict[str, dict]:
-    """Map record-dir name -> {num, clock, desc} from the README's track table.
-
-    parse_leaderboard() in make_record_report keeps only num/minutes/acc; here the
-    legend also needs the human-authored Description and the dir-name link target.
-    """
-    text = (REPO_ROOT / "README.md").read_text()
-    block = next(s for s in re.split(r"^## ", text, flags=re.M) if s.startswith(section))
-    rows = {}
-    for line in block.splitlines():
-        if not re.match(r"\|\s*\d+\s*\|", line):  # a data row: leading | <int> |
-            continue
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        link = re.search(r"\(((?:llm|non_llm)/records/[^)]+?)/?\)", cells[4])
-        if not link:
-            continue
-        rows[Path(link.group(1)).name] = {
-            "num": int(cells[0]), "clock": cells[1],
-            "desc": cells[2].replace("`", ""),
-        }
-    return rows
+    """Map record-dir name -> leaderboard row (num, clock, desc) for the legend."""
+    return {r["dir"]: r for r in parse_leaderboard(section) if r["dir"]}
 
 
 def shorten(desc: str, limit: int = LEGEND_DESC_MAX) -> str:
@@ -113,22 +99,24 @@ def shorten(desc: str, limit: int = LEGEND_DESC_MAX) -> str:
 def load_seed_frames(record_dir: Path) -> tuple[dict[str, pd.DataFrame], bool]:
     """Both seeds' step series: the submission log + the verification rerun's.
 
-    When a seed ships metrics_seed<seed>.jsonl (records assembled after speedrun.py
-    grew the metrics stream), its solved_frac column is replaced with the unfiltered
-    online solve rate; otherwise the log's value stands. Returns (frames, online) —
-    online is True only if every seed came from a metrics file."""
-    frames, online = {}, []
+    All-or-nothing per record (mirroring load_metrics_frames in the report):
+    solved_frac is replaced with the unfiltered online rate only when EVERY seed
+    ships a usable metrics_seed<seed>.jsonl covering its log — a per-seed or
+    per-step splice would mix two different metrics in one curve/band on the LLM
+    track. Returns (frames, online)."""
+    frames, rates = {}, {}
     for p in train_log_paths(record_dir) + train_log_paths(record_dir / "verification"):
         seed = p.stem.replace("train_log_", "")
         df = parse_train_log(p)["df"]
-        metrics_path = p.with_name(f"metrics_{seed}.jsonl")
-        if metrics_path.exists():
-            w = normalize_online_frame(pd.read_json(metrics_path, lines=True))
-            rate = df.step.map(w.set_index("step")[ONLINE_METRIC])
-            df = df.assign(solved_frac=rate.fillna(df.solved_frac))
-        online.append(metrics_path.exists())
+        w = load_metrics_frame(p.with_name(f"metrics_{seed}.jsonl"), df)
+        if w is not None:
+            # full coverage is guaranteed by load_metrics_frame — no NaN to fill
+            rates[seed] = df.step.map(w.set_index("step")[ONLINE_METRIC])
         frames[seed] = df
-    return frames, bool(online) and all(online)
+    online = bool(frames) and set(rates) == set(frames)
+    if online:
+        frames = {seed: df.assign(solved_frac=rates[seed]) for seed, df in frames.items()}
+    return frames, online
 
 
 def seed_band(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -154,6 +142,9 @@ def plot_track(cfg: dict) -> None:
         if not (d.is_dir() and re.match(r"\d{4}-\d{2}-\d{2}_", d.name)):
             continue
         frames, online = load_seed_frames(d)
+        if not frames:
+            print(f"  ! {d.name}: no seed logs — skipped")
+            continue
         if len(frames) < 2:
             print(f"  ! {d.name}: only {len(frames)} seed log(s) — band collapses to one seed")
         lb = rows.get(d.name, {"num": len(records) + 1, "clock": "?", "desc": d.name})
@@ -165,15 +156,18 @@ def plot_track(cfg: dict) -> None:
 
     # All-online records get the plain label; a mixed era daggers the fallback records
     # (only meaningful where fallback is a different metric, i.e. the LLM track).
-    all_online = all(r["online"] for r in records)
-    mixed = not all_online and any(r["online"] for r in records)
-    dagger = mixed and cfg["ylabel"] != cfg["ylabel_online"]
+    any_online = any(r["online"] for r in records)
+    mixed = any_online and not all(r["online"] for r in records)
+    dagger = mixed and cfg["fallback_is_filtered"]
     legend_title = "line = 2-seed mean  ·  band = seed spread"
     if dagger:
         legend_title += "\n† train metric = filtered accepted batches (pre-metrics record)"
 
+    if len(records) > len(RECORD_COLORS):
+        print(f"  ! {len(records)} records exceed the {len(RECORD_COLORS)}-color palette — "
+              "colors repeat; extend RECORD_COLORS")
     fig, ax = plt.subplots(figsize=(8.6, 4.8))
-    for rec, color in zip(records, RECORD_COLORS):
+    for rec, color in zip(records, itertools.cycle(RECORD_COLORS)):
         b = rec["band"]
         mark = "†" if dagger and not rec["online"] else ""
         ax.fill_between(b.clock_min, b.lo, b.hi, color=color, alpha=0.18, lw=0)
@@ -181,7 +175,8 @@ def plot_track(cfg: dict) -> None:
                 label=f"#{rec['num']}{mark} · {shorten(rec['desc'])} · {rec['clock']}")
     ax.set_title(cfg["title"], loc="left")
     ax.set_xlabel("record clock (minutes)")
-    ax.set_ylabel(cfg["ylabel_online"] if all_online or mixed else cfg["ylabel"])
+    ax.set_ylabel(cfg["ylabel_fallback"] if cfg["fallback_is_filtered"] and not any_online
+                  else cfg["ylabel"])
     ax.set_xlim(left=0)
     pct_axis(ax)
     leg = ax.legend(loc="lower right", fontsize=11,

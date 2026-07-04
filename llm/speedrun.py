@@ -2366,10 +2366,23 @@ class RunLogger:
         fh = self._metrics_fh
         if fh is None:
             return
+        # Keep JSON scalars only (numpy scalars via float()); drop non-scalar entries
+        # per key — wandb-enabled runs put a wandb.Table in metrics (rollouts_live),
+        # which must not poison json.dumps and kill the stream for the whole run.
+        row = {}
+        for k, v in metrics.items():
+            if isinstance(v, (int, float, str, bool)) or v is None:
+                row[k] = v
+            else:
+                try:
+                    row[k] = float(v)
+                except (TypeError, ValueError):
+                    continue
         # Injected keys last so the one-based step (matching the step: lines) wins.
-        row = {**metrics, "step": step + 1, "record_time_s": self.record_time()}
+        row["step"] = step + 1
+        row["record_time_s"] = self.record_time()
         try:
-            fh.write(json.dumps(row, default=float) + "\n")
+            fh.write(json.dumps(row) + "\n")
             fh.flush()
         except Exception as exc:
             print0(f"RunLogger metrics stream disabled (write failed): {exc!r}")

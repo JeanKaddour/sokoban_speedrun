@@ -164,7 +164,10 @@ def normalize_online_frame(df: pd.DataFrame) -> pd.DataFrame:
     out = df[["step", col]].dropna().rename(columns={col: ONLINE_METRIC}).copy()
     out["step"] = out["step"].astype(int)
     out[ONLINE_METRIC] = out[ONLINE_METRIC].astype(float)
-    return out.sort_values("step").drop_duplicates("step", keep="last").reset_index(drop=True)
+    # kind="stable": the default quicksort reorders equal keys, which would make
+    # keep="last" keep arbitrary rows when an append-mode metrics.jsonl holds a
+    # crashed attempt's steps below a relaunch's (RunLogger's documented contract).
+    return out.sort_values("step", kind="stable").drop_duplicates("step", keep="last").reset_index(drop=True)
 
 
 def aligned_training_series(log: dict, online_frame: pd.DataFrame | None = None) -> dict:
@@ -342,14 +345,44 @@ def load_record(record_dir: Path) -> dict:
     return {"logs": logs, "evals": evals, "name": record_dir.name}
 
 
-def load_metrics_frames(record_dir: Path, seeds: list[str]) -> list[pd.DataFrame] | None:
+def load_metrics_frame(path: Path, log_df: pd.DataFrame) -> pd.DataFrame | None:
+    """One seed's metrics_seed<seed>.jsonl as a normalized online frame, or None
+    meaning "fall back to the step: lines".
+
+    Guards the stream's own failure modes so partial data never silently splices
+    into a curve: a missing/empty file (fail-open disable before the first write),
+    an unparseable file (crash mid-line), stale steps beyond the log (append-mode
+    relaunch after a longer crashed attempt — rows are one-based, so any step not
+    in the log is dropped), and incomplete coverage (stream disabled mid-run).
+    A surviving frame covers the log's steps exactly, which also pins
+    aligned_training_series to its one-based branch (step N+1 can't match, so the
+    zero-based W&B heuristic never misfires on these frames)."""
+    if not path.is_file() or path.stat().st_size == 0:
+        return None
+    try:
+        w = normalize_online_frame(pd.read_json(path, lines=True))
+    except (ValueError, SystemExit) as exc:
+        print(f"{path.name}: unusable metrics file ({exc}); falling back to step: lines")
+        return None
+    w = w[w["step"].isin(log_df.step)].reset_index(drop=True)
+    if not log_df.step.isin(w["step"]).all():
+        print(f"{path.name}: covers {len(w)}/{len(log_df)} log steps; falling back to step: lines")
+        return None
+    return w
+
+
+def load_metrics_frames(record_dir: Path, logs: dict[str, dict]) -> list[pd.DataFrame] | None:
     """Per-seed metrics_seed<seed>.jsonl written by speedrun.py's RunLogger — the offline
     stand-in for fetch_wandb_history (record runs are --no-wandb). All-or-nothing: every
-    seed log must have its metrics file, else fall back to the filtered step: lines."""
-    paths = [record_dir / f"metrics_{seed}.jsonl" for seed in seeds]
-    if not paths or not all(p.exists() for p in paths):
-        return None
-    return [normalize_online_frame(pd.read_json(p, lines=True)) for p in paths]
+    seed log must have a usable metrics file covering its steps, else fall back to the
+    filtered step: lines for every seed (mixing metrics across seeds would skew plots)."""
+    frames = []
+    for seed, log in sorted(logs.items()):
+        w = load_metrics_frame(record_dir / f"metrics_{seed}.jsonl", log["df"])
+        if w is None:
+            return None
+        frames.append(w)
+    return frames
 
 
 def fetch_wandb_history(run_paths: list[str]) -> list[pd.DataFrame]:
@@ -597,17 +630,28 @@ def _lb_minutes(time_str: str) -> float:
 
 
 def parse_leaderboard(section: str) -> list[dict]:
-    """Pull one track's record rows (num, minutes, held-out acc) from its README table."""
+    """Pull one track's record rows from its README table.
+
+    The single parser of the leaderboard tables (plot_leaderboard here plus the
+    per-track overlay in plot_track_train_solve_rate.py), so a column change only
+    has one home: num, clock (verbatim mm:ss), minutes, desc, dir (record-dir name
+    from the Log link, or None), acc."""
     text = (REPO_ROOT / "README.md").read_text()
-    block = next(s for s in re.split(r"^## ", text, flags=re.M) if s.startswith(section))
+    block = next((s for s in re.split(r"^## ", text, flags=re.M) if s.startswith(section)), None)
+    if block is None:
+        raise SystemExit(f"README.md has no '## {section}' section")
     out = []
     for line in block.splitlines():
         if not re.match(r"\|\s*\d+\s*\|", line):  # a data row: leading | <int> |
             continue
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        link = re.search(r"\(((?:llm|non_llm)/records/[^)]+?)/?\)", cells[4])
         out.append({
             "num": int(cells[0]),
+            "clock": cells[1],
             "minutes": _lb_minutes(cells[1]),
+            "desc": cells[2].replace("`", ""),
+            "dir": Path(link.group(1)).name if link else None,
             "acc": float(re.search(r"[\d.]+", cells[5]).group()),
         })
     return sorted(out, key=lambda r: r["num"])
@@ -904,7 +948,7 @@ def main() -> None:
         if len(online_frames) != len(seeds):
             raise SystemExit(f"got {len(online_frames)} W&B runs for {len(seeds)} seed logs")
     else:
-        online_frames = load_metrics_frames(args.record_dir, seeds)
+        online_frames = load_metrics_frames(args.record_dir, record["logs"])
         if online_frames is not None:
             print(f"using metrics_seed*.jsonl for the online train metric ({len(seeds)} seed(s))")
 

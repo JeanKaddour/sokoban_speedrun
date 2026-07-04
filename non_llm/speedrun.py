@@ -899,10 +899,23 @@ class RunLogger:
         error warns once and disables the stream, never the run."""
         if self._metrics_fh is None:
             return
+        # Keep JSON scalars only (numpy scalars via float()); drop non-scalar entries
+        # per key rather than letting one bad value kill the stream (parity with the
+        # LLM track's RunLogger, whose wandb path carries a non-scalar table).
+        row = {}
+        for k, v in metrics.items():
+            if isinstance(v, (int, float, str, bool)) or v is None:
+                row[k] = v
+            else:
+                try:
+                    row[k] = float(v)
+                except (TypeError, ValueError):
+                    continue
         # Injected keys last so the one-based step (matching the step: lines) wins.
-        row = {**metrics, "step": step + 1, "record_time_s": self.record_time()}
+        row["step"] = step + 1
+        row["record_time_s"] = self.record_time()
         try:
-            self._metrics_fh.write(json.dumps(row, default=float) + "\n")
+            self._metrics_fh.write(json.dumps(row) + "\n")
             self._metrics_fh.flush()
         except Exception as exc:
             print(f"RunLogger metrics stream disabled (write failed): {exc!r}")
