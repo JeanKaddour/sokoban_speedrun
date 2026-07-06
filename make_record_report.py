@@ -17,7 +17,7 @@ Artifact-only mode needs nothing beyond the committed record directory
 the args attestation straight from the run logs, so any reviewer can regenerate the
 plots from the PR alone. --wandb-runs fetches the train solve-rate metric from W&B;
 if your metrics live elsewhere, anything that yields
-(step, online_solved_frac) can be adapted — see fetch_wandb_history for the expected shape.
+(step, record/online_solved_frac) can be adapted — see fetch_wandb_history for the expected shape.
 
 The record README is written with the human-authored sections preserved: everything
 between the AUTO markers is regenerated, everything outside them is never touched.
@@ -77,8 +77,7 @@ TARGET_C = "#ff7b72"  # target / threshold lines (warm coral)
 SEED_COLORS = ["#22d3ee", "#fbbf24", "#a78bfa"]  # cyan / amber / violet — pop on dark
 DASH = (0, (5, 4))    # shared dashed style for reference lines
 SMOOTH = 8            # rolling window for the bold trend line
-ONLINE_METRIC = "reward/online_solved_frac_unfiltered"
-ONLINE_METRIC_ALIASES = (ONLINE_METRIC, "online_solved_frac", "online_solve_rate")
+ONLINE_METRIC = "record/online_solved_frac"
 ONLINE_TRAIN_LABEL = "train solve rate"
 FILTERED_TRAIN_LABEL = "filtered accepted-train diagnostic"
 
@@ -148,20 +147,12 @@ def normalize_wandb_run(run_path: str) -> str:
     raise SystemExit(f"could not parse W&B run URL: {run_path}")
 
 
-def online_metric_col(df: pd.DataFrame) -> str:
-    for col in ONLINE_METRIC_ALIASES:
-        if col in df.columns:
-            return col
-    raise SystemExit(
-        f"online metric history needs one of {', '.join(ONLINE_METRIC_ALIASES)}"
-    )
-
-
 def normalize_online_frame(df: pd.DataFrame) -> pd.DataFrame:
     if "step" not in df.columns:
         raise SystemExit("online metric history needs a step column")
-    col = online_metric_col(df)
-    out = df[["step", col]].dropna().rename(columns={col: ONLINE_METRIC}).copy()
+    if ONLINE_METRIC not in df.columns:
+        raise SystemExit(f"online metric history needs a {ONLINE_METRIC} column")
+    out = df[["step", ONLINE_METRIC]].dropna().copy()
     out["step"] = out["step"].astype(int)
     out[ONLINE_METRIC] = out[ONLINE_METRIC].astype(float)
     # kind="stable": the default quicksort reorders equal keys, which would make

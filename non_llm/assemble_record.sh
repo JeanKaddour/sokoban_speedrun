@@ -130,6 +130,7 @@ fi
 mkdir -p "$DEST"
 cp "$stage/$log_name"  "$DEST/train_log_seed${TRAIN_SEED}.txt"
 cp "$stage/$eval_json" "$DEST/eval_seed${TRAIN_SEED}.json"
+rm -f "$DEST/metrics_seed${TRAIN_SEED}.jsonl"
 [ -f "$stage/metrics.jsonl" ] && \
   cp "$stage/metrics.jsonl" "$DEST/metrics_seed${TRAIN_SEED}.jsonl"
 if [ -f "$stage/source/speedrun.py" ]; then

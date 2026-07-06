@@ -885,13 +885,16 @@ class RunLogger:
             self._fh.write(line + "\n")
             self._fh.flush()
 
-    def log_step(self, step, num_steps, *, reward_mean, solved_frac, loss, grad_norm):
+    def log_step(self, step, num_steps, metrics: dict):
         rt = self.record_time()
         self._write(f"step:{step + 1}/{num_steps} record_time:{rt:.1f}s step_avg:{rt / (step + 1):.1f}s "
-                    f"reward_mean:{max(0.0, reward_mean):.4f} solved_frac:{solved_frac:.4f} "
-                    f"loss:{loss:.4f} grad_norm:{grad_norm:.4f}")
+                    f"reward_mean:{max(0.0, metrics['record/reward_mean']):.4f} "
+                    f"solved_frac:{metrics['record/solved_frac']:.4f} "
+                    f"loss:{metrics['record/loss']:.4f} "
+                    f"grad_norm:{metrics['record/grad_norm']:.4f}")
+        self._write_metrics(step, metrics)
 
-    def log_metrics(self, step, metrics: dict):
+    def _write_metrics(self, step, metrics: dict):
         """Append one JSON row of per-step metrics (W&B key names) to metrics.jsonl.
 
         Record runs are --no-wandb, so this file is the offline metrics channel: the
@@ -1031,25 +1034,28 @@ def train(cfg: argparse.Namespace) -> Path:
             logger.stop_clock(time.monotonic())
         elog = env.log()
         solved = float(elog.get("perf", 0.0))
-        logger.log_step(it, total_iters, reward_mean=float(elog.get("targets_hit", 0.0)),
-                        solved_frac=solved, loss=float(stats["policy"] + cfg.vf_coef * stats["value"]),
-                        grad_norm=float(stats["grad_norm"]))
+        loss = float(stats["policy"] + cfg.vf_coef * stats["value"])
         sps = global_step / max(1e-6, logger.record_time())
+        targets_hit = float(elog.get("targets_hit", 0.0))
+        grad_norm = float(stats["grad_norm"])
         metrics = {
+            "record/reward_mean": targets_hit,
+            "record/solved_frac": solved,
+            "record/loss": loss,
+            "record/grad_norm": grad_norm,
+            "record/online_solved_frac": solved,
             "train/solved_frac": solved,
-            # Alias recognized by make_record_report's ONLINE_METRIC_ALIASES — this
-            # track's solve rate is unfiltered (every episode counts), so it IS online.
-            "online_solved_frac": solved,
-            "train/targets_hit": float(elog.get("targets_hit", 0.0)),
+            "train/targets_hit": targets_hit,
             "train/episode_return": float(elog.get("episode_return", 0.0)),
+            "loss": loss,
             "loss/policy": stats["policy"], "loss/value": stats["value"], "loss/entropy": stats["entropy"],
             "loss/approx_kl": stats["approx_kl"], "loss/clipfrac": stats["clipfrac"],
-            "opt/grad_norm": stats["grad_norm"], "opt/lr": optimizer.param_groups[0]["lr"],
+            "opt/grad_norm": grad_norm, "opt/lr": optimizer.param_groups[0]["lr"],
             "perf/sps": sps, "perf/record_time_s": logger.record_time(),
             "epoch": it + 1,
         }
         wandb_run.log(metrics, step=global_step)
-        logger.log_metrics(it, metrics)
+        logger.log_step(it, total_iters, metrics)
         if it % max(1, cfg.print_every) == 0 or it == total_iters - 1:
             print(f"  iter {it + 1}/{total_iters} gstep={global_step:,} solved={solved:.3f} "
                   f"ent={stats['entropy']:.3f} kl={stats['approx_kl']:.4f} gnorm={stats['grad_norm']:.2f} "
