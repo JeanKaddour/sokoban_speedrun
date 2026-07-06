@@ -98,6 +98,11 @@ if [ "$SOURCE" = modal ]; then
   else
     echo ">> source snapshot not found in run output; report generation will backfill from train log"
   fi
+  if modal volume get "$VOL" "/outputs/$RUN/metrics.jsonl" "$stage/" --force; then
+    echo ">> pulled metrics.jsonl"
+  else
+    echo ">> metrics.jsonl not found in run output (pre-metrics run); plots fall back to step: lines"
+  fi
 else
   run_dir="$LOCAL_OUTPUTS/$RUN"
   [ -d "$run_dir" ] || {
@@ -139,6 +144,7 @@ else
     echo ">> WARN: no rollouts beside the eval JSON — verify_record will skip re-scoring"
   fi
   cp "$log_path" "$stage/$log_name"
+  [ -f "$run_dir/metrics.jsonl" ] && cp "$run_dir/metrics.jsonl" "$stage/metrics.jsonl"
   if [ -z "$VERIFY_OF" ] && [ -f "$run_dir/final_rollouts.jsonl.gz" ]; then
     cp "$run_dir/final_rollouts.jsonl.gz" "$stage/final_rollouts.jsonl.gz"
   fi
@@ -166,6 +172,9 @@ fi
 mkdir -p "$DEST"
 cp "$stage/$log_name"  "$DEST/train_log_seed${TRAIN_SEED}.txt"
 cp "$stage/$eval_json" "$DEST/eval_seed${TRAIN_SEED}.json"
+rm -f "$DEST/metrics_seed${TRAIN_SEED}.jsonl"
+[ -f "$stage/metrics.jsonl" ] && \
+  cp "$stage/metrics.jsonl" "$DEST/metrics_seed${TRAIN_SEED}.jsonl"
 [ -n "$eval_roll" ] && [ -f "$stage/$eval_roll" ] && \
   cp "$stage/$eval_roll" "$DEST/eval_seed${TRAIN_SEED}.rollouts.jsonl.gz"
 [ -z "$VERIFY_OF" ] && [ -f "$stage/final_rollouts.jsonl.gz" ] && \

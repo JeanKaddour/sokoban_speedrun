@@ -2208,6 +2208,7 @@ class RunLogger:
 
     def __init__(self, run_dir: Path, args: argparse.Namespace, enabled: bool) -> None:
         self._fh = None
+        self._metrics_fh = None
         self._queue: queue.Queue[str | object] | None = None
         self._thread: threading.Thread | None = None
         self._t0: float | None = None
@@ -2222,6 +2223,9 @@ class RunLogger:
             self._fh = self.path.open("w", encoding="utf-8")
             self._fh.write(self._header(args, source, source_sha256))
             self._fh.flush()
+            # Append (not truncate): a relaunch reusing the run name keeps the crashed
+            # attempt's rows for autopsies; consumers dedupe on step (keep="last").
+            self._metrics_fh = (run_dir / "metrics.jsonl").open("a", encoding="utf-8")
             self._queue = queue.Queue()
             self._thread = threading.Thread(target=self._writer_main, name="runlogger-writer", daemon=True)
             self._thread.start()
@@ -2345,11 +2349,49 @@ class RunLogger:
         rt = self.record_time()
         self._write(
             f"step:{step + 1}/{num_steps} record_time:{rt:.1f}s step_avg:{rt / (step + 1):.1f}s "
-            f"reward_mean:{metrics.get('reward/mean', float('nan')):.4f} "
-            f"solved_frac:{metrics.get('reward/solved_frac', float('nan')):.4f} "
-            f"loss:{metrics.get('loss', float('nan')):.4f} "
-            f"grad_norm:{metrics.get('grad_norm', float('nan')):.4f}"
+            f"reward_mean:{metrics['record/reward_mean']:.4f} "
+            f"solved_frac:{metrics['record/solved_frac']:.4f} "
+            f"loss:{metrics['record/loss']:.4f} "
+            f"grad_norm:{metrics['record/grad_norm']:.4f} "
+            f"online_solved:{metrics['record/online_solved_frac']:.4f}"
         )
+        self._write_metrics(step, metrics)
+
+    def _write_metrics(self, step: int, metrics: dict) -> None:
+        """Append one JSON row of per-step metrics (W&B key names) to metrics.jsonl.
+
+        Record runs are --no-wandb, so this file is the offline metrics channel: the
+        report tooling prefers it over the coarser step: lines (which only carry the
+        filtered accepted-batch diagnostic). Fail-open like the text log: a write
+        error warns once and disables the stream, never the run."""
+        fh = self._metrics_fh
+        if fh is None:
+            return
+        # Keep JSON scalars only (numpy scalars via float()); drop non-scalar entries
+        # per key — wandb-enabled runs put a wandb.Table in metrics (rollouts_live),
+        # which must not poison json.dumps and kill the stream for the whole run.
+        row = {}
+        for k, v in metrics.items():
+            if isinstance(v, (int, float, str, bool)) or v is None:
+                row[k] = v
+            else:
+                try:
+                    row[k] = float(v)
+                except (TypeError, ValueError):
+                    continue
+        # Injected keys last so the one-based step (matching the step: lines) wins.
+        row["step"] = step + 1
+        row["record_time_s"] = self.record_time()
+        try:
+            fh.write(json.dumps(row) + "\n")
+            fh.flush()
+        except Exception as exc:
+            print0(f"RunLogger metrics stream disabled (write failed): {exc!r}")
+            try:
+                fh.close()
+            except Exception:
+                pass
+            self._metrics_fh = None
 
     def log_final_checkpoint(self, checkpoint_dir: Path) -> None:
         self._write(f"final_checkpoint:{checkpoint_dir} record_time:{self.record_time():.1f}s")
@@ -2374,6 +2416,12 @@ class RunLogger:
             except Exception:
                 pass
             self._fh = None
+        if self._metrics_fh is not None:
+            try:
+                self._metrics_fh.close()
+            except Exception:
+                pass
+            self._metrics_fh = None
 
 
 # ============================ TRAINING PIPELINE ============================
@@ -3025,9 +3073,17 @@ def run_pipeline(
                     band_vals.setdefault(band, []).append(r)
         band_metrics = {f"reward/band_{b}": sum(v) / len(v) for b, v in band_vals.items()}
         band_metrics.update({f"reward/band_{b}_n": float(len(v)) for b, v in band_vals.items()})
+        reward_mean = float(rewards_all.mean())
+        solved_frac = float((rewards_all >= 1.0 - 1e-9).float().mean())
+        online_solved_frac = cs.samples_solved_total / max(1, cs.samples_seen_total)
         metrics = {
             **band_metrics,
             "step": step, "lr": lr, "weight_version": current_version,
+            "record/reward_mean": reward_mean,
+            "record/solved_frac": solved_frac,
+            "record/loss": loss_sum,
+            "record/grad_norm": float(grad_norm),
+            "record/online_solved_frac": online_solved_frac,
             "groups/used": cs.puzzles_used,
             "groups/zero_variance_dropped": cs.groups_zero_variance,
             "groups/zero_variance_allfail": cs.groups_zv_allfail,
@@ -3041,13 +3097,11 @@ def run_pipeline(
             "groups/acceptance_ratio": cs.puzzles_used / max(1, cs.groups_seen_total),
             "groups/consecutive_rejected_max": cs.consecutive_rejected_max,
             "seqs": n_seqs,
-            "reward/mean": float(rewards_all.mean()),
+            "reward/mean": reward_mean,
             "reward/std": float(rewards_all.std(unbiased=False)),
-            "reward/solved_frac": float((rewards_all >= 1.0 - 1e-9).float().mean()),
+            "reward/solved_frac": solved_frac,
             "reward/group_pass_at_k": float(sum(cs.group_solved) / max(1, len(cs.group_solved))),
-            # Unbiased proxies over all fresh generated groups (pre-filter). Use these,
-            # not solved_frac/group_pass_at_k, to gauge live progress; see run_held_out_eval.
-            "reward/online_solved_frac_unfiltered": cs.samples_solved_total / max(1, cs.samples_seen_total),
+            # Unbiased group proxy over all fresh generated groups (pre-filter).
             "reward/online_group_any_solved_unfiltered": cs.groups_any_solved_total / max(1, cs.groups_seen_total),
             "reward/answer_rate": answer_rate,
             "reward/solve_given_answer": solve_given_answer,
