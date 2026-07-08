@@ -17,10 +17,10 @@ Fastest recipes to RL models to solve Sokoban to a held-out target on one node:
 | #   | Record time (mm:ss) | Description                        | Date       | Log                                                          | held-out pass@1         | Contributors |
 | --- | ------------------- | ---------------------------------- | ---------- | ------------------------------------------------------------ | ----------------------- | ------------ |
 | 1   | 48:53               | GRPO, LR 1.6e-6 annealed, 75 steps | 2026-06-29 | [llm/records/2026-06-29_01](llm/records/2026-06-29_01_grpo/) | 0.869 (CI [0.83, 0.90]) | @JeanKaddour |
-| 2   | 36:53               | GRPO, LR 1.6e-6 annealed, 60 steps | 2026-06-29 | [llm/records/2026-06-29_02](llm/records/2026-06-29_02_grpo_60step/) | 0.843 (CI [0.81, 0.88]) | @dexhunter   |
-| 3   | 35:29               | GRPO, LR 1.6e-6 annealed, 54 steps | 2026-07-02 | [llm/records/2026-07-02_01](llm/records/2026-07-02_01_grpo_54step/) | 0.860 (CI [0.83, 0.89]) | @dexhunter   |
-| 4 | 33:40 | GRPO + Weco advantage shaping, 52 steps | 2026-07-02 | [llm/records/2026-07-02_02](llm/records/2026-07-02_02_weco_strategy_52step/) | 0.866 (CI [0.83, 0.90]) | @dexhunter |
-| 5 | 26:27 | GRPO + Weco shaping, 4800-token rollouts, 48 steps | 2026-07-02 | [llm/records/2026-07-02_03](llm/records/2026-07-02_03_grpo_48step/) | 0.848 (CI [0.82, 0.88]) | @lorenzflow |
+| 2   | 36:53               | steps + LR-decay horizon 75 → 60   | 2026-06-29 | [llm/records/2026-06-29_02](llm/records/2026-06-29_02_grpo_60step/) | 0.843 (CI [0.81, 0.88]) | @dexhunter   |
+| 3   | 35:29               | earlier stop: 54 steps             | 2026-07-02 | [llm/records/2026-07-02_01](llm/records/2026-07-02_01_grpo_54step/) | 0.860 (CI [0.83, 0.89]) | @dexhunter   |
+| 4 | 33:40 | Weco advantage shaping, 52 steps | 2026-07-02 | [llm/records/2026-07-02_02](llm/records/2026-07-02_02_weco_strategy_52step/) | 0.866 (CI [0.83, 0.90]) | @dexhunter |
+| 5 | 26:27 | rollout budget 5632 → 4800 tokens, 48 steps | 2026-07-02 | [llm/records/2026-07-02_03](llm/records/2026-07-02_03_grpo_48step/) | 0.848 (CI [0.82, 0.88]) | @lorenzflow |
 
 
 ### Rules
