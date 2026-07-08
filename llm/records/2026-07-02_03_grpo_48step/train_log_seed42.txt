@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import gzip
 import hashlib
+import importlib
 import json
 import math
 import os
@@ -79,9 +80,9 @@ WANDB_PROJECT = "sokoban-speedrun-llm"
 # ============================ RUN RECIPE (single source of truth) ============================
 # The benchmark sprint recipe lives here as a top-level constant. main() PREPENDS it to the CLI
 # args, so the same hyperparameters apply to local launches and Modal. Any flag passed on the CLI
-# appears AFTER the recipe and therefore OVERRIDES the recipe value (argparse last-wins). --run and
-# --seed are deliberately NOT here (they vary per launch); --max-steps IS here (= the current
-# record's step count) so it stays a CLI override for probes and longer runs.
+# appears AFTER the recipe and therefore OVERRIDES the recipe value (argparse last-wins). --run is
+# deliberately NOT here (it varies per launch); --max-steps IS here (75 = the record's step count)
+# so it stays a CLI override for probes and longer runs.
 # --eval-data stays in the recipe because --verify-datasets-only validates both train and eval sets.
 # TRAINER COUNT: the 8-GPU node runs NTRAINERS=3 (3 trainer ranks + 5 vLLM generators) — the sweet
 # spot: generation keeps the async buffer full while the trainer is compute-bound, and a 4th trainer
@@ -97,8 +98,8 @@ RECIPE = [
     "--num-samples", "8",
     "--temperature", "0.8",
     "--top-p", "0.95",
-    "--max-new-tokens", "4800",  # record 5: shorter thinking budget is the speed lever (~32.5s/step vs ~39s)
-    "--max-model-len", "6144",
+    "--max-new-tokens", "5632",
+    "--max-model-len", "7168",
     "--device-batch-size", "2",   # 4B fp32 params+grads+optimizer fit one 80GB H100 at db=2 (microbatch only, grad-identical)
     "--logits-chunk-size", "2048",
     "--gradient-checkpointing",
@@ -110,14 +111,9 @@ RECIPE = [
     "--warmup-steps", "5",
     "--lr-schedule", "linear",
     "--min-lr-frac", "0.15",
-    "--lr-decay-steps", "60",
-    "--max-steps", "48",          # the record's step count; override on the CLI for probes/longer runs
+    "--lr-decay-steps", "90",
+    "--max-steps", "75",          # the record's step count; override on the CLI for probes/longer runs
     "--grad-clip", "1.0",
-    "--loss-fn", "grpo",          # record 4: PPO-clip GRPO (advantage-mode auto-resolves to 'grpo')
-    "--adv-centered-blend", "0.04",    # record 4: Weco advantage shaping (see shape_group_advantages)
-    "--adv-difficulty-weight", "0.18",
-    "--adv-difficulty-ramp", "1.0",
-    "--adv-variance-boost", "1.1",
     "--cispo-eps", "4.0",
     "--loss-normalization", "sequence",  # sample-level (GRPO).
     "--max-staleness", "4",          # less off-policy than ScaleRL's 8; a proven stability lever
@@ -2019,6 +2015,89 @@ def batch_normalize_advantages(advantages: torch.Tensor, eps: float = 1e-6) -> t
     return advantages / (std + eps)
 
 
+_STRATEGY_MODULE: Any | None = None
+_STRATEGY_MODULE_LOADED = False
+
+
+def _load_strategy_module() -> Any | None:
+    """Load an optional local strategy module for record experiments."""
+    global _STRATEGY_MODULE, _STRATEGY_MODULE_LOADED
+    if _STRATEGY_MODULE_LOADED:
+        return _STRATEGY_MODULE
+    _STRATEGY_MODULE_LOADED = True
+    module_name = os.environ.get("SOKOBAN_STRATEGY_MODULE", "").strip()
+    if not module_name:
+        return None
+    _STRATEGY_MODULE = importlib.import_module(module_name)
+    return _STRATEGY_MODULE
+
+
+def _coerce_strategy_advantages(value: Any, reference: torch.Tensor) -> torch.Tensor:
+    if value is None:
+        return reference
+    if isinstance(value, torch.Tensor):
+        out = value.to(device=reference.device, dtype=torch.float32)
+    else:
+        out = torch.as_tensor(value, dtype=torch.float32, device=reference.device)
+    if out.shape != reference.shape:
+        raise ValueError(f"strategy advantage shape {tuple(out.shape)} != {tuple(reference.shape)}")
+    if not torch.isfinite(out).all():
+        raise ValueError("strategy returned non-finite advantages")
+    return out
+
+
+def apply_strategy_advantages(
+    rewards: torch.Tensor,
+    advantages: torch.Tensor,
+    *,
+    mode: str,
+    step: int,
+    num_steps: int,
+    group_index: int,
+    puzzle_id: int,
+) -> torch.Tensor:
+    strategy = _load_strategy_module()
+    fn = getattr(strategy, "transform_group_advantages", None) if strategy is not None else None
+    if not callable(fn):
+        return advantages
+    updated = fn(
+        rewards.detach().clone(),
+        advantages.detach().clone(),
+        mode=mode,
+        step=step,
+        num_steps=num_steps,
+        group_index=group_index,
+        puzzle_id=puzzle_id,
+    )
+    return _coerce_strategy_advantages(updated, advantages)
+
+
+def apply_strategy_group_filter(
+    rewards: torch.Tensor,
+    advantages: torch.Tensor,
+    *,
+    default_train: bool,
+    step: int,
+    num_steps: int,
+    group_index: int,
+    puzzle_id: int,
+) -> bool:
+    strategy = _load_strategy_module()
+    fn = getattr(strategy, "should_train_group", None) if strategy is not None else None
+    if not callable(fn):
+        return default_train
+    decision = fn(
+        rewards.detach().clone(),
+        advantages.detach().clone(),
+        default_train=default_train,
+        step=step,
+        num_steps=num_steps,
+        group_index=group_index,
+        puzzle_id=puzzle_id,
+    )
+    return default_train if decision is None else bool(decision)
+
+
 def compute_group_advantages(rewards: torch.Tensor, mode: str = "centered") -> torch.Tensor:
     """Per-group advantages from one puzzle group's rewards.
 
@@ -2061,45 +2140,6 @@ def group_has_signal(rewards, eps: float = 1e-8) -> bool:
     if r.numel() == 0:
         return False
     return bool((r.max() - r.min()).item() > eps)
-
-
-def shape_group_advantages(
-    rewards: torch.Tensor,
-    advantages: torch.Tensor,
-    *,
-    step: int,
-    num_steps: int,
-    centered_blend: float = 0.0,
-    difficulty_weight: float = 0.0,
-    difficulty_ramp: float = 1.0,
-    variance_boost: float = 0.0,
-) -> torch.Tensor:
-    """Domain-agnostic per-group advantage shaping (from @dexhunter's Weco method search, PR #5).
-
-    Three terms applied in order on top of compute_group_advantages; each is a no-op at its
-    default, so all-defaults returns `advantages` unchanged (byte-identical baseline):
-    1. centered_blend b: adv = (1-b)*adv + b*(r - mean(r)) — blends back the plain
-       reward-centered signal, re-injecting the reward-scale information the grpo per-group
-       std division discards.
-    2. difficulty_weight w: adv *= 1 + w*ramp*(1 - mean(r)) with ramp = (1-difficulty_ramp)
-       + difficulty_ramp*(step+1)/num_steps — up-weights hard (low-mean-reward) groups for
-       w > 0, increasingly so through training when difficulty_ramp is 1.
-    3. variance_boost v: adv *= 1 + v*var(r) (unbiased) — up-weights mixed success/failure
-       groups, prioritizing the learning frontier where the model is uncertain.
-
-    The scales in 2/3 are >= 1 for non-negative w/v and the blend in 1 preserves each
-    group's signal/no-signal status, so the zero-variance filter's group_has_signal(rewards)
-    decision is unaffected by shaping."""
-    out = advantages
-    if centered_blend:
-        out = (1.0 - centered_blend) * out + centered_blend * (rewards - rewards.mean())
-    if difficulty_weight:
-        progress = (step + 1) / max(1, num_steps)
-        ramp = (1.0 - difficulty_ramp) + difficulty_ramp * progress
-        out = out * (1.0 + difficulty_weight * ramp * (1.0 - rewards.mean()))
-    if variance_boost and rewards.numel() > 1:
-        out = out * (1.0 + variance_boost * rewards.var())
-    return out
 
 
 def is_fresh_enough(example_version: int, current_version: int, max_staleness: int) -> bool:
@@ -2197,8 +2237,8 @@ def _git_commit() -> str | None:
 class RunLogger:
     """Self-contained record log, modded-nanogpt style: rank 0 writes outputs/<run>/log_<8hex>.txt
     holding the full script source, environment attestation (versions, git commit, nvidia-smi,
-    argv/config), per-step record-clock lines, and a final line stamped with
-    the final training-update time — one file proves what ran, on what, with what result.
+    argv/config), per-step record-clock lines, and a final line stamped when
+    the final checkpoint finishes writing — one file proves what ran, on what, with what result.
     The record clock starts at the START of the first training step (startup is untimed; see the
     README rules). Disabled instances (non-rank-0) are inert, and logging can never crash a run:
     every I/O failure prints a warning and permanently disables the logger."""
@@ -2208,11 +2248,9 @@ class RunLogger:
 
     def __init__(self, run_dir: Path, args: argparse.Namespace, enabled: bool) -> None:
         self._fh = None
-        self._metrics_fh = None
         self._queue: queue.Queue[str | object] | None = None
         self._thread: threading.Thread | None = None
         self._t0: float | None = None
-        self._t1: float | None = None
         if not enabled:
             return
         try:
@@ -2223,9 +2261,6 @@ class RunLogger:
             self._fh = self.path.open("w", encoding="utf-8")
             self._fh.write(self._header(args, source, source_sha256))
             self._fh.flush()
-            # Append (not truncate): a relaunch reusing the run name keeps the crashed
-            # attempt's rows for autopsies; consumers dedupe on step (keep="last").
-            self._metrics_fh = (run_dir / "metrics.jsonl").open("a", encoding="utf-8")
             self._queue = queue.Queue()
             self._thread = threading.Thread(target=self._writer_main, name="runlogger-writer", daemon=True)
             self._thread.start()
@@ -2281,6 +2316,7 @@ class RunLogger:
                 env_lines.append(f"{pkg}: unknown")
         env_lines.append(f"git commit: {_git_commit()}")
         env_lines.append(f"GENERATOR_GC_COLLECT_EVERY: {GENERATOR_GC_COLLECT_EVERY}")
+        env_lines.append(f"SOKOBAN_STRATEGY_MODULE: {os.environ.get('SOKOBAN_STRATEGY_MODULE', '')}")
         if source_sha256:
             env_lines.append(f"source snapshot: source/speedrun.py sha256:{source_sha256}")
         else:
@@ -2336,62 +2372,18 @@ class RunLogger:
         if self._t0 is None:
             self._t0 = anchor
 
-    def stop_clock(self, anchor: float) -> None:
-        if self._t1 is None:
-            self._t1 = anchor
-
     def record_time(self) -> float:
-        if self._t0 is None:
-            return 0.0
-        return (self._t1 if self._t1 is not None else time.monotonic()) - self._t0
+        return time.monotonic() - self._t0 if self._t0 is not None else 0.0
 
     def log_step(self, step: int, num_steps: int, metrics: dict) -> None:
         rt = self.record_time()
         self._write(
             f"step:{step + 1}/{num_steps} record_time:{rt:.1f}s step_avg:{rt / (step + 1):.1f}s "
-            f"reward_mean:{metrics['record/reward_mean']:.4f} "
-            f"solved_frac:{metrics['record/solved_frac']:.4f} "
-            f"loss:{metrics['record/loss']:.4f} "
-            f"grad_norm:{metrics['record/grad_norm']:.4f} "
-            f"online_solved:{metrics['record/online_solved_frac']:.4f}"
+            f"reward_mean:{metrics.get('reward/mean', float('nan')):.4f} "
+            f"solved_frac:{metrics.get('reward/solved_frac', float('nan')):.4f} "
+            f"loss:{metrics.get('loss', float('nan')):.4f} "
+            f"grad_norm:{metrics.get('grad_norm', float('nan')):.4f}"
         )
-        self._write_metrics(step, metrics)
-
-    def _write_metrics(self, step: int, metrics: dict) -> None:
-        """Append one JSON row of per-step metrics (W&B key names) to metrics.jsonl.
-
-        Record runs are --no-wandb, so this file is the offline metrics channel: the
-        report tooling prefers it over the coarser step: lines (which only carry the
-        filtered accepted-batch diagnostic). Fail-open like the text log: a write
-        error warns once and disables the stream, never the run."""
-        fh = self._metrics_fh
-        if fh is None:
-            return
-        # Keep JSON scalars only (numpy scalars via float()); drop non-scalar entries
-        # per key — wandb-enabled runs put a wandb.Table in metrics (rollouts_live),
-        # which must not poison json.dumps and kill the stream for the whole run.
-        row = {}
-        for k, v in metrics.items():
-            if isinstance(v, (int, float, str, bool)) or v is None:
-                row[k] = v
-            else:
-                try:
-                    row[k] = float(v)
-                except (TypeError, ValueError):
-                    continue
-        # Injected keys last so the one-based step (matching the step: lines) wins.
-        row["step"] = step + 1
-        row["record_time_s"] = self.record_time()
-        try:
-            fh.write(json.dumps(row) + "\n")
-            fh.flush()
-        except Exception as exc:
-            print0(f"RunLogger metrics stream disabled (write failed): {exc!r}")
-            try:
-                fh.close()
-            except Exception:
-                pass
-            self._metrics_fh = None
 
     def log_final_checkpoint(self, checkpoint_dir: Path) -> None:
         self._write(f"final_checkpoint:{checkpoint_dir} record_time:{self.record_time():.1f}s")
@@ -2416,12 +2408,6 @@ class RunLogger:
             except Exception:
                 pass
             self._fh = None
-        if self._metrics_fh is not None:
-            try:
-                self._metrics_fh.close()
-            except Exception:
-                pass
-            self._metrics_fh = None
 
 
 # ============================ TRAINING PIPELINE ============================
@@ -2930,13 +2916,16 @@ def run_pipeline(
             rewards = [sample.reward for sample in processed_samples]
             fins = [sample.finish_reason for sample in processed_samples]
             rewards_t = torch.tensor(rewards, dtype=torch.float32)
+            group_index = cs.groups_seen_total
             adv = compute_group_advantages(rewards_t, args.advantage_mode)
-            adv = shape_group_advantages(
-                rewards_t, adv, step=step, num_steps=num_steps,
-                centered_blend=args.adv_centered_blend,
-                difficulty_weight=args.adv_difficulty_weight,
-                difficulty_ramp=args.adv_difficulty_ramp,
-                variance_boost=args.adv_variance_boost,
+            adv = apply_strategy_advantages(
+                rewards_t,
+                adv,
+                mode=args.advantage_mode,
+                step=step,
+                num_steps=num_steps,
+                group_index=group_index,
+                puzzle_id=pid,
             )
             adv_values = adv.tolist()
             # Unbiased online proxy (before any filter): solved == reward 1.0, matching evaluate().
@@ -2954,7 +2943,20 @@ def run_pipeline(
             cs.samples_interrupted_total += sum(interrupted)
             cs.samples_interrupted_answered_total += sum(
                 1 for s, was in zip(processed_samples, interrupted) if was and s.moves is not None)
-            is_zero_var = args.zero_variance_filter and not group_has_signal(rewards)
+            if os.environ.get("SOKOBAN_STRATEGY_MODULE"):
+                default_train_group = group_has_signal(adv)
+            else:
+                default_train_group = group_has_signal(rewards)
+            train_group = apply_strategy_group_filter(
+                rewards_t,
+                adv,
+                default_train=default_train_group,
+                step=step,
+                num_steps=num_steps,
+                group_index=group_index,
+                puzzle_id=pid,
+            )
+            is_zero_var = args.zero_variance_filter and not train_group
             t_log_start = time.monotonic()
             if rollout_stream_q is not None:
                 # Dict building only — the gz append happens on the stream writer thread. The
@@ -3073,17 +3075,9 @@ def run_pipeline(
                     band_vals.setdefault(band, []).append(r)
         band_metrics = {f"reward/band_{b}": sum(v) / len(v) for b, v in band_vals.items()}
         band_metrics.update({f"reward/band_{b}_n": float(len(v)) for b, v in band_vals.items()})
-        reward_mean = float(rewards_all.mean())
-        solved_frac = float((rewards_all >= 1.0 - 1e-9).float().mean())
-        online_solved_frac = cs.samples_solved_total / max(1, cs.samples_seen_total)
         metrics = {
             **band_metrics,
             "step": step, "lr": lr, "weight_version": current_version,
-            "record/reward_mean": reward_mean,
-            "record/solved_frac": solved_frac,
-            "record/loss": loss_sum,
-            "record/grad_norm": float(grad_norm),
-            "record/online_solved_frac": online_solved_frac,
             "groups/used": cs.puzzles_used,
             "groups/zero_variance_dropped": cs.groups_zero_variance,
             "groups/zero_variance_allfail": cs.groups_zv_allfail,
@@ -3097,11 +3091,13 @@ def run_pipeline(
             "groups/acceptance_ratio": cs.puzzles_used / max(1, cs.groups_seen_total),
             "groups/consecutive_rejected_max": cs.consecutive_rejected_max,
             "seqs": n_seqs,
-            "reward/mean": reward_mean,
+            "reward/mean": float(rewards_all.mean()),
             "reward/std": float(rewards_all.std(unbiased=False)),
-            "reward/solved_frac": solved_frac,
+            "reward/solved_frac": float((rewards_all >= 1.0 - 1e-9).float().mean()),
             "reward/group_pass_at_k": float(sum(cs.group_solved) / max(1, len(cs.group_solved))),
-            # Unbiased group proxy over all fresh generated groups (pre-filter).
+            # Unbiased proxies over all fresh generated groups (pre-filter). Use these,
+            # not solved_frac/group_pass_at_k, to gauge live progress; see run_held_out_eval.
+            "reward/online_solved_frac_unfiltered": cs.samples_solved_total / max(1, cs.samples_seen_total),
             "reward/online_group_any_solved_unfiltered": cs.groups_any_solved_total / max(1, cs.groups_seen_total),
             "reward/answer_rate": answer_rate,
             "reward/solve_given_answer": solve_given_answer,
@@ -3234,7 +3230,7 @@ def run_pipeline(
             checkpoint_dir = save_hf_checkpoint(model, tokenizer, run_dir, step)
             print0(f"Saved checkpoint to {checkpoint_dir}")
             if step == num_steps - 1 and args.save_final:
-                # Written after the artifact exists; record_time stopped at the final training update.
+                # The record clock stops here: the final checkpoint has finished writing.
                 run_logger.log_final_checkpoint(checkpoint_dir)
         if trunc_ewma >= TRUNC_WARN_EWMA:
             print0(f"WARNING step {step}: gen/length_trunc_ewma={trunc_ewma:.3f} "
@@ -3562,8 +3558,6 @@ def run_pipeline(
             # MSG_WEIGHTS_READY below). ----
             if world_size > 1:
                 dist.barrier()
-            if master_process and not has_next_step:
-                run_logger.stop_clock(time.monotonic())
 
             # ---- push fresh weights to the generators (RANK 0 ONLY) ----
             # The step's collectives are done, so workers are blocked at the NEXT step's Phase-C
@@ -3894,28 +3888,6 @@ def build_parser() -> argparse.ArgumentParser:
                              "toward the maximum-likelihood gradient and zeroing all-fail groups. "
                              "The global batch-std rescale still applies to centered/maxrl "
                              "(preserves relative weighting, keeps LR comparable).")
-    parser.add_argument("--adv-centered-blend", type=float, default=0.0,
-                        help="Advantage shaping (@dexhunter's Weco method search, PR #5): blend fraction "
-                             "b of the plain reward-centered signal into the per-group advantages, "
-                             "adv = (1-b)*adv + b*(r - group_mean). Re-injects the reward-scale "
-                             "information the grpo std division removes. In [0, 1]; 0.0 (default) "
-                             "disables (byte-identical baseline). The Weco recipe uses 0.04.")
-    parser.add_argument("--adv-difficulty-weight", type=float, default=0.0,
-                        help="Advantage shaping: scale each group's advantages by "
-                             "1 + w*ramp*(1 - group_mean_reward), up-weighting hard (low mean reward) "
-                             "groups for w > 0; negative w emphasizes already-easy groups. 0.0 "
-                             "(default) disables. The Weco recipe uses 0.18 (with ramp 1.0, so the "
-                             "hard-group emphasis fades in linearly over the run).")
-    parser.add_argument("--adv-difficulty-ramp", type=float, default=1.0,
-                        help="Linear ramp of --adv-difficulty-weight over training: effective weight "
-                             "is w*((1-ramp) + ramp*(step+1)/num_steps). In [0, 1]; 1.0 (default) "
-                             "ramps from ~0 to full strength across the run, 0.0 applies w at full "
-                             "strength from step 1.")
-    parser.add_argument("--adv-variance-boost", type=float, default=0.0,
-                        help="Advantage shaping: scale each group's advantages by "
-                             "1 + v*var(rewards) (unbiased sample variance), boosting mixed "
-                             "success/failure groups — the learning frontier where the model is "
-                             "uncertain. 0.0 (default) disables. The Weco recipe uses 1.1.")
     parser.add_argument("--entropy-coef", type=float, default=0.0,
                         help="Entropy-bonus coefficient: adds +entropy_coef * mean H(pi) over valid "
                              "tokens to the objective (aggregated with the SAME denominator as the "
@@ -4065,10 +4037,6 @@ def _validate_pipeline_args(args: argparse.Namespace) -> None:
         raise ValueError("--adam-eps must be positive")
     if args.entropy_coef < 0:
         raise ValueError("--entropy-coef must be >= 0")
-    if not (0.0 <= args.adv_centered_blend <= 1.0):
-        raise ValueError("--adv-centered-blend must be in [0, 1]")
-    if not (0.0 <= args.adv_difficulty_ramp <= 1.0):
-        raise ValueError("--adv-difficulty-ramp must be in [0, 1]")
     if args.interrupt_min_tokens is not None or args.interrupt_max_tokens is not None:
         if not args.interruption:
             raise ValueError("--interrupt-min-tokens/--interrupt-max-tokens require --interruption")
@@ -4137,3 +4105,116 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
+
+====================================================================================================
+python: 3.12.3 (main, Mar 3 2026, 12:15:18) [GCC 13.3.0]
+torch: 2.11.0+cu130
+transformers: 5.8.1
+vllm: 0.22.0
+git commit: e17de1b2f506b8e4e9e1841e62df4999d915fd1f
+GENERATOR_GC_COLLECT_EVERY: 4
+SOKOBAN_STRATEGY_MODULE: strategy_weco_pr5
+source snapshot: source/speedrun.py sha256:520c6deabfd3c0c07958283e7ce063ba3376181710fa4c948aa4a712343965dd
+Thu Jul  2 02:38:27 2026
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.126.09             Driver Version: 580.126.09     CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA H100 80GB HBM3          On  |   00000000:0A:00.0 Off |                    0 |
+| N/A   52C    P0            130W /  700W |   16865MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA H100 80GB HBM3          On  |   00000000:18:00.0 Off |                    0 |
+| N/A   27C    P0            113W /  700W |   16869MiB /  81559MiB |    100%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA H100 80GB HBM3          On  |   00000000:2F:00.0 Off |                    0 |
+| N/A   27C    P0            111W /  700W |   16869MiB /  81559MiB |    100%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA H100 80GB HBM3          On  |   00000000:38:00.0 Off |                    0 |
+| N/A   29C    P0             70W /  700W |       4MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   4  NVIDIA H100 80GB HBM3          On  |   00000000:87:00.0 Off |                    0 |
+| N/A   29C    P0             70W /  700W |       4MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   5  NVIDIA H100 80GB HBM3          On  |   00000000:90:00.0 Off |                    0 |
+| N/A   25C    P0             70W /  700W |       4MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   6  NVIDIA H100 80GB HBM3          On  |   00000000:BE:00.0 Off |                    0 |
+| N/A   25C    P0             70W /  700W |       4MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   7  NVIDIA H100 80GB HBM3          On  |   00000000:C7:00.0 Off |                    0 |
+| N/A   28C    P0             70W /  700W |       4MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A         3684055      C   ...n_latest/llm/.venv/bin/python      16856MiB |
+|    1   N/A  N/A         3684056      C   ...n_latest/llm/.venv/bin/python      16860MiB |
+|    2   N/A  N/A         3684057      C   ...n_latest/llm/.venv/bin/python      16860MiB |
++-----------------------------------------------------------------------------------------+
+
+argv: ['/data/lorenz/sokoban_speedrun_latest/llm/speedrun.py', '--run', 'weco-pr5-tok4800-gc-s42-48', '--loss-fn', 'grpo', '--lr-decay-steps', '60', '--max-steps', '48', '--seed', '42', '--max-new-tokens', '4800', '--max-model-len', '6144', '--no-wandb', '--no-save-rollouts', '--final-rollout-steps', '0']
+args: {'model': 'Qwen/Qwen3-4B-Instruct-2507', 'trust_remote_code': False, 'device': '', 'train_data': PosixPath('datasets/sokoban_train.jsonl'), 'eval_data': PosixPath('datasets/sokoban_eval.jsonl'), 'verify_datasets_only': False, 'dtype': 'float32', 'run': 'weco-pr5-tok4800-gc-s42-48', 'wandb': False, 'output_dir': PosixPath('outputs'), 'seed': 42, 'num_epochs': 1, 'max_steps': 48, 'device_batch_size': 2, 'examples_per_step': 16, 'num_samples': 8, 'max_new_tokens': 4800, 'interruption': True, 'interrupt_answer_tokens': 512, 'interrupt_min_tokens': None, 'interrupt_max_tokens': None, 'interrupt_temperature': None, 'interrupt_top_p': None, 'interrupt_top_k': None, 'temperature': 0.8, 'top_k': 0, 'top_p': 0.95, 'learning_rate': 1.6e-06, 'optimizer': 'adamw', 'adam_eps': 1e-15, 'weight_decay': 0.01, 'init_lr_frac': 0.05, 'warmup_steps': 5, 'lr_schedule': 'linear', 'min_lr_frac': 0.15, 'lr_decay_steps': 60, 'lr_decay_start': None, 'grad_clip': 1.0, 'loss_normalization': 'sequence', 'gradient_checkpointing': True, 'compile': False, 'attn_implementation': 'flash_attention_2', 'enable_thinking': False, 'save_every': 0, 'save_final': True, 'trim_after_answer': True, 'vllm_gpu_mem_util': 0.9, 'vllm_enforce_eager': False, 'vllm_max_num_seqs': 512, 'vllm_max_num_batched_tokens': 8192, 'vllm_max_num_scheduled_tokens': None, 'vllm_max_num_partial_prefills': None, 'vllm_max_long_partial_prefills': None, 'vllm_long_prefill_token_threshold': None, 'vllm_enable_chunked_prefill': None, 'vllm_scheduler_reserve_full_isl': None, 'vllm_stream_interval': 8, 'vllm_performance_mode': None, 'inflight_requests': 64, 'max_staleness': 4, 'logits_chunk_size': 2048, 'log_entropy': False, 'train_autocast_dtype': 'bfloat16', 'debug_assert_replica_sync': False, 'loss_fn': 'grpo', 'advantage_mode': 'grpo', 'entropy_coef': 0.0, 'cispo_eps': 4.0, 'clip_eps_low': 0.2, 'clip_eps_high': 0.2, 'clip_ratio_c': 3.0, 'kl_tau': 0.0, 'max_model_len': 6144, 'zero_variance_filter': True, 'save_rollouts': False, 'wandb_rollout_samples': 20, 'final_rollout_steps': 0, 'rollout_flush_every': 10, 'auto_run_name': False}
+====================================================================================================
+step:1/48 record_time:113.5s step_avg:113.5s reward_mean:0.4258 solved_frac:0.2969 loss:0.0001 grad_norm:0.5100
+step:2/48 record_time:144.2s step_avg:72.1s reward_mean:0.5078 solved_frac:0.3984 loss:0.0001 grad_norm:0.5767
+step:3/48 record_time:175.8s step_avg:58.6s reward_mean:0.4805 solved_frac:0.3672 loss:0.0001 grad_norm:0.4159
+step:4/48 record_time:206.8s step_avg:51.7s reward_mean:0.5312 solved_frac:0.4297 loss:0.0001 grad_norm:0.3554
+step:5/48 record_time:241.3s step_avg:48.3s reward_mean:0.5117 solved_frac:0.3984 loss:0.0001 grad_norm:0.3182
+step:6/48 record_time:271.3s step_avg:45.2s reward_mean:0.5312 solved_frac:0.4609 loss:-0.0001 grad_norm:0.3349
+step:7/48 record_time:301.2s step_avg:43.0s reward_mean:0.5664 solved_frac:0.4531 loss:-0.0001 grad_norm:0.3553
+step:8/48 record_time:331.5s step_avg:41.4s reward_mean:0.6055 solved_frac:0.5781 loss:-0.0000 grad_norm:0.5878
+step:9/48 record_time:362.2s step_avg:40.2s reward_mean:0.5859 solved_frac:0.4531 loss:0.0000 grad_norm:0.3205
+step:10/48 record_time:392.8s step_avg:39.3s reward_mean:0.5586 solved_frac:0.4766 loss:-0.0002 grad_norm:0.3189
+step:11/48 record_time:424.3s step_avg:38.6s reward_mean:0.4688 solved_frac:0.3594 loss:-0.0002 grad_norm:0.5162
+step:12/48 record_time:453.0s step_avg:37.8s reward_mean:0.4648 solved_frac:0.3984 loss:-0.0001 grad_norm:0.3359
+step:13/48 record_time:483.8s step_avg:37.2s reward_mean:0.5547 solved_frac:0.4609 loss:-0.0003 grad_norm:0.3415
+step:14/48 record_time:514.2s step_avg:36.7s reward_mean:0.5586 solved_frac:0.4688 loss:-0.0001 grad_norm:0.3508
+step:15/48 record_time:544.6s step_avg:36.3s reward_mean:0.5859 solved_frac:0.5000 loss:-0.0002 grad_norm:0.3496
+step:16/48 record_time:574.8s step_avg:35.9s reward_mean:0.5664 solved_frac:0.5078 loss:-0.0002 grad_norm:0.4512
+step:17/48 record_time:603.0s step_avg:35.5s reward_mean:0.5820 solved_frac:0.5156 loss:-0.0003 grad_norm:0.3629
+step:18/48 record_time:631.5s step_avg:35.1s reward_mean:0.7109 solved_frac:0.6172 loss:-0.0002 grad_norm:0.3376
+step:19/48 record_time:662.0s step_avg:34.8s reward_mean:0.5586 solved_frac:0.4609 loss:-0.0003 grad_norm:0.3664
+step:20/48 record_time:690.7s step_avg:34.5s reward_mean:0.6641 solved_frac:0.6094 loss:-0.0000 grad_norm:0.3670
+step:21/48 record_time:720.9s step_avg:34.3s reward_mean:0.6250 solved_frac:0.5312 loss:-0.0001 grad_norm:0.4341
+step:22/48 record_time:750.8s step_avg:34.1s reward_mean:0.6055 solved_frac:0.5391 loss:-0.0003 grad_norm:0.3283
+step:23/48 record_time:779.9s step_avg:33.9s reward_mean:0.6875 solved_frac:0.5938 loss:-0.0001 grad_norm:0.3142
+step:24/48 record_time:811.6s step_avg:33.8s reward_mean:0.5273 solved_frac:0.4688 loss:-0.0001 grad_norm:0.3390
+step:25/48 record_time:840.8s step_avg:33.6s reward_mean:0.7109 solved_frac:0.6484 loss:-0.0002 grad_norm:0.3391
+step:26/48 record_time:872.1s step_avg:33.5s reward_mean:0.6289 solved_frac:0.5859 loss:-0.0002 grad_norm:0.3190
+step:27/48 record_time:901.4s step_avg:33.4s reward_mean:0.6641 solved_frac:0.5859 loss:-0.0003 grad_norm:0.3456
+step:28/48 record_time:931.7s step_avg:33.3s reward_mean:0.6992 solved_frac:0.6406 loss:-0.0001 grad_norm:0.3241
+step:29/48 record_time:961.1s step_avg:33.1s reward_mean:0.8086 solved_frac:0.7344 loss:-0.0002 grad_norm:0.5669
+step:30/48 record_time:992.1s step_avg:33.1s reward_mean:0.6484 solved_frac:0.5547 loss:-0.0004 grad_norm:0.3266
+step:31/48 record_time:1020.5s step_avg:32.9s reward_mean:0.6484 solved_frac:0.6172 loss:-0.0002 grad_norm:0.3627
+step:32/48 record_time:1051.8s step_avg:32.9s reward_mean:0.5703 solved_frac:0.4922 loss:-0.0002 grad_norm:0.4702
+step:33/48 record_time:1083.1s step_avg:32.8s reward_mean:0.7305 solved_frac:0.6562 loss:-0.0002 grad_norm:0.3519
+step:34/48 record_time:1112.0s step_avg:32.7s reward_mean:0.6797 solved_frac:0.5859 loss:-0.0002 grad_norm:0.4300
+step:35/48 record_time:1141.3s step_avg:32.6s reward_mean:0.7500 solved_frac:0.6641 loss:-0.0003 grad_norm:0.7845
+step:36/48 record_time:1173.3s step_avg:32.6s reward_mean:0.6133 solved_frac:0.5703 loss:-0.0003 grad_norm:0.3310
+step:37/48 record_time:1217.6s step_avg:32.9s reward_mean:0.7148 solved_frac:0.6719 loss:-0.0001 grad_norm:0.3277
+step:38/48 record_time:1251.2s step_avg:32.9s reward_mean:0.5430 solved_frac:0.4219 loss:-0.0001 grad_norm:0.3222
+step:39/48 record_time:1282.4s step_avg:32.9s reward_mean:0.6680 solved_frac:0.5391 loss:-0.0002 grad_norm:0.3530
+step:40/48 record_time:1314.4s step_avg:32.9s reward_mean:0.6328 solved_frac:0.5312 loss:-0.0001 grad_norm:0.3306
+step:41/48 record_time:1347.3s step_avg:32.9s reward_mean:0.7266 solved_frac:0.6484 loss:-0.0002 grad_norm:0.3288
+step:42/48 record_time:1379.8s step_avg:32.9s reward_mean:0.6172 solved_frac:0.5312 loss:-0.0002 grad_norm:0.4628
+step:43/48 record_time:1409.9s step_avg:32.8s reward_mean:0.7852 solved_frac:0.6953 loss:-0.0003 grad_norm:0.3151
+step:44/48 record_time:1440.4s step_avg:32.7s reward_mean:0.6641 solved_frac:0.5625 loss:-0.0002 grad_norm:0.3581
+step:45/48 record_time:1468.9s step_avg:32.6s reward_mean:0.7344 solved_frac:0.6562 loss:-0.0003 grad_norm:0.3463
+step:46/48 record_time:1498.9s step_avg:32.6s reward_mean:0.6680 solved_frac:0.6016 loss:-0.0002 grad_norm:0.7137
+step:47/48 record_time:1529.3s step_avg:32.5s reward_mean:0.6914 solved_frac:0.6406 loss:-0.0002 grad_norm:0.3448
+step:48/48 record_time:1560.0s step_avg:32.5s reward_mean:0.6523 solved_frac:0.5938 loss:-0.0001 grad_norm:0.6534
+final_checkpoint:outputs/weco-pr5-tok4800-gc-s42-48/step_000047 record_time:1587.9s

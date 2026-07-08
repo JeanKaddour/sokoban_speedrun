@@ -1,0 +1,1 @@
+@lorenzflow; independent seed43 verification of the same 48-step recipe on Prime Intellect 8xH100
