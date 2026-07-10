@@ -474,7 +474,7 @@ def plot_eval(record: dict, target: float, out: Path) -> None:
 
 def plot_hero_card(record: dict, target: float, out: Path,
                    online_frames: list[pd.DataFrame] | None = None, subtitle: str = "") -> None:
-    """Clean 16:9 record card: training climb, record time, pass@1, target."""
+    """Clean 16:9 record card: training climb, record time, score, target."""
     logs, evals = record["logs"], record["evals"]
     fig = plt.figure(figsize=(12.8, 7.2), constrained_layout=False)
     gs = fig.add_gridspec(1, 2, width_ratios=[1.5, 1.0],
@@ -508,18 +508,19 @@ def plot_hero_card(record: dict, target: float, out: Path,
     ax_main.set_title("")
 
     final_time = logs[sorted(logs)[0]]["final_time_s"]
-    p1s = [e["pass_at_1"] for e in evals.values()]
-    p1 = sum(p1s) / len(p1s)
+    # The record's score: the worst run's lower 95% CI — the same gate-binding number the
+    # leaderboard reports (the verification rerun, assembled later, can only lower it).
+    score = min(e["ci_low"] for e in evals.values())
 
     ax_card.text(0.0, 0.82, "RECORD", color=MUTED, fontsize=17,
                  fontweight="bold", va="top")
     ax_card.text(0.0, 0.72, fmt_clock(final_time), color=INK, fontsize=52,
                  fontweight="bold", va="top")
-    ax_card.text(0.0, 0.45, "HELD-OUT PASS@1", color=MUTED, fontsize=17,
+    ax_card.text(0.0, 0.45, "SCORE  ·  LOWER 95% CI", color=MUTED, fontsize=17,
                  fontweight="bold", va="top")
-    ax_card.text(0.0, 0.36, f"{p1:.1%}", color=SEED_COLORS[0], fontsize=78,
+    ax_card.text(0.0, 0.36, f"{score:.1%}", color=SEED_COLORS[0], fontsize=78,
                  fontweight="bold", va="top")
-    ax_card.text(0.0, 0.12, f"lower CI > {target:.0%}", color=TARGET_C, fontsize=22,
+    ax_card.text(0.0, 0.12, f"target > {target:.0%}", color=TARGET_C, fontsize=22,
                  fontweight="bold", va="top")
     fig.savefig(out); plt.close(fig)
 
@@ -563,7 +564,7 @@ TRACKS = {
         "show_flops": False,
         "lb_section": "LLM Track",          # README world-record table heading
         "lb_title": "Sokoban Speedrun  ·  LLM Track",
-        "lb_metric": "Held-out pass@1",
+        "lb_metric": "score  (lower 95% CI, pass@1)",
         "lb_out": "assets/llm_records.png",
         "reproduce": [
             "# train on one 8xH100 node (the recipe is baked into speedrun.py's RECIPE — no recipe flags)",
@@ -585,7 +586,7 @@ TRACKS = {
         "show_flops": False,   # open-architecture track: a FLOPs estimator can't stay faithful across archs
         "lb_section": "Non-LLM Track",      # README world-record table heading
         "lb_title": "Sokoban Speedrun  ·  Non-LLM Track",
-        "lb_metric": "Held-out solve rate",
+        "lb_metric": "score  (lower 95% CI, solve rate)",
         "lb_out": "assets/non_llm_records.png",
         "reproduce": [
             "# train (the record recipe is baked into speedrun.py's RECIPE — no recipe flags or env needed)",
@@ -601,11 +602,13 @@ TRACKS = {
 
 # --- Leaderboard figure (README world-record tables -> assets/*.png) ---------
 # One light, academic plot per track: each accepted record is a point at
-# (wall-clock time to target, held-out accuracy), with the fixed target dashed.
-# Faster is right, more accurate is up, so successive records march toward the
-# top-right — the same spirit as modded-nanoGPT's `figure_wr_vs_base`. The data is
-# read straight from the README leaderboard tables, so the figure fills in as
-# faster records land. Regenerate after editing a row: `--leaderboard`.
+# (wall-clock time to target, score), with the fixed target dashed. The score is
+# the gate-binding number — the worst run's lower 95% CI — so a point's height
+# above the target line IS its gate margin. Faster is right, higher-scoring is up,
+# so successive records march toward the top-right — the same spirit as
+# modded-nanoGPT's `figure_wr_vs_base`. The data is read straight from the README
+# leaderboard tables, so the figure fills in as faster records land. Regenerate
+# after editing a row: `--leaderboard`.
 LB_INK = "#1b1f24"      # titles / record labels
 LB_MUTED = "#333a42"    # axis labels, ticks (darkened for feed contrast)
 LB_GRID = "#d3d7dd"     # grid (darker so it survives X's downscale + re-encode)
@@ -626,7 +629,7 @@ def parse_leaderboard(section: str) -> list[dict]:
     The single parser of the leaderboard tables (plot_leaderboard here plus the
     per-track overlay in plot_track_train_solve_rate.py), so a column change only
     has one home: num, clock (verbatim mm:ss), minutes, desc, dir (record-dir name
-    from the Log link, or None), acc."""
+    from the Log link, or None), score (worst run's lower 95% CI)."""
     text = (REPO_ROOT / "README.md").read_text()
     block = next((s for s in re.split(r"^## ", text, flags=re.M) if s.startswith(section)), None)
     if block is None:
@@ -643,7 +646,7 @@ def parse_leaderboard(section: str) -> list[dict]:
             "minutes": _lb_minutes(cells[1]),
             "desc": cells[2].replace("`", ""),
             "dir": Path(link.group(1)).name if link else None,
-            "acc": float(re.search(r"[\d.]+", cells[5]).group()),
+            "score": float(re.search(r"[\d.]+", cells[5]).group()),
         })
     return sorted(out, key=lambda r: r["num"])
 
@@ -674,7 +677,7 @@ def plot_leaderboard(cfg: dict) -> None:
     if not recs:
         print(f"no records under '{cfg['lb_section']}' in README — skipped {out.name}")
         return
-    target, accs = cfg["target"], [r["acc"] for r in recs]
+    target, scores = cfg["target"], [r["score"] for r in recs]
     best = min(range(len(recs)), key=lambda i: recs[i]["minutes"])
     x_max = max(r["minutes"] for r in recs)
 
@@ -683,7 +686,7 @@ def plot_leaderboard(cfg: dict) -> None:
     # target near the bottom (thin "below target" strip), records near the top
     # only a little headroom past the slowest record — keep the left whitespace tight
     ax.set_xlim(x_max * 1.08, 0)
-    ax.set_ylim(max(0.0, target - 0.02), min(1.0, max(accs) + 0.025))
+    ax.set_ylim(max(0.0, target - 0.02), min(1.0, max(scores) + 0.025))
 
     ax.axhspan(ax.get_ylim()[0], target, color=LB_TARGET, alpha=0.05, zorder=0)
     ax.axhline(target, color=LB_TARGET, lw=2.2, ls=(0, (6, 4)), zorder=2)
@@ -694,19 +697,19 @@ def plot_leaderboard(cfg: dict) -> None:
     # connect successive records (only meaningful with >= 2); each clears the target
     order = sorted(range(len(recs)), key=lambda i: recs[i]["num"])
     if len(recs) > 1:
-        ax.plot([recs[i]["minutes"] for i in order], [recs[i]["acc"] for i in order],
+        ax.plot([recs[i]["minutes"] for i in order], [recs[i]["score"] for i in order],
                 color=LB_ACCENT, lw=1.8, alpha=0.5, zorder=3)
 
     for i, r in enumerate(recs):
         if i == best:
-            ax.scatter([r["minutes"]], [r["acc"]], marker="*", s=560, color=LB_RECORD,
+            ax.scatter([r["minutes"]], [r["score"]], marker="*", s=560, color=LB_RECORD,
                        edgecolors=LB_INK, linewidths=1.0, zorder=6)
             dx = 26
         else:
-            ax.scatter([r["minutes"]], [r["acc"]], s=120, color=LB_ACCENT,
+            ax.scatter([r["minutes"]], [r["score"]], s=120, color=LB_ACCENT,
                        edgecolors="white", linewidths=1.2, zorder=5)
             dx = 15
-        ax.annotate(f"#{r['num']}", xy=(r["minutes"], r["acc"]), xytext=(dx, 0),
+        ax.annotate(f"#{r['num']}", xy=(r["minutes"], r["score"]), xytext=(dx, 0),
                     textcoords="offset points", ha="left", va="center",
                     color=LB_INK, fontsize=15, fontweight="bold")
 
@@ -742,14 +745,14 @@ def update_leaderboard_row(record_dir: Path, track: str) -> None:
     seed = sorted(rec["logs"])[0]
     s = int(rec["logs"][seed]["final_time_s"])
     clock = fmt_clock(s)  # mm:ss (both tracks' headers)
-    # Report the WORST of the required seeds (submission run + verification rerun), not the
-    # submission seed alone. Both seeds must clear the bar, so the binding (lower) one is the
-    # honest, un-cherry-pickable quality signal — it stops a submitter from seed-shopping the
-    # headline. The *ranking* is still wall-clock (the submission run's clock, set above).
+    # The score column is the WORST lower 95% CI across the required runs (submission +
+    # verification rerun), not the submission run alone. The gate binds on each run's ci_low,
+    # so the minimum is the honest, un-cherry-pickable quality signal — it stops a submitter
+    # from seed-shopping the headline, and its distance above the target is the true gate
+    # margin. The *ranking* is still wall-clock (the submission run's clock, set above).
     eval_paths = sorted(record_dir.glob("eval_seed*.json")) + \
         sorted((record_dir / "verification").glob("eval_seed*.json"))
-    ev = min((json.loads(p.read_text()) for p in eval_paths), key=lambda e: e["pass_at_1"])
-    acc = f"{ev['pass_at_1']:.3f} (CI [{ev['ci_low']:.2f}, {ev['ci_high']:.2f}])"
+    acc = f"{min(json.loads(p.read_text())['ci_low'] for p in eval_paths):.3f}"
 
     name = record_dir.name                                     # e.g. 2026-06-29_01_grpo
     m = re.match(r"(\d{4}-\d{2}-\d{2})_(\d+)", name)

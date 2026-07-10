@@ -12,27 +12,27 @@ Fastest recipes to RL models to solve Sokoban to a held-out target on one node:
 
 ### World record history
 
-![LLM track world records — held-out pass@1 vs wall-clock time to target](assets/llm_records.png)
+![LLM track world records — held-out score (lower 95% CI) vs wall-clock time to target](assets/llm_records.png)
 
-| #   | Record time (mm:ss) | Description                        | Date       | Log                                                          | held-out pass@1         | Contributors |
-| --- | ------------------- | ---------------------------------- | ---------- | ------------------------------------------------------------ | ----------------------- | ------------ |
-| 1   | 48:53               | GRPO, LR 1.6e-6 annealed, 75 steps | 2026-06-29 | [llm/records/2026-06-29_01](llm/records/2026-06-29_01_grpo/) | 0.869 (CI [0.83, 0.90]) | @JeanKaddour |
-| 2   | 36:53               | steps + LR-decay horizon 75 → 60   | 2026-06-29 | [llm/records/2026-06-29_02](llm/records/2026-06-29_02_grpo_60step/) | 0.843 (CI [0.81, 0.88]) | @dexhunter   |
-| 3   | 35:29               | earlier stop: 54 steps             | 2026-07-02 | [llm/records/2026-07-02_01](llm/records/2026-07-02_01_grpo_54step/) | 0.860 (CI [0.83, 0.89]) | @dexhunter   |
-| 4 | 33:40 | Weco advantage shaping, 52 steps | 2026-07-02 | [llm/records/2026-07-02_02](llm/records/2026-07-02_02_weco_strategy_52step/) | 0.866 (CI [0.83, 0.90]) | @dexhunter |
-| 5 | 26:27 | rollout budget 5632 → 4800 tokens, 48 steps | 2026-07-02 | [llm/records/2026-07-02_03](llm/records/2026-07-02_03_grpo_48step/) | 0.848 (CI [0.82, 0.88]) | @lorenzflow |
+| #   | Record time (mm:ss) | Description                        | Date       | Log                                                          | score | Contributors |
+| --- | ------------------- | ---------------------------------- | ---------- | ------------------------------------------------------------ | ----- | ------------ |
+| 1   | 48:53               | GRPO, LR 1.6e-6 annealed, 75 steps | 2026-06-29 | [llm/records/2026-06-29_01](llm/records/2026-06-29_01_grpo/) | 0.834 | @JeanKaddour |
+| 2   | 36:53               | steps + LR-decay horizon 75 → 60   | 2026-06-29 | [llm/records/2026-06-29_02](llm/records/2026-06-29_02_grpo_60step/) | 0.807 | @dexhunter   |
+| 3   | 35:29               | earlier stop: 54 steps             | 2026-07-02 | [llm/records/2026-07-02_01](llm/records/2026-07-02_01_grpo_54step/) | 0.829 | @dexhunter   |
+| 4 | 33:40 | Weco advantage shaping, 52 steps | 2026-07-02 | [llm/records/2026-07-02_02](llm/records/2026-07-02_02_weco_strategy_52step/) | 0.835 | @dexhunter |
+| 5 | 26:27 | rollout budget 5632 → 4800 tokens, 48 steps | 2026-07-02 | [llm/records/2026-07-02_03](llm/records/2026-07-02_03_grpo_48step/) | 0.815 | @lorenzflow |
 
 
 ### Rules
 
 Fastest wall-clock run wins: one run on one 8xH100 node, from training step 1 through the final training update.
 
-- **Target:** lower 95% bootstrap CI > 0.80 on [llm/datasets/sokoban_eval.jsonl](llm/datasets/sokoban_eval.jsonl).
+- **Score:** the lower 95% bootstrap CI of pass@1 on [llm/datasets/sokoban_eval.jsonl](llm/datasets/sokoban_eval.jsonl) — a record must score > **0.80**.
 - **Eval:** 8 completions/puzzle, 12,288 tokens, temperature 0.8, top-p 0.95, seed 12345.
 - **Fixed:** model, [train set](llm/datasets/sokoban_train.jsonl), eval set, reward function, hardware.
 - **Open:** RL algorithm, loss, schedules, engine, parallelism, domain-agnostic rewards, prompt.
 - **Not allowed:** Sokoban-specific hints, heuristics, or few-shot examples.
-- **Verification:** Rerun with a second seed; both runs must clear the target. The held-out pass@1 column reports the worst of the two seeds.
+- **Verification:** Rerun with a second seed; both runs must score above the target. The score column reports the worse of the two runs.
 
 ### Running
 
@@ -49,25 +49,25 @@ This track uses [PufferLib's](https://github.com/pufferai/pufferlib) Boxoban env
 
 ### World record history
 
-![Non-LLM track world records — held-out solve-rate vs wall-clock time to target](assets/non_llm_records.png)
+![Non-LLM track world records — held-out score (lower 95% CI) vs wall-clock time to target](assets/non_llm_records.png)
 
-| #   | Record time (mm:ss) | Description     | Date       | Log                                                                     | held-out pass@1         | Contributors |
-| --- | ------------------- | --------------- | ---------- | ----------------------------------------------------------------------- | ----------------------- | ------------ |
-| 1   | 22:24               | cnn-mingru h256 | 2026-06-21 | [non_llm/records/2026-06-21_01](non_llm/records/2026-06-21_01_non_llm/) | 0.744 (CI [0.72, 0.77]) | @JeanKaddour |
-| 2 | 21:00 | same recipe as #1, earliest clearing checkpoint | 2026-06-29 | [non_llm/records/2026-06-29_01](non_llm/records/2026-06-29_01_non_llm/) | 0.727 (CI [0.70, 0.75]) | @JeanKaddour |
-| 3 | 15:55 | torch.compile + steps-matched-anneal | 2026-06-30 | [non_llm/records/2026-06-30_01](non_llm/records/2026-06-30_01_non_llm/) | 0.748 (CI [0.72, 0.77]) | @JeanKaddour |
-| 4 | 14:42 | anneal horizon tuned 1300→1200 steps | 2026-07-02 | [non_llm/records/2026-07-02_01](non_llm/records/2026-07-02_01_non_llm/) | 0.736 (CI [0.71, 0.76]) | @JeanKaddour |
-| 5 | 12:38 | conv-free shift + pooled-global encoder (`sgpm2`), 950-step anneal | 2026-07-02 | [non_llm/records/2026-07-02_02](non_llm/records/2026-07-02_02_non_llm/) | 0.741 (CI [0.72, 0.77]) | @srijanpatel |
+| #   | Record time (mm:ss) | Description     | Date       | Log                                                                     | score | Contributors |
+| --- | ------------------- | --------------- | ---------- | ----------------------------------------------------------------------- | ----- | ------------ |
+| 1   | 22:24               | cnn-mingru h256 | 2026-06-21 | [non_llm/records/2026-06-21_01](non_llm/records/2026-06-21_01_non_llm/) | 0.718 | @JeanKaddour |
+| 2 | 21:00 | same recipe as #1, earliest clearing checkpoint | 2026-06-29 | [non_llm/records/2026-06-29_01](non_llm/records/2026-06-29_01_non_llm/) | 0.701 | @JeanKaddour |
+| 3 | 15:55 | torch.compile + steps-matched-anneal | 2026-06-30 | [non_llm/records/2026-06-30_01](non_llm/records/2026-06-30_01_non_llm/) | 0.706 | @JeanKaddour |
+| 4 | 14:42 | anneal horizon tuned 1300→1200 steps | 2026-07-02 | [non_llm/records/2026-07-02_01](non_llm/records/2026-07-02_01_non_llm/) | 0.709 | @JeanKaddour |
+| 5 | 12:38 | conv-free shift + pooled-global encoder (`sgpm2`), 950-step anneal | 2026-07-02 | [non_llm/records/2026-07-02_02](non_llm/records/2026-07-02_02_non_llm/) | 0.715 | @srijanpatel |
 
 
 ### Rules
 
 Fastest wall-clock run wins: one run on a single H100, from training step 1 through the final training update.
 
-- **Target:** lower 95% CI on held-out Boxoban solve-rate > **0.70**.
+- **Score:** the lower 95% CI of the held-out solve rate — a record must score > **0.70**.
 - **Eval:** official [DeepMind Boxoban](https://github.com/google-deepmind/boxoban-levels) test split `unfiltered/test`.
 - **Open:** policy architecture, RL algorithm, optimizer, schedules, implementation.
-- **Verification:** Rerun with a second seed; both runs must clear the target. The held-out pass@1 column reports the worst of the two seeds.
+- **Verification:** Rerun with a second seed; both runs must score above the target. The score column reports the worse of the two runs.
 
 ### Running
 
