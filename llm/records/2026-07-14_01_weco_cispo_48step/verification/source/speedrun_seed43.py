@@ -113,13 +113,13 @@ RECIPE = [
     "--lr-decay-steps", "60",
     "--max-steps", "48",          # the record's step count; override on the CLI for probes/longer runs
     "--grad-clip", "1.0",
-    "--loss-fn", "cispo",        # record 6: CISPO (advantage-mode auto-resolves to 'centered')
-    "--adv-centered-blend", "0.04",    # record 6: Weco advantage shaping (see shape_group_advantages)
+    "--loss-fn", "grpo",          # record 4: PPO-clip GRPO (advantage-mode auto-resolves to 'grpo')
+    "--adv-centered-blend", "0.04",    # record 4: Weco advantage shaping (see shape_group_advantages)
     "--adv-difficulty-weight", "0.18",
     "--adv-difficulty-ramp", "1.0",
     "--adv-variance-boost", "1.1",
     "--cispo-eps", "4.0",
-    "--loss-normalization", "sequence",  # sample-level objective normalization.
+    "--loss-normalization", "sequence",  # sample-level (GRPO).
     "--max-staleness", "4",          # less off-policy than ScaleRL's 8; a proven stability lever
     "--inflight-requests", "64",     # outstanding-group tickets, reissued at CONSUME time: pins total unconsumed
                                      # inventory, so worst-case FIFO staleness is 64/(16 groups/step) = max-staleness.

@@ -113,13 +113,13 @@ RECIPE = [
     "--lr-decay-steps", "60",
     "--max-steps", "48",          # the record's step count; override on the CLI for probes/longer runs
     "--grad-clip", "1.0",
-    "--loss-fn", "cispo",        # record 6: CISPO (advantage-mode auto-resolves to 'centered')
-    "--adv-centered-blend", "0.04",    # record 6: Weco advantage shaping (see shape_group_advantages)
+    "--loss-fn", "grpo",          # record 4: PPO-clip GRPO (advantage-mode auto-resolves to 'grpo')
+    "--adv-centered-blend", "0.04",    # record 4: Weco advantage shaping (see shape_group_advantages)
     "--adv-difficulty-weight", "0.18",
     "--adv-difficulty-ramp", "1.0",
     "--adv-variance-boost", "1.1",
     "--cispo-eps", "4.0",
-    "--loss-normalization", "sequence",  # sample-level objective normalization.
+    "--loss-normalization", "sequence",  # sample-level (GRPO).
     "--max-staleness", "4",          # less off-policy than ScaleRL's 8; a proven stability lever
     "--inflight-requests", "64",     # outstanding-group tickets, reissued at CONSUME time: pins total unconsumed
                                      # inventory, so worst-case FIFO staleness is 64/(16 groups/step) = max-staleness.
@@ -4137,3 +4137,115 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
+
+====================================================================================================
+python: 3.12.3 (main, Mar 3 2026, 12:15:18) [GCC 13.3.0]
+torch: 2.11.0+cu130
+transformers: 5.8.1
+vllm: 0.22.0
+git commit: 64fd8222b51cd2c7d2429d715e6885faaa699624
+GENERATOR_GC_COLLECT_EVERY: 4
+source snapshot: source/speedrun.py sha256:0870c78eb912306d41540d9555705eb74669f4437a675109d442c4a88b3f75ca
+Tue Jul 14 15:36:14 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.126.09             Driver Version: 580.126.09     CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA H100 80GB HBM3          On  |   00000000:0A:00.0 Off |                    0 |
+| N/A   33C    P0            117W /  700W |   16865MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA H100 80GB HBM3          On  |   00000000:18:00.0 Off |                    0 |
+| N/A   30C    P0            114W /  700W |   16869MiB /  81559MiB |    100%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA H100 80GB HBM3          On  |   00000000:23:00.0 Off |                    0 |
+| N/A   30C    P0            120W /  700W |   16869MiB /  81559MiB |    100%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA H100 80GB HBM3          On  |   00000000:2C:00.0 Off |                    0 |
+| N/A   30C    P0             70W /  700W |       4MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   4  NVIDIA H100 80GB HBM3          On  |   00000000:87:00.0 Off |                    0 |
+| N/A   30C    P0             71W /  700W |       4MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   5  NVIDIA H100 80GB HBM3          On  |   00000000:90:00.0 Off |                    0 |
+| N/A   29C    P0             69W /  700W |       4MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   6  NVIDIA H100 80GB HBM3          On  |   00000000:BE:00.0 Off |                    0 |
+| N/A   28C    P0             70W /  700W |       4MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   7  NVIDIA H100 80GB HBM3          On  |   00000000:C7:00.0 Off |                    0 |
+| N/A   29C    P0             69W /  700W |       4MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A         2437421      C   ...speedrun/llm/.venv/bin/python      16856MiB |
+|    1   N/A  N/A         2437422      C   ...speedrun/llm/.venv/bin/python      16860MiB |
+|    2   N/A  N/A         2437423      C   ...speedrun/llm/.venv/bin/python      16860MiB |
++-----------------------------------------------------------------------------------------+
+
+argv: ['/data/lorenz/sokoban_speedrun/llm/speedrun.py', '--run', 'weco-cispo-tok4800-s43-48', '--loss-fn', 'cispo', '--lr-decay-steps', '60', '--max-steps', '48', '--seed', '43', '--no-wandb', '--no-save-rollouts', '--final-rollout-steps', '0']
+args: {'model': 'Qwen/Qwen3-4B-Instruct-2507', 'trust_remote_code': False, 'device': '', 'train_data': PosixPath('datasets/sokoban_train.jsonl'), 'eval_data': PosixPath('datasets/sokoban_eval.jsonl'), 'verify_datasets_only': False, 'dtype': 'float32', 'run': 'weco-cispo-tok4800-s43-48', 'wandb': False, 'output_dir': PosixPath('outputs'), 'seed': 43, 'num_epochs': 1, 'max_steps': 48, 'device_batch_size': 2, 'examples_per_step': 16, 'num_samples': 8, 'max_new_tokens': 4800, 'interruption': True, 'interrupt_answer_tokens': 512, 'interrupt_min_tokens': None, 'interrupt_max_tokens': None, 'interrupt_temperature': None, 'interrupt_top_p': None, 'interrupt_top_k': None, 'temperature': 0.8, 'top_k': 0, 'top_p': 0.95, 'learning_rate': 1.6e-06, 'optimizer': 'adamw', 'adam_eps': 1e-15, 'weight_decay': 0.01, 'init_lr_frac': 0.05, 'warmup_steps': 5, 'lr_schedule': 'linear', 'min_lr_frac': 0.15, 'lr_decay_steps': 60, 'lr_decay_start': None, 'grad_clip': 1.0, 'loss_normalization': 'sequence', 'gradient_checkpointing': True, 'compile': False, 'attn_implementation': 'flash_attention_2', 'enable_thinking': False, 'save_every': 0, 'save_final': True, 'trim_after_answer': True, 'vllm_gpu_mem_util': 0.9, 'vllm_enforce_eager': False, 'vllm_max_num_seqs': 512, 'vllm_max_num_batched_tokens': 8192, 'vllm_max_num_scheduled_tokens': None, 'vllm_max_num_partial_prefills': None, 'vllm_max_long_partial_prefills': None, 'vllm_long_prefill_token_threshold': None, 'vllm_enable_chunked_prefill': None, 'vllm_scheduler_reserve_full_isl': None, 'vllm_stream_interval': 8, 'vllm_performance_mode': None, 'inflight_requests': 64, 'max_staleness': 4, 'logits_chunk_size': 2048, 'log_entropy': False, 'train_autocast_dtype': 'bfloat16', 'debug_assert_replica_sync': False, 'loss_fn': 'cispo', 'advantage_mode': 'centered', 'adv_centered_blend': 0.04, 'adv_difficulty_weight': 0.18, 'adv_difficulty_ramp': 1.0, 'adv_variance_boost': 1.1, 'entropy_coef': 0.0, 'cispo_eps': 4.0, 'clip_eps_low': None, 'clip_eps_high': None, 'clip_ratio_c': 3.0, 'kl_tau': 0.0, 'max_model_len': 6144, 'zero_variance_filter': True, 'save_rollouts': False, 'wandb_rollout_samples': 20, 'final_rollout_steps': 0, 'rollout_flush_every': 10, 'auto_run_name': False}
+====================================================================================================
+step:1/48 record_time:119.2s step_avg:119.2s reward_mean:0.4414 solved_frac:0.3203 loss:-0.0046 grad_norm:0.5328 online_solved:0.3380
+step:2/48 record_time:153.2s step_avg:76.6s reward_mean:0.5859 solved_frac:0.4531 loss:-0.0098 grad_norm:0.5137 online_solved:0.5865
+step:3/48 record_time:186.3s step_avg:62.1s reward_mean:0.5156 solved_frac:0.3672 loss:-0.0038 grad_norm:0.3954 online_solved:0.4145
+step:4/48 record_time:219.0s step_avg:54.7s reward_mean:0.5586 solved_frac:0.4766 loss:-0.0075 grad_norm:0.3049 online_solved:0.4792
+step:5/48 record_time:252.8s step_avg:50.6s reward_mean:0.5547 solved_frac:0.4766 loss:-0.0077 grad_norm:1.1304 online_solved:0.4236
+step:6/48 record_time:285.0s step_avg:47.5s reward_mean:0.5781 solved_frac:0.5000 loss:-0.0045 grad_norm:0.4342 online_solved:0.5000
+step:7/48 record_time:317.2s step_avg:45.3s reward_mean:0.6094 solved_frac:0.5000 loss:-0.0090 grad_norm:0.3092 online_solved:0.5789
+step:8/48 record_time:348.3s step_avg:43.5s reward_mean:0.5586 solved_frac:0.4844 loss:-0.0088 grad_norm:0.3197 online_solved:0.5147
+step:9/48 record_time:379.2s step_avg:42.1s reward_mean:0.6172 solved_frac:0.5078 loss:-0.0048 grad_norm:0.3212 online_solved:0.5368
+step:10/48 record_time:412.1s step_avg:41.2s reward_mean:0.5195 solved_frac:0.4297 loss:-0.0064 grad_norm:0.3145 online_solved:0.4297
+step:11/48 record_time:443.6s step_avg:40.3s reward_mean:0.4727 solved_frac:0.4297 loss:-0.0056 grad_norm:0.3060 online_solved:0.4375
+step:12/48 record_time:473.9s step_avg:39.5s reward_mean:0.5430 solved_frac:0.4922 loss:-0.0094 grad_norm:1.6585 online_solved:0.4145
+step:13/48 record_time:506.2s step_avg:38.9s reward_mean:0.5625 solved_frac:0.4766 loss:-0.0067 grad_norm:0.2951 online_solved:0.5074
+step:14/48 record_time:535.8s step_avg:38.3s reward_mean:0.6055 solved_frac:0.5156 loss:0.0011 grad_norm:0.3658 online_solved:0.5156
+step:15/48 record_time:566.5s step_avg:37.8s reward_mean:0.6133 solved_frac:0.5156 loss:-0.0035 grad_norm:0.3408 online_solved:0.5441
+step:16/48 record_time:597.0s step_avg:37.3s reward_mean:0.6055 solved_frac:0.5469 loss:-0.0070 grad_norm:0.3514 online_solved:0.6548
+step:17/48 record_time:626.2s step_avg:36.8s reward_mean:0.6016 solved_frac:0.5469 loss:-0.0074 grad_norm:0.3514 online_solved:0.6705
+step:18/48 record_time:658.5s step_avg:36.6s reward_mean:0.6914 solved_frac:0.6250 loss:-0.0128 grad_norm:0.3384 online_solved:0.6316
+step:19/48 record_time:688.9s step_avg:36.3s reward_mean:0.6602 solved_frac:0.5625 loss:-0.0053 grad_norm:0.3074 online_solved:0.5556
+step:20/48 record_time:720.3s step_avg:36.0s reward_mean:0.7383 solved_frac:0.6797 loss:-0.0043 grad_norm:0.3298 online_solved:0.6985
+step:21/48 record_time:751.3s step_avg:35.8s reward_mean:0.7031 solved_frac:0.6484 loss:-0.0086 grad_norm:0.2988 online_solved:0.7188
+step:22/48 record_time:781.8s step_avg:35.5s reward_mean:0.6680 solved_frac:0.5859 loss:-0.0027 grad_norm:0.3134 online_solved:0.6319
+step:23/48 record_time:812.6s step_avg:35.3s reward_mean:0.5625 solved_frac:0.5078 loss:-0.0067 grad_norm:0.3188 online_solved:0.5625
+step:24/48 record_time:841.8s step_avg:35.1s reward_mean:0.7578 solved_frac:0.7109 loss:-0.0103 grad_norm:0.3045 online_solved:0.7798
+step:25/48 record_time:872.7s step_avg:34.9s reward_mean:0.6875 solved_frac:0.6172 loss:-0.0044 grad_norm:0.3003 online_solved:0.6776
+step:26/48 record_time:904.5s step_avg:34.8s reward_mean:0.6133 solved_frac:0.5391 loss:-0.0109 grad_norm:0.3060 online_solved:0.6488
+step:27/48 record_time:932.9s step_avg:34.6s reward_mean:0.7852 solved_frac:0.7344 loss:-0.0057 grad_norm:0.3333 online_solved:0.7763
+step:28/48 record_time:961.1s step_avg:34.3s reward_mean:0.7734 solved_frac:0.7031 loss:-0.0109 grad_norm:0.3335 online_solved:0.7500
+step:29/48 record_time:990.8s step_avg:34.2s reward_mean:0.7539 solved_frac:0.6875 loss:-0.0058 grad_norm:0.3305 online_solved:0.7500
+step:30/48 record_time:1017.7s step_avg:33.9s reward_mean:0.6836 solved_frac:0.6641 loss:-0.0056 grad_norm:0.3353 online_solved:0.7663
+step:31/48 record_time:1047.6s step_avg:33.8s reward_mean:0.7305 solved_frac:0.6719 loss:-0.0092 grad_norm:0.2700 online_solved:0.7375
+step:32/48 record_time:1076.7s step_avg:33.6s reward_mean:0.6992 solved_frac:0.6406 loss:-0.0131 grad_norm:0.3183 online_solved:0.6974
+step:33/48 record_time:1105.6s step_avg:33.5s reward_mean:0.7656 solved_frac:0.6797 loss:-0.0136 grad_norm:0.3199 online_solved:0.8170
+step:34/48 record_time:1137.9s step_avg:33.5s reward_mean:0.7539 solved_frac:0.6797 loss:-0.0131 grad_norm:0.2877 online_solved:0.8170
+step:35/48 record_time:1172.4s step_avg:33.5s reward_mean:0.6602 solved_frac:0.6328 loss:-0.0101 grad_norm:0.2972 online_solved:0.7446
+step:36/48 record_time:1204.1s step_avg:33.4s reward_mean:0.6680 solved_frac:0.5859 loss:-0.0136 grad_norm:0.3023 online_solved:0.6845
+step:37/48 record_time:1233.5s step_avg:33.3s reward_mean:0.7812 solved_frac:0.6953 loss:-0.0138 grad_norm:0.3023 online_solved:0.7132
+step:38/48 record_time:1264.1s step_avg:33.3s reward_mean:0.6602 solved_frac:0.5859 loss:-0.0180 grad_norm:0.3037 online_solved:0.7350
+step:39/48 record_time:1294.1s step_avg:33.2s reward_mean:0.7578 solved_frac:0.6641 loss:-0.0081 grad_norm:0.2999 online_solved:0.7171
+step:40/48 record_time:1324.3s step_avg:33.1s reward_mean:0.7070 solved_frac:0.6250 loss:-0.0133 grad_norm:0.3353 online_solved:0.7000
+step:41/48 record_time:1355.3s step_avg:33.1s reward_mean:0.6914 solved_frac:0.6172 loss:-0.0176 grad_norm:0.3149 online_solved:0.6397
+step:42/48 record_time:1385.0s step_avg:33.0s reward_mean:0.7891 solved_frac:0.7109 loss:-0.0209 grad_norm:0.3267 online_solved:0.7898
+step:43/48 record_time:1415.4s step_avg:32.9s reward_mean:0.7344 solved_frac:0.6406 loss:-0.0152 grad_norm:0.2999 online_solved:0.7870
+step:44/48 record_time:1444.0s step_avg:32.8s reward_mean:0.7383 solved_frac:0.6875 loss:-0.0112 grad_norm:0.3256 online_solved:0.7727
+step:45/48 record_time:1475.6s step_avg:32.8s reward_mean:0.6719 solved_frac:0.5781 loss:-0.0171 grad_norm:0.5738 online_solved:0.7300
+step:46/48 record_time:1502.8s step_avg:32.7s reward_mean:0.7930 solved_frac:0.7344 loss:-0.0125 grad_norm:0.4936 online_solved:0.7875
+step:47/48 record_time:1533.5s step_avg:32.6s reward_mean:0.6797 solved_frac:0.6094 loss:-0.0216 grad_norm:0.3350 online_solved:0.7283
+step:48/48 record_time:1560.3s step_avg:32.5s reward_mean:0.8164 solved_frac:0.7578 loss:-0.0053 grad_norm:0.3488 online_solved:0.8385
+final_checkpoint:outputs/weco-cispo-tok4800-s43-48/step_000047 record_time:1560.3s
