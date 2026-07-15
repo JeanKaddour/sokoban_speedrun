@@ -14,6 +14,8 @@ Fastest recipes to RL models to solve Sokoban to a held-out target on one node:
 
 ![LLM track world records — held-out score (lower 95% CI) vs wall-clock time to target](assets/llm_records.png)
 
+![LLM track recent record training curves](assets/llm_train_solve_rate.png)
+
 | #   | Record time (mm:ss) | Description                        | Date       | Log                                                          | score | Contributors |
 | --- | ------------------- | ---------------------------------- | ---------- | ------------------------------------------------------------ | ----- | ------------ |
 | 1   | 48:53               | GRPO, LR 1.6e-6 annealed, 75 steps | 2026-06-29 | [llm/records/2026-06-29_01](llm/records/2026-06-29_01_grpo/) | 0.834 | @JeanKaddour |
@@ -23,7 +25,6 @@ Fastest recipes to RL models to solve Sokoban to a held-out target on one node:
 | 5 | 26:27 | rollout budget 5632 → 4800 tokens, 48 steps | 2026-07-02 | [llm/records/2026-07-02_03](llm/records/2026-07-02_03_grpo_48step/) | 0.815 | @lorenzflow |
 | 6 | 25:51 | GRPO → CISPO, same 48-step recipe | 2026-07-14 | [llm/records/2026-07-14_01](llm/records/2026-07-14_01_weco_cispo_48step/) | 0.804 | @lorenzflow |
 | 7 | 19:20 | earlier stop: 35 CISPO steps | 2026-07-15 | [llm/records/2026-07-15_01](llm/records/2026-07-15_01_weco_cispo_35step/) | 0.824 | @lorenzflow |
-
 
 ### Rules
 
@@ -53,6 +54,8 @@ This track uses [PufferLib's](https://github.com/pufferai/pufferlib) Boxoban env
 
 ![Non-LLM track world records — held-out score (lower 95% CI) vs wall-clock time to target](assets/non_llm_records.png)
 
+![Non-LLM track recent record training curves](assets/non_llm_train_solve_rate.png)
+
 | #   | Record time (mm:ss) | Description     | Date       | Log                                                                     | score | Contributors |
 | --- | ------------------- | --------------- | ---------- | ----------------------------------------------------------------------- | ----- | ------------ |
 | 1   | 22:24               | cnn-mingru h256 | 2026-06-21 | [non_llm/records/2026-06-21_01](non_llm/records/2026-06-21_01_non_llm/) | 0.718 | @JeanKaddour |
@@ -60,7 +63,6 @@ This track uses [PufferLib's](https://github.com/pufferai/pufferlib) Boxoban env
 | 3 | 15:55 | torch.compile + steps-matched-anneal | 2026-06-30 | [non_llm/records/2026-06-30_01](non_llm/records/2026-06-30_01_non_llm/) | 0.706 | @JeanKaddour |
 | 4 | 14:42 | anneal horizon tuned 1300→1200 steps | 2026-07-02 | [non_llm/records/2026-07-02_01](non_llm/records/2026-07-02_01_non_llm/) | 0.709 | @JeanKaddour |
 | 5 | 12:38 | conv-free shift + pooled-global encoder (`sgpm2`), 950-step anneal | 2026-07-02 | [non_llm/records/2026-07-02_02](non_llm/records/2026-07-02_02_non_llm/) | 0.715 | @srijanpatel |
-
 
 ### Rules
 
@@ -81,7 +83,7 @@ uv run python speedrun.py
 
 ## Submitting a record
 
-Each track's `assemble_record.sh` ([`llm/`](llm/assemble_record.sh), [`non_llm/`](non_llm/assemble_record.sh)) turns a finished run into a record dir: it collects the log, eval JSON, and source snapshot, builds the report, pins the top-level `speedrun.py`, runs `verify_record.py`, and adds the record's row + redraws the leaderboard figure. Configure record runs by editing `RECIPE` in `speedrun.py` and launch them flag-free — the pinned `speedrun.py` then *is* the recipe (assembly rejects flag-configured runs). It reads a local `outputs/<RUN>/` by default; pass `SOURCE=modal` to pull off the volume.
+Each track's `assemble_record.sh` ([`llm/`](llm/assemble_record.sh), [`non_llm/`](non_llm/assemble_record.sh)) turns a finished run into a record dir: it collects the log, eval JSON, and source snapshot, builds the report, pins the top-level `speedrun.py`, runs `verify_record.py`, and adds or refreshes the record's row + redraws the leaderboard and rolling recent-training figures. Configure record runs by editing `RECIPE` in `speedrun.py` and launch them flag-free — the pinned `speedrun.py` then *is* the recipe (assembly rejects flag-configured runs). It reads a local `outputs/<RUN>/` by default; pass `SOURCE=modal` to pull off the volume.
 
 1. **Train + eval** with your track's [Running](#running) commands.
 
