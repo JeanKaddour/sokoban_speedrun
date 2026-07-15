@@ -5,8 +5,8 @@ Usage:
         [--wandb-runs entity/project/id1,entity/project/id2,...] \
         [--prev records/<previous-record-dir>]
 
-    # regenerate the README world-record figures (assets/*.png) from the
-    # leaderboard tables — run after editing a leaderboard row, no record dir:
+    # regenerate the README leaderboard + rolling training figures (assets/*.png)
+    # — run after editing a leaderboard row, no record dir:
     python make_record_report.py --leaderboard
 
 Three plots: training (solve rate vs step + vs record-clock minutes), stability (grad
@@ -35,6 +35,8 @@ import hashlib
 import json
 import math
 import re
+import subprocess
+import sys
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -54,7 +56,6 @@ SOURCE_DIVIDER = "=" * 100
 STEP_RE = re.compile(
     r"step:(\d+)/(\d+) record_time:([\d.]+)s step_avg:[\d.]+s reward_mean:([\d.]+) "
     r"solved_frac:([\d.]+) loss:(-?[\d.]+) grad_norm:([\d.]+)"
-    r"(?: cum_flops:([\d.eE+-]+))?"  # node-invariant FLOPs-to-target (logs predating it omit it)
 )
 # Key hyperparameters surfaced in the README config table; the full args dict goes in <details>.
 HEADLINE_ARGS = [
@@ -293,11 +294,19 @@ def parse_train_log(path: Path) -> dict:
     for line in path.read_text(errors="replace").splitlines():
         m = STEP_RE.match(line)
         if m:
+            # Both suffixes were introduced after the original record-log format and
+            # are therefore optional. Search them independently instead of baking an
+            # order into STEP_RE so old logs and either future suffix order still parse.
+            online = re.search(r"(?:^| )online_solved:([\d.]+)(?: |$)", line)
+            flops = re.search(r"(?:^| )cum_flops:([\d.eE+-]+)(?: |$)", line)
             steps.append({
                 "step": int(m.group(1)), "record_time_s": float(m.group(3)),
                 "reward_mean": float(m.group(4)), "solved_frac": float(m.group(5)),
                 "loss": float(m.group(6)), "grad_norm": float(m.group(7)),
-                "cum_flops": float(m.group(8)) if m.group(8) else float("nan"),
+                "online_solved_frac": (
+                    float(online.group(1)) if online else float("nan")
+                ),
+                "cum_flops": float(flops.group(1)) if flops else float("nan"),
             })
         elif line.startswith("args: {") and args_dict is None:
             # The attestation prints repr(vars(args)); PosixPath is its only non-literal.
@@ -373,6 +382,24 @@ def load_metrics_frames(record_dir: Path, logs: dict[str, dict]) -> list[pd.Data
         if w is None:
             return None
         frames.append(w)
+    return frames
+
+
+def load_inline_online_frames(logs: dict[str, dict]) -> list[pd.DataFrame] | None:
+    """Recover the unfiltered train solve-rate from newer ``step:`` lines.
+
+    This bridge matters for records produced after ``online_solved`` was added to
+    the durable text log but before the richer ``metrics.jsonl`` artifact channel
+    landed. As with metrics files, coverage is all-or-nothing across seeds.
+    """
+    frames = []
+    for _seed, log in sorted(logs.items()):
+        df = log["df"]
+        if "online_solved_frac" not in df or df["online_solved_frac"].isna().any():
+            return None
+        frames.append(df[["step", "online_solved_frac"]].rename(
+            columns={"online_solved_frac": ONLINE_METRIC}
+        ))
     return frames
 
 
@@ -725,10 +752,22 @@ def plot_leaderboard(cfg: dict) -> None:
 
 
 def make_leaderboard() -> None:
-    """Regenerate every track's world-record figure from the README tables."""
+    """Regenerate every track's leaderboard and rolling training-curve assets."""
     set_leaderboard_style()
     for track in TRACKS:
         plot_leaderboard(TRACKS[track])
+    sys.stdout.flush()
+    subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "plot_track_train_solve_rate.py"),
+            "--recent",
+            "--out-dir",
+            str(REPO_ROOT / "assets"),
+        ],
+        cwd=REPO_ROOT,
+        check=True,
+    )
 
 
 def _track_path_prefix(track: str) -> str:
@@ -907,10 +946,11 @@ def main() -> None:
     ap.add_argument("record_dir", type=Path, nargs="?",
                     help="record dir to report on (omit with --leaderboard)")
     ap.add_argument("--leaderboard", action="store_true",
-                    help="regenerate the README world-record figures (assets/*.png) from the leaderboard tables, then exit")
+                    help="regenerate the README leaderboard and recent-training figures (assets/*.png), then exit")
     ap.add_argument("--update-leaderboard", action="store_true",
                     help="after writing the per-record report, insert/refresh this record's row in the "
-                         "README world-record table and redraw the figures (Description/Contributors left for you)")
+                         "README world-record table and redraw the leaderboard + recent-training figures "
+                         "(Description/Contributors left for you)")
     ap.add_argument("--wandb-runs", default=None,
                     help="comma-separated entity/project/run_id list, one per seed, ordered like the seed files")
     ap.add_argument("--prev", type=Path, default=None, help="previous record dir for the config diff")
@@ -945,6 +985,10 @@ def main() -> None:
         online_frames = load_metrics_frames(args.record_dir, record["logs"])
         if online_frames is not None:
             print(f"using metrics_seed*.jsonl for the online train metric ({len(seeds)} seed(s))")
+        else:
+            online_frames = load_inline_online_frames(record["logs"])
+            if online_frames is not None:
+                print(f"using inline online_solved for the online train metric ({len(seeds)} seed(s))")
 
     plot_training(record, online_frames, plots / "training.png", target)
     plot_stability(record, plots / "stability.png")
