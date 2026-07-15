@@ -23,7 +23,8 @@
 # Collects only the record artifacts (not the multi-GB checkpoint), including the source snapshot
 # when present, renames to the seed convention, then regenerates the record report + verifies
 # (verify_record checks submission AND verification). A submission also inserts/refreshes this
-# record's README leaderboard row and redraws the figures (fill in Description + Contributors after).
+# record's README leaderboard row and redraws the leaderboard + rolling training figures
+# (fill in Description + Contributors after). Verification refreshes those assets with seed two.
 set -euo pipefail
 
 RUN="${RUN:?set RUN to the run name (local outputs/<RUN>/, or outputs/<RUN>/ on the volume with SOURCE=modal)}"
@@ -198,10 +199,9 @@ if [ -n "$VERIFY_OF" ]; then
   echo ">> verifier.txt: ${VERIFIER:-<unset — add one before merging>}"
 fi
 
-# A submission also writes its README leaderboard row + redraws the figures; a verification doesn't
-# (it reruns the same record, adding no new row).
-report_args=("$RECORD")
-[ -z "$VERIFY_OF" ] && report_args+=(--update-leaderboard)
+# A submission adds its README leaderboard row; verification refreshes that same row. Both redraw
+# the figures so the rolling training plot gains its matched two-seed band after the rerun.
+report_args=("$RECORD" --update-leaderboard)
 echo ">> generating report + plots for $RECORD"
 uv run python ../make_record_report.py "${report_args[@]}"
 echo ">> verifying $RECORD (submission + verification)"
@@ -210,7 +210,7 @@ echo
 if [ -n "$VERIFY_OF" ]; then
   echo ">> DONE. Verification appended to $RECORD; its README now has a ## Verification section."
 else
-  echo ">> DONE. Leaderboard row added + figures redrawn. Next:"
+  echo ">> DONE. Leaderboard row added + leaderboard/training figures redrawn. Next:"
   echo "   1) fill in the placeholder '## Idea' section in $DEST/README.md"
   echo "   2) fill in the new row's Description + Contributors in README.md"
   echo "   3) run a verification rerun (different seed): RUN=<VRUN> VERIFY_OF=$DEST ./assemble_record.sh"
