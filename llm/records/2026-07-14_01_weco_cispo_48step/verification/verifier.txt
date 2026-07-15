@@ -1,0 +1,1 @@
+@lorenzflow; independent seed43 verification of the same 48-step CISPO recipe on local 8xH100 Slurm

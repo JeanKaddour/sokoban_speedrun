@@ -111,7 +111,7 @@ RECIPE = [
     "--lr-schedule", "linear",
     "--min-lr-frac", "0.15",
     "--lr-decay-steps", "60",
-    "--max-steps", "35",          # the record's step count; override on the CLI for probes/longer runs
+    "--max-steps", "48",          # the record's step count; override on the CLI for probes/longer runs
     "--grad-clip", "1.0",
     "--loss-fn", "cispo",        # record 6: CISPO (advantage-mode auto-resolves to 'centered')
     "--adv-centered-blend", "0.04",    # record 6: Weco advantage shaping (see shape_group_advantages)
