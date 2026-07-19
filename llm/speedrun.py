@@ -88,9 +88,11 @@ WANDB_PROJECT = "sokoban-speedrun-llm"
 # starves generation. That is a torchrun launch param, NOT a speedrun CLI arg, so modal_app.py
 # defaults it from the GPU count (3 on 8-GPU nodes, 1 on smaller boxes), not in this list. Local
 # record runs should use `cd llm` then
-# `NODE_GPUS=8 uv run torchrun --standalone --nproc_per_node=3 -m speedrun ...`.
+# `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True NODE_GPUS=8 uv run torchrun
+# --standalone --nproc_per_node=3 -m speedrun ...`. Expandable segments are important at db=2:
+# long-sequence microbatches otherwise fragment the narrow H100 memory margin between steps.
 RECIPE = [
-    "--dtype", "float32",       # load trainer params/head fp32; train autocast runs body bf16, head/logits fp32
+    "--dtype", "float32",       # proven >80% path; body autocasts bf16 while params/Adam stay fp32
     "--train-data", "datasets/sokoban_train.jsonl",
     "--eval-data", "datasets/sokoban_eval.jsonl",
     "--examples-per-step", "16",
@@ -99,7 +101,7 @@ RECIPE = [
     "--top-p", "0.95",
     "--max-new-tokens", "4800",  # record 5: shorter thinking budget is the speed lever (~32.5s/step vs ~39s)
     "--max-model-len", "6144",
-    "--device-batch-size", "2",   # 4B fp32 params+grads+optimizer fit one 80GB H100 at db=2 (microbatch only, grad-identical)
+    "--device-batch-size", "2",   # fp32 params+Adam fit one 80GB H100 at db=2
     "--logits-chunk-size", "2048",
     "--gradient-checkpointing",
     "--no-log-entropy",           # the entropy softmax temp would OOM 4B at the memory ceiling
@@ -111,14 +113,19 @@ RECIPE = [
     "--lr-schedule", "linear",
     "--min-lr-frac", "0.15",
     "--lr-decay-steps", "60",
-    "--max-steps", "35",          # the record's step count; override on the CLI for probes/longer runs
+    "--max-steps", "28",          # MaxRL+WECO record: 85.125% pass@1 in 15:17.1 on 8x H100
     "--grad-clip", "1.0",
-    "--loss-fn", "cispo",        # record 6: CISPO (advantage-mode auto-resolves to 'centered')
+    "--loss-fn", "dppo",         # DPPO-Binary-TV trust region around the async behavior policy
+    "--advantage-mode", "maxrl", # hard-group-weighted grouped REINFORCE estimator
     "--adv-centered-blend", "0.04",    # record 6: Weco advantage shaping (see shape_group_advantages)
     "--adv-difficulty-weight", "0.18",
     "--adv-difficulty-ramp", "1.0",
     "--adv-variance-boost", "1.1",
     "--cispo-eps", "4.0",
+    "--dppo-divergence", "binary_tv",
+    "--dppo-delta", "0.2",       # paper's default for dense full-parameter scaling runs
+    "--dppo-is-cap", "5.0",      # paper's scaling-experiment IS cap C
+    "--echo-alpha", "0.0",       # ECHO is opt-in; one-shot final-board ablation did not clear 80%
     "--loss-normalization", "sequence",  # sample-level objective normalization.
     "--max-staleness", "4",          # less off-policy than ScaleRL's 8; a proven stability lever
     "--inflight-requests", "64",     # outstanding-group tickets, reissued at CONSUME time: pins total unconsumed
@@ -296,6 +303,25 @@ def score_sokoban_moves(moves: str | None, entry: dict[str, Any]) -> float:
     return float(_SOKOBAN_DATASET.score_answer(answer=moves, entry=entry))
 
 
+def simulate_sokoban_state(moves: str | None, entry: dict[str, Any]) -> tuple[str, str]:
+    """Execute an action and return (initial_state, final_state) for reward and ECHO targets.
+
+    An absent/unparseable action is the environment's no-op response. Keeping that observation
+    means failed rollouts still provide world-model supervision, which is ECHO's main benefit.
+    """
+    import numpy as np
+
+    grid = [list(line) for line in entry["metadata"]["gamestr"].replace(" ", "").strip().split("\n")]
+    matrix = np.array(grid)
+    h, w = matrix.shape
+    game = _SOKOBAN_DATASET._Game(height=h, width=w)
+    game.load_puzzle_matrix(matrix)
+    init_state = game.get_curr_state()
+    for move in moves or "":
+        game.player.update(key=move)
+    return init_state, game.get_curr_state()
+
+
 def score_sokoban_progress(moves: str | None, entry: dict[str, Any]) -> float:
     """Dense TRAINING reward in [0, 1] measuring PROGRESS from the puzzle's initial state: the
     fraction of the initially-uncovered goals that `moves` ends up covering (RG's own game engine
@@ -308,20 +334,11 @@ def score_sokoban_progress(moves: str | None, entry: dict[str, Any]) -> float:
 
     Board symbols (RG): '$' box-on-goal, '@' box-off-goal, 'X' empty goal, '%' player-on-goal.
     is_solved == ('@' not in state); total goal cells are invariant under moves."""
-    if not isinstance(moves, str):
-        return 0.0
-    import numpy as np
     try:
-        grid = [list(line) for line in entry["metadata"]["gamestr"].replace(" ", "").strip().split("\n")]
-        matrix = np.array(grid)
-        h, w = matrix.shape
-        game = _SOKOBAN_DATASET._Game(height=h, width=w)
-        game.load_puzzle_matrix(matrix)
-        init_state = game.get_curr_state()
-        for move in moves:
-            game.player.update(key=move)
-        state = game.get_curr_state()
+        init_state, state = simulate_sokoban_state(moves, entry)
     except Exception:
+        return 0.0
+    if not isinstance(moves, str):
         return 0.0
     if "@" not in state:          # fully solved — matches the binary scorer exactly
         return 1.0
@@ -537,11 +554,15 @@ def load_model_and_tokenizer(args: argparse.Namespace, device: torch.device):
     model.to(device)
     print0(f"Attention implementation: {getattr(model.config, '_attn_implementation', 'unknown')}")
 
-    if dtype != torch.float32 and hasattr(model, "lm_head") and isinstance(model.lm_head, torch.nn.Linear):
+    if (dtype != torch.float32
+            and hasattr(model, "lm_head")
+            and isinstance(model.lm_head, torch.nn.Linear)
+            and not getattr(model.config, "tie_word_embeddings", False)):
+        # Untied heads can safely keep their own fp32 parameter. Tied heads (Qwen3) must remain
+        # aliased to embed_tokens so vLLM sees exactly the weight the trainer updates; the chunked
+        # head path below functionally upcasts that shared bf16 weight for fp32 logits.
         model.lm_head = FP32LMHead(model.lm_head)
         model.lm_head.to(device)
-        if getattr(model.config, "tie_word_embeddings", False):
-            model.config.tie_word_embeddings = False
 
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -1043,6 +1064,7 @@ class RolloutExample:
     puzzle_id: int
     completion: str = ""
     loss_mask: list[bool] | None = None
+    echo_mask: list[bool] | None = None
     group_token_count: int = 0
 
 
@@ -1063,10 +1085,12 @@ class ProcessedRolloutSample:
     sequence: torch.Tensor
     behavior_logprobs: list[float]
     loss_mask: list[bool] | None
+    echo_mask: list[bool] | None
     completion: str
     moves: str | None
     reward: float
     finish_reason: str | None
+    action_token_count: int
 
 
 @dataclass(frozen=True)
@@ -1310,8 +1334,8 @@ def sort_and_shard_for_microbatching(
     return shards, adv_shards
 
 
-def local_and_global_counts(local_examples: list["RolloutExample"]) -> tuple[int, int]:
-    """Per-shard (sample_count, token_count) for one trainer rank, counting only real
+def local_and_global_counts(local_examples: list["RolloutExample"]) -> tuple[int, int, int]:
+    """Per-shard (sample_count, RL-token count, ECHO-token count), counting only real
     examples. Pad examples (empty behavior_logprobs) add 0 to BOTH counts, so summing
     across ranks recovers the unpadded global counts and the loss stays byte-equivalent
     to the unpadded full-batch gradient in both normalization branches.
@@ -1324,7 +1348,11 @@ def local_and_global_counts(local_examples: list["RolloutExample"]) -> tuple[int
         (sum(e.loss_mask) if e.loss_mask is not None else len(e.behavior_logprobs))
         for e in local_examples
     )
-    return local_sample_count, local_token_count
+    local_echo_token_count = sum(
+        sum(e.echo_mask) if e.echo_mask is not None else 0
+        for e in local_examples
+    )
+    return local_sample_count, local_token_count, local_echo_token_count
 
 
 def _scatter_payload(
@@ -1605,6 +1633,7 @@ def process_rollout_sample(
     conversation: dict[str, Any],
     *,
     trim_after_answer: bool,
+    echo_alpha: float = 0.0,
 ) -> ProcessedRolloutSample:
     """Convert one vLLM sample into trainable fields, extracting the Sokoban answer once.
 
@@ -1629,19 +1658,51 @@ def process_rollout_sample(
         completion = tokenizer.decode(generated.tolist(), skip_special_tokens=True)
         moves = extract_sokoban_answer(completion)
     reward = score_sokoban_progress(moves, conversation)
+    action_token_count = len(behavior_logprobs)
+    echo_mask = None
+    if echo_alpha > 0.0:
+        # One-shot Sokoban adaptation of ECHO: the complete submitted move string is the agent
+        # action and the simulator's resulting board is its environment observation. Append that
+        # observation to the same causal sequence, but keep it out of policy gradient / IS. Only
+        # the observation body (not the synthetic role delimiters) receives env-token CE.
+        try:
+            _, final_state = simulate_sokoban_state(moves, conversation)
+        except Exception:
+            final_state = extract_sokoban_board(conversation["question"]).replace(" ", "")
+        solved = "yes" if "@" not in final_state else "no"
+        env_prefix = "\n<environment>\n"
+        env_body = f"Final board:\n{final_state}\nSolved: {solved}"
+        env_suffix = "\n</environment>"
+        prefix_ids = tokenizer.encode(env_prefix, add_special_tokens=False)
+        body_ids = tokenizer.encode(env_body, add_special_tokens=False)
+        suffix_ids = tokenizer.encode(env_suffix, add_special_tokens=False)
+        env_ids = prefix_ids + body_ids + suffix_ids
+        sequence = torch.cat([sequence, torch.tensor(env_ids, dtype=torch.long)])
+        behavior_logprobs.extend([0.0] * len(env_ids))
+        action_mask = loss_mask if loss_mask is not None else [True] * action_token_count
+        loss_mask = action_mask + [False] * len(env_ids)
+        echo_mask = (
+            [False] * action_token_count
+            + [False] * len(prefix_ids)
+            + [True] * len(body_ids)
+            + [False] * len(suffix_ids)
+        )
     return ProcessedRolloutSample(
         sequence=sequence,
         behavior_logprobs=behavior_logprobs,
         loss_mask=loss_mask,
+        echo_mask=echo_mask,
         completion=completion,
         moves=moves,
         reward=reward,
         finish_reason=sample.get("finish_reason"),
+        action_token_count=action_token_count,
     )
 
 
 # ============================ MICROBATCH TENSORIZATION & CISPO LOSS ============================
-def build_rl_batch_varprefix_cpu(sequences, prefixes, pad_token_id, masks=None, pin_memory=False):
+def build_rl_batch_varprefix_cpu(sequences, prefixes, pad_token_id, masks=None, echo_masks=None,
+                                 pin_memory=False):
     """Pad/concat + mask construction for one RL microbatch, with NO CUDA calls beyond
     optional pinned allocation, so a prefetch thread can build the NEXT microbatch while
     the current one's fwd/bwd runs; the train loop then issues one non_blocking H2D copy
@@ -1652,35 +1713,44 @@ def build_rl_batch_varprefix_cpu(sequences, prefixes, pad_token_id, masks=None, 
         raise ValueError("sequences and prefixes must align")
     if masks is not None and len(masks) != len(sequences):
         raise ValueError("masks must align with sequences")
+    if echo_masks is not None and len(echo_masks) != len(sequences):
+        raise ValueError("echo_masks must align with sequences")
     max_length = max(int(seq.numel()) for seq in sequences)
     if max_length < 2:
         raise ValueError("Sequences must contain at least two tokens")
     ids = torch.full((len(sequences), max_length), pad_token_id, dtype=torch.long,
                      pin_memory=pin_memory)
     real = torch.zeros((len(sequences), max_length), dtype=torch.bool, pin_memory=pin_memory)
-    gen = torch.zeros((len(sequences), max_length), dtype=torch.bool)
+    rl_gen = torch.zeros((len(sequences), max_length), dtype=torch.bool)
+    echo_gen = torch.zeros((len(sequences), max_length), dtype=torch.bool)
     for row, (seq, pfx) in enumerate(zip(sequences, prefixes)):
         seq = seq.to(device="cpu", dtype=torch.long)
         n = int(seq.numel())
         ids[row, :n] = seq
         real[row, :n] = True
         if n > pfx:
-            gen[row, pfx:n] = True
+            rl_gen[row, pfx:n] = True
             # Drop injected (interruption-marker) positions from the training targets: present in
             # `real` (attended to as context) but excluded from `gen`/labels so they carry no gradient.
             m = masks[row] if masks is not None else None
             if m is not None:
                 if len(m) != n - pfx:
                     raise ValueError(f"row {row}: loss_mask len {len(m)} != generated len {n - pfx}")
-                gen[row, pfx:n] &= torch.tensor(m, dtype=torch.bool)
+                rl_gen[row, pfx:n] &= torch.tensor(m, dtype=torch.bool)
+            em = echo_masks[row] if echo_masks is not None else None
+            if em is not None:
+                if len(em) != n - pfx:
+                    raise ValueError(f"row {row}: echo_mask len {len(em)} != generated len {n - pfx}")
+                echo_gen[row, pfx:n] = torch.tensor(em, dtype=torch.bool)
     input_ids = ids[:, :-1]
     # ids[:, :-1] / real[:, :-1] are views of pinned storage and stay pinned; a plain .clone()
     # for labels would allocate UNPINNED memory and silently degrade its non_blocking H2D copy,
     # so copy into an explicitly (optionally pinned) buffer instead.
     labels = torch.empty((len(sequences), max_length - 1), dtype=torch.long, pin_memory=pin_memory)
     labels.copy_(ids[:, 1:])
-    labels.masked_fill_(~gen[:, 1:], IGNORE_INDEX)
-    return input_ids, real[:, :-1], labels
+    train_targets = rl_gen | echo_gen
+    labels.masked_fill_(~train_targets[:, 1:], IGNORE_INDEX)
+    return input_ids, real[:, :-1], labels, rl_gen[:, 1:], echo_gen[:, 1:]
 
 
 def build_behavior_logprob_tensor_varprefix_cpu(sequences, behavior_logprobs, prefixes,
@@ -1710,11 +1780,13 @@ def tensorize_microbatch_cpu(microbatch, pad_token_id, pin_memory=False):
     seqs = [e.sequence for e in microbatch]
     prefixes = [e.prefix_length for e in microbatch]
     masks = [e.loss_mask for e in microbatch]
-    input_ids, attention_mask, labels = build_rl_batch_varprefix_cpu(
-        seqs, prefixes, pad_token_id, masks=masks, pin_memory=pin_memory)
+    echo_masks = [e.echo_mask for e in microbatch]
+    input_ids, attention_mask, labels, rl_mask, echo_mask = build_rl_batch_varprefix_cpu(
+        seqs, prefixes, pad_token_id, masks=masks, echo_masks=echo_masks,
+        pin_memory=pin_memory)
     beh = build_behavior_logprob_tensor_varprefix_cpu(
         seqs, [e.behavior_logprobs for e in microbatch], prefixes, pin_memory=pin_memory)
-    return input_ids, attention_mask, labels, beh
+    return input_ids, attention_mask, labels, beh, rl_mask, echo_mask
 
 
 def token_logprobs_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -1774,7 +1846,15 @@ def chunked_token_logprobs(lm_head, hidden_states, labels, chunk_size=1024, entr
             # autocast and upcast the hidden input so the head matmul runs in fp32. The trailing
             # .float() also normalizes the output for a bf16-weight head; keep both.
             with torch.autocast(device_type=h_chunk.device.type, enabled=False):
-                logits = lm_head(h_chunk.float()).float()
+                if (isinstance(lm_head, torch.nn.Linear)
+                        and lm_head.weight.dtype != torch.float32):
+                    # Preserve tied embedding/head parameters in bf16 while retaining the proven
+                    # fp32-logit DPPO/CISPO numerics. `.float()` is differentiable, so gradients
+                    # still land on the single shared bf16 Parameter that weight sync broadcasts.
+                    bias = lm_head.bias.float() if lm_head.bias is not None else None
+                    logits = F.linear(h_chunk.float(), lm_head.weight.float(), bias)
+                else:
+                    logits = lm_head(h_chunk.float()).float()
             tlp = token_logprobs_from_logits(logits, lab_chunk)
             if return_entropy_grad:
                 # Per-token H(pi) carried THROUGH the checkpoint WITH gradient (entropy bonus);
@@ -1816,6 +1896,9 @@ def policy_gradient_loss_from_token_logprobs(
     behavior_logprobs: torch.Tensor | None = None,
     loss_fn: str = "cispo",
     cispo_eps: float | None = None,
+    dppo_divergence: str = "binary_tv",
+    dppo_delta: float | None = None,
+    dppo_is_cap: float | None = None,
     clip_eps_low: float | None = None,
     clip_eps_high: float | None = None,
     clip_ratio_c: float | None = None,
@@ -1824,14 +1907,29 @@ def policy_gradient_loss_from_token_logprobs(
     kl_tau: float = 0.0,
     entropy_tokens: torch.Tensor | None = None,
     entropy_coef: float = 0.0,
+    rl_mask: torch.Tensor | None = None,
+    echo_mask: torch.Tensor | None = None,
+    echo_alpha: float = 0.0,
+    echo_token_normalizer: torch.Tensor | float | None = None,
 ) -> torch.Tensor:
     """Each loss variant builds a per-token OBJECTIVE tensor J (to be maximized); the
     token/sequence/prompt aggregation below is shared and identical across variants.
-    CISPO is the only variant whose J is zero at IGNORE positions by construction
-    (token_logprobs is masked to 0 there); grpo/gspo objectives are exp(log_ratio)-shaped,
+    CISPO and DPPO are zero at IGNORE positions by construction (token_logprobs is masked
+    to 0 there and DPPO explicitly applies its valid-token mask); grpo/gspo objectives are
+    exp(log_ratio)-shaped,
     which is A (not 0) at IGNORE positions (pads, injected interruption markers, where
     behavior holds 0.0 placeholders), so they MUST be explicitly masked."""
     advantage_weight = advantages.to(token_logprobs.dtype).unsqueeze(-1)  # (B, 1)
+    rl_valid = (labels != IGNORE_INDEX) if rl_mask is None else rl_mask.bool()
+    echo_valid = torch.zeros_like(rl_valid) if echo_mask is None else echo_mask.bool()
+    if torch.any(rl_valid & echo_valid):
+        raise ValueError("RL and ECHO token masks must be disjoint")
+    echo_loss = token_logprobs.new_zeros(())
+    if echo_alpha != 0.0:
+        echo_count = echo_valid.sum().clamp(min=1)
+        echo_denom = echo_count if echo_token_normalizer is None else echo_token_normalizer
+        echo_loss = -echo_alpha * token_logprobs.masked_fill(~echo_valid, 0.0).sum() / (
+            echo_denom * normalizer)
     kl_per_token = None  # set below when the optional KL anchor is active (behavior-logprob branch only)
     # Optional entropy bonus: maximize mean H(pi) over valid tokens, aggregated with the SAME
     # denominator as the policy objective (so entropy_coef means the same across token/sequence/
@@ -1839,10 +1937,10 @@ def policy_gradient_loss_from_token_logprobs(
     entropy_per_token = None
     if entropy_tokens is not None and entropy_coef != 0.0:
         entropy_per_token = entropy_tokens.to(token_logprobs.dtype).masked_fill(
-            labels == IGNORE_INDEX, 0.0)
+            ~rl_valid, 0.0)
     if behavior_logprobs is not None:
         log_ratio = token_logprobs - behavior_logprobs.to(token_logprobs.dtype)
-        valid = labels != IGNORE_INDEX
+        valid = rl_valid
         if loss_fn == "cispo":
             if cispo_eps is None or cispo_eps <= 0:
                 raise ValueError("cispo_eps must be a positive float for the cispo loss")
@@ -1851,8 +1949,51 @@ def policy_gradient_loss_from_token_logprobs(
             # exp to avoid overflow: exp(min(log_ratio, log eps)) == min(ratio, eps).
             is_weight = torch.exp(torch.clamp(log_ratio, max=math.log(cispo_eps))).detach()
             token_weight = is_weight * advantage_weight  # (B, T)
-            per_token_objective = token_logprobs * token_weight
+            per_token_objective = (token_logprobs * token_weight).masked_fill(~valid, 0.0)
             clip_active = (log_ratio > math.log(cispo_eps)) & valid
+        elif loss_fn == "dppo":
+            if dppo_delta is None or dppo_delta <= 0:
+                raise ValueError("dppo_delta must be positive for the dppo loss")
+            if dppo_is_cap is None or dppo_is_cap <= 0:
+                raise ValueError("dppo_is_cap must be positive for the dppo loss")
+
+            # DPPO (Qi et al., arXiv:2602.04879), binary approximation. Collapse the
+            # categorical policy into Bernoulli(sampled token vs all other tokens), then
+            # block only an update that is already moving AWAY from the behavior policy and
+            # has crossed the divergence trust region. Unlike PPO ratio clipping, absolute
+            # probability movement lets low-probability reasoning tokens change freely while
+            # still constraining dangerous changes to high-probability tokens.
+            eps = torch.finfo(token_logprobs.dtype).eps
+            behavior_lp = behavior_logprobs.to(token_logprobs.dtype)
+            policy_prob = torch.exp(token_logprobs).clamp(min=eps, max=1.0 - eps)
+            behavior_prob = torch.exp(behavior_lp).clamp(min=eps, max=1.0 - eps)
+            if dppo_divergence == "binary_tv":
+                divergence = (policy_prob - behavior_prob).abs()
+            elif dppo_divergence == "binary_kl":
+                divergence = (
+                    behavior_prob * (torch.log(behavior_prob) - torch.log(policy_prob))
+                    + (1.0 - behavior_prob)
+                    * (torch.log1p(-behavior_prob) - torch.log1p(-policy_prob))
+                ).clamp(min=0.0)
+            else:
+                raise ValueError(f"unknown DPPO divergence: {dppo_divergence!r}")
+
+            moving_away = torch.where(
+                advantage_weight > 0,
+                log_ratio > 0,
+                torch.where(advantage_weight < 0, log_ratio < 0, torch.zeros_like(valid)),
+            )
+            clip_active = moving_away & (divergence > dppo_delta) & valid
+            trust_mask = (~clip_active).to(token_logprobs.dtype).detach()
+
+            # The paper's unified formulation uses a stopped-gradient importance weight,
+            # min(pi / behavior, C). C=5 is its default in the scaling experiments.
+            is_weight = torch.exp(
+                torch.clamp(log_ratio, max=math.log(dppo_is_cap))
+            ).detach()
+            per_token_objective = (
+                token_logprobs * is_weight * advantage_weight * trust_mask
+            ).masked_fill(~valid, 0.0)
         elif loss_fn == "grpo":
             if clip_eps_low is None or clip_eps_high is None:
                 raise ValueError("clip_eps_low/clip_eps_high are required for the grpo loss")
@@ -1893,7 +2034,7 @@ def policy_gradient_loss_from_token_logprobs(
         # token_logprobs only (behavior_logprobs is detached). Mask to valid tokens because log_ratio
         # is not necessarily 0 at IGNORE positions (token_logprobs is, but behavior may not be).
         if kl_tau != 0.0:
-            kl_per_token = (log_ratio * log_ratio).masked_fill(labels == IGNORE_INDEX, 0.0)
+            kl_per_token = (log_ratio * log_ratio).masked_fill(~valid, 0.0)
         if stats is not None:
             # Off-policy drift diagnostics over valid (generated) tokens. Loss-agnostic except
             # is_clipped_count, which counts the tokens where THIS loss's clip is active.
@@ -1911,7 +2052,7 @@ def policy_gradient_loss_from_token_logprobs(
                 stats["is_ratio_sq_sum"] = (((raw_ratio * raw_ratio) * valid).sum()).detach()
     else:
         token_weight = advantage_weight              # (B, 1) broadcasts
-        per_token_objective = token_logprobs * token_weight
+        per_token_objective = (token_logprobs * token_weight).masked_fill(~rl_valid, 0.0)
     if prompt_lengths is not None:
         # ScaleRL prompt-level aggregation (ScaleRL §3.2, the J_ScaleRL objective): each
         # sample's token-summed loss is divided by its PROMPT GROUP's total valid-token count L_p
@@ -1930,9 +2071,9 @@ def policy_gradient_loss_from_token_logprobs(
         if entropy_per_token is not None:
             entropy_objective = (entropy_per_token.sum(dim=-1) / denom).sum() / (prompt_normalizer * normalizer)
             loss = loss - entropy_coef * entropy_objective
-        return loss
+        return loss + echo_loss
     if sequence_normalize:
-        valid_mask = labels != IGNORE_INDEX
+        valid_mask = rl_valid
         sample_lengths = valid_mask.sum(dim=-1).clamp(min=1).to(token_logprobs.dtype)
         sample_normalizer = labels.size(0) if valid_sample_normalizer is None else valid_sample_normalizer
         pg_objective = (per_token_objective.sum(dim=-1) / sample_lengths).sum() / (sample_normalizer * normalizer)
@@ -1943,8 +2084,8 @@ def policy_gradient_loss_from_token_logprobs(
         if entropy_per_token is not None:
             entropy_objective = (entropy_per_token.sum(dim=-1) / sample_lengths).sum() / (sample_normalizer * normalizer)
             loss = loss - entropy_coef * entropy_objective
-        return loss
-    valid_count = (labels != IGNORE_INDEX).sum().clamp(min=1)
+        return loss + echo_loss
+    valid_count = rl_valid.sum().clamp(min=1)
     token_normalizer = valid_count if valid_token_normalizer is None else valid_token_normalizer
     pg_objective = per_token_objective.sum() / (token_normalizer * normalizer)
     loss = -pg_objective
@@ -1954,17 +2095,20 @@ def policy_gradient_loss_from_token_logprobs(
     if entropy_per_token is not None:
         entropy_objective = entropy_per_token.sum() / (token_normalizer * normalizer)
         loss = loss - entropy_coef * entropy_objective
-    return loss
+    return loss + echo_loss
 
 
 def chunked_policy_loss(model, input_ids, attention_mask, labels, advantages, *,
                         behavior_logprobs=None, loss_fn="cispo", cispo_eps=None,
+                        dppo_divergence="binary_tv", dppo_delta=None, dppo_is_cap=None,
                         clip_eps_low=None, clip_eps_high=None, clip_ratio_c=None,
                         chunk_size=1024,
                         valid_token_normalizer=None, valid_sample_normalizer=None,
                         normalizer=1.0, sequence_normalize=False, stats=None,
                         autocast_dtype=None, prompt_lengths=None, kl_tau=0.0,
-                        compute_entropy=False, entropy_coef=0.0):
+                        compute_entropy=False, entropy_coef=0.0,
+                        rl_mask=None, echo_mask=None, echo_alpha=0.0,
+                        echo_token_normalizer=None):
     """Memory-efficient policy loss (cispo/grpo/gspo): run the base model to hidden states
     (small: B,T,H), then apply the LM head + cross-entropy in checkpointed sequence chunks to
     avoid materializing the full (T, vocab) fp32 logits. The head always runs in fp32; with
@@ -1987,7 +2131,7 @@ def chunked_policy_loss(model, input_ids, attention_mask, labels, advantages, *,
             lm_head, hidden, labels, chunk_size=chunk_size, return_entropy_grad=True)
         if stats is not None:
             with torch.no_grad():
-                valid = labels != IGNORE_INDEX
+                valid = (labels != IGNORE_INDEX) if rl_mask is None else rl_mask.bool()
                 stats["entropy_sum"] = (entropy_tokens.detach() * valid).sum()
                 stats["entropy_count"] = valid.sum()
     else:
@@ -2004,9 +2148,12 @@ def chunked_policy_loss(model, input_ids, attention_mask, labels, advantages, *,
         valid_sample_normalizer=valid_sample_normalizer,
         normalizer=normalizer, sequence_normalize=sequence_normalize,
         behavior_logprobs=behavior_logprobs, loss_fn=loss_fn, cispo_eps=cispo_eps,
+        dppo_divergence=dppo_divergence, dppo_delta=dppo_delta, dppo_is_cap=dppo_is_cap,
         clip_eps_low=clip_eps_low, clip_eps_high=clip_eps_high, clip_ratio_c=clip_ratio_c,
         stats=stats, prompt_lengths=prompt_lengths, kl_tau=kl_tau,
-        entropy_tokens=entropy_tokens, entropy_coef=entropy_coef)
+        entropy_tokens=entropy_tokens, entropy_coef=entropy_coef,
+        rl_mask=rl_mask, echo_mask=echo_mask, echo_alpha=echo_alpha,
+        echo_token_normalizer=echo_token_normalizer)
 
 
 def batch_normalize_advantages(advantages: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -2518,16 +2665,6 @@ def run_pipeline(
         ((ex.get("metadata") or {}).get("band") or "") for ex in train_task.examples
     ]
 
-    if args.dtype != "float32":
-        # Non-fp32 triggers the FP32LMHead wrapper, which unties lm_head from embed_tokens on
-        # tied-embedding models (e.g. all Qwen3). The trainer would then learn a separate
-        # lm_head.weight that the still-tied vLLM generator skips on weight sync, desyncing the
-        # generator head from the trained policy. fp32 keeps the tie (only embed_tokens.weight
-        # syncs) and yields fp32 logits inherently.
-        raise ValueError(
-            "training requires --dtype float32 (non-fp32 untie of lm_head desyncs the "
-            "vLLM generator head from the trained policy on tied-embedding models)"
-        )
     if args.device and args.device.lower() != "cuda":
         raise ValueError(
             "--device is currently only supported as 'cuda' for training; the pipeline depends "
@@ -2915,6 +3052,7 @@ def run_pipeline(
                     sample,
                     meta["conversation"],
                     trim_after_answer=args.trim_after_answer,
+                    echo_alpha=args.echo_alpha,
                 ),
                 msg["samples"],
             ))
@@ -2966,7 +3104,7 @@ def run_pipeline(
                         "staleness": current_version - version,
                         "puzzle_id": pid, "status": status,
                         "reward": float(sample.reward), "advantage": float(a),
-                        "gen_tokens": len(sample.behavior_logprobs),
+                        "gen_tokens": sample.action_token_count,
                         "finish_reason": sample.finish_reason,
                         "completion": sample.completion,
                     })
@@ -2991,10 +3129,11 @@ def run_pipeline(
                     behavior_logprobs=sample.behavior_logprobs,
                     weight_version=version, puzzle_id=pid,
                     completion=sample.completion,
-                    loss_mask=sample.loss_mask))
+                    loss_mask=sample.loss_mask,
+                    echo_mask=sample.echo_mask))
                 cs.finish_reasons.append(sample.finish_reason)
                 cs.staleness.append(current_version - version)
-                cs.gen_tokens_total += len(sample.behavior_logprobs)
+                cs.gen_tokens_total += sample.action_token_count
             cs.puzzles_used += 1
         times["collect"] = time.monotonic() - t_step_start
         return cs
@@ -3399,7 +3538,7 @@ def run_pipeline(
                 my_adv = torch.tensor(adv_shards[0], dtype=torch.float32, device=device)
                 global_num_prompts = num_prompts_local
 
-            # ---- CISPO training step ----
+            # ---- Policy training step ----
             t_train_start = time.monotonic()
             optimizer.zero_grad(set_to_none=True)
             total = len(my_shard)
@@ -3410,16 +3549,18 @@ def run_pipeline(
             # gradient. They exclude pads and any zero-token example (which contributes 0 to both
             # numerator and denominator); for real rollouts they equal the single-GPU
             # len(step_examples). Placed after scatter (shard sizes known) and before backward. ----
-            local_sample_count, local_token_count = local_and_global_counts(my_shard)
+            local_sample_count, local_token_count, local_echo_token_count = local_and_global_counts(my_shard)
             if world_size > 1:
-                counts = torch.tensor([local_sample_count, local_token_count],
+                counts = torch.tensor([local_sample_count, local_token_count, local_echo_token_count],
                                       dtype=torch.long, device=device)
                 dist.all_reduce(counts, op=dist.ReduceOp.SUM)
                 global_sample_count = int(counts[0].item())
                 global_token_count = int(counts[1].item())
+                global_echo_token_count = int(counts[2].item())
             else:
                 global_sample_count = local_sample_count
                 global_token_count = local_token_count
+                global_echo_token_count = local_echo_token_count
             loss_sum_t = torch.zeros((), dtype=torch.float32, device=device)
             is_ratio_acc_t = torch.zeros((), dtype=torch.float32, device=device)
             is_clip_acc_t = torch.zeros((), dtype=torch.float32, device=device)
@@ -3452,7 +3593,7 @@ def run_pipeline(
             for mb_index, mb in enumerate(microbatches):
                 start = mb_index * args.device_batch_size
                 t_tensorize_start = time.monotonic()
-                ids_host, attn_host, labels_host, beh_host = pending_host.result()
+                ids_host, attn_host, labels_host, beh_host, rl_mask_host, echo_mask_host = pending_host.result()
                 if mb_index + 1 < len(microbatches):
                     pending_host = tensorize_pool.submit(
                         tensorize_microbatch_cpu, microbatches[mb_index + 1], pad_token_id, pin_host)
@@ -3462,6 +3603,8 @@ def run_pipeline(
                 attention_mask = attn_host.to(device, non_blocking=True)
                 labels = labels_host.to(device, non_blocking=True)
                 beh = beh_host.to(device, non_blocking=True)
+                rl_mask = rl_mask_host.to(device, non_blocking=True)
+                echo_mask = echo_mask_host.to(device, non_blocking=True)
                 train_padded_tokens_t = train_padded_tokens_t + float(ids_host.numel())
                 train_forward_backward_passes_t = train_forward_backward_passes_t + 1.0
                 times["batch_tensorize"] += time.monotonic() - t_tensorize_start
@@ -3477,6 +3620,8 @@ def run_pipeline(
                 loss = chunked_policy_loss(
                     model, input_ids, attention_mask, labels, my_adv[start:start + len(mb)],
                     behavior_logprobs=beh, loss_fn=args.loss_fn, cispo_eps=args.cispo_eps,
+                    dppo_divergence=args.dppo_divergence, dppo_delta=args.dppo_delta,
+                    dppo_is_cap=args.dppo_is_cap,
                     clip_eps_low=args.clip_eps_low, clip_eps_high=args.clip_eps_high,
                     clip_ratio_c=args.clip_ratio_c, chunk_size=args.logits_chunk_size,
                     valid_token_normalizer=global_token_count,
@@ -3489,6 +3634,10 @@ def run_pipeline(
                     kl_tau=args.kl_tau,
                     compute_entropy=args.log_entropy,
                     entropy_coef=args.entropy_coef,
+                    rl_mask=rl_mask,
+                    echo_mask=echo_mask,
+                    echo_alpha=args.echo_alpha,
+                    echo_token_normalizer=global_echo_token_count,
                 )
                 loss.backward()
                 loss_sum_t = loss_sum_t + loss.detach()
@@ -3714,7 +3863,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="float32",
         choices=["auto", "float32", "bfloat16", "float16"],
-        help="Parameter dtype used when loading the model. LM head is kept in fp32 when non-fp32 is chosen.",
+        help="Parameter dtype used when loading the model. Logits stay fp32; an untied LM head "
+             "is kept fp32, while a tied head remains shared and is functionally upcast.",
     )
     parser.add_argument(
         "--run",
@@ -3876,9 +4026,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="After each optimizer step (first few steps), assert all trainer-rank "
                              "model replicas are bit-identical via an all-reduce MIN==MAX checksum. "
                              "Debug guard; small overhead. No-op at world_size==1.")
-    parser.add_argument("--loss-fn", choices=["cispo", "grpo", "gspo"], default="cispo",
+    parser.add_argument("--loss-fn", choices=["cispo", "dppo", "grpo", "gspo"], default="cispo",
                         help="Policy loss. 'cispo' (default, record 1): stop-grad clipped IS weight times "
-                             "log-prob — clipped tokens keep a capped gradient. 'grpo': PPO-clip surrogate "
+                             "log-prob — clipped tokens keep a capped gradient. 'dppo': divergence-based "
+                             "trust-region mask with a stopped-gradient IS weight (Qi et al., 2026). "
+                             "'grpo': PPO-clip surrogate "
                              "(gradient through the ratio; clipped tokens get ZERO gradient), DAPO = grpo + "
                              "--clip-eps-high 0.28 + --loss-normalization token. 'gspo': length-normalized "
                              "SEQUENCE-level IS ratio, clipped (use with --loss-normalization sequence). "
@@ -3927,6 +4079,20 @@ def build_parser() -> argparse.ArgumentParser:
                              "diagnostic path is used instead). Try 1e-3 to ~1e-2.")
     parser.add_argument("--cispo-eps", type=float, default=4.0,
                         help="CISPO upper clip epsilon_max for the importance weight")
+    parser.add_argument("--dppo-divergence", choices=["binary_tv", "binary_kl"], default="binary_tv",
+                        help="DPPO binary divergence approximation. 'binary_tv' (paper scaling default) "
+                             "uses |pi(token)-behavior(token)|; 'binary_kl' uses the Bernoulli KL over "
+                             "the sampled token versus all other tokens.")
+    parser.add_argument("--dppo-delta", type=float, default=None,
+                        help="DPPO divergence trust-region threshold. Default resolves to 0.2 for "
+                             "binary TV and 0.05 for binary KL, matching the paper's scaling runs.")
+    parser.add_argument("--dppo-is-cap", type=float, default=5.0,
+                        help="DPPO stopped-gradient importance-weight cap C. The paper's scaling "
+                             "experiments use C=5.")
+    parser.add_argument("--echo-alpha", type=float, default=0.0,
+                        help="ECHO environment-prediction CE weight. For one-shot Sokoban, append the "
+                             "simulator's final board after each submitted move string and train only "
+                             "those observation tokens with length-normalized CE. 0 disables ECHO.")
     parser.add_argument("--clip-eps-low", type=float, default=None,
                         help="Lower clip epsilon for grpo/gspo (ratio floored at 1-eps_low). Default "
                              "resolves per loss: grpo 0.2 (PPO/GRPO), gspo 3e-4 (the GSPO paper scale — "
@@ -3943,7 +4109,7 @@ def build_parser() -> argparse.ArgumentParser:
                              "over valid tokens, aggregated with the SAME per-prompt/per-sample/per-token "
                              "denominator as the policy loss. Back-props through the policy logprobs only "
                              "(behavior detached). 0.0 (default) disables it (byte-identical). Active only "
-                             "when behavior logprobs are present (the CISPO branch). prime-rl's default is 1e-3.")
+                             "when behavior logprobs are present. prime-rl's default is 1e-3.")
     parser.add_argument("--max-model-len", type=int, default=8192,
                         help="vLLM max_model_len (prompt + generation) for the generators; must cover "
                              "prompt (~700) + --max-new-tokens (6144).")
@@ -4033,6 +4199,15 @@ def _resolve_loss_args(args: argparse.Namespace) -> None:
         if args.cispo_eps is None or args.cispo_eps <= 0:
             raise ValueError("--cispo-eps must be positive for --loss-fn cispo")
         return
+    if args.loss_fn == "dppo":
+        if args.dppo_delta is None:
+            args.dppo_delta = 0.2 if args.dppo_divergence == "binary_tv" else 0.05
+        if args.dppo_delta <= 0:
+            raise ValueError("--dppo-delta must be positive for --loss-fn dppo")
+        if args.dppo_is_cap <= 0:
+            raise ValueError("--dppo-is-cap must be positive for --loss-fn dppo")
+        args.clip_ratio_c = None
+        return
     if args.loss_fn == "grpo":
         if args.clip_eps_low is None:
             args.clip_eps_low = 0.2
@@ -4065,6 +4240,8 @@ def _validate_pipeline_args(args: argparse.Namespace) -> None:
         raise ValueError("--adam-eps must be positive")
     if args.entropy_coef < 0:
         raise ValueError("--entropy-coef must be >= 0")
+    if args.echo_alpha < 0:
+        raise ValueError("--echo-alpha must be >= 0")
     if not (0.0 <= args.adv_centered_blend <= 1.0):
         raise ValueError("--adv-centered-blend must be in [0, 1]")
     if not (0.0 <= args.adv_difficulty_ramp <= 1.0):
