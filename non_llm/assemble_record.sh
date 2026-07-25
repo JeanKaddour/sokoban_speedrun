@@ -19,6 +19,10 @@
 #   RUN=<VRUN> VERIFY_OF=records/<date>_01_<name> ./assemble_record.sh
 #   (seed is read from the run log; add VERIFIER="@me  PR#12" to attribute, or TRAIN_SEED= to override)
 #
+# A run dir relaunched under the same name holds one log_<hex>.txt per attempt; the newest is used.
+# Set LOG_NAME=log_<hex>.txt to assemble from a specific attempt (required with SOURCE=modal, whose
+# volume listing carries no timestamps).
+#
 # Collects only the record artifacts (not the multi-MB checkpoint): the run log, eval JSON, and source
 # snapshot, renamed to the seed convention, then regenerates the record report + verifies
 # (verify_record checks submission AND verification). A submission also inserts/refreshes this record's
@@ -32,6 +36,7 @@ EVAL_SEED="${EVAL_SEED:-12345}"  # pinned eval seed (the JSON's sampling.seed / 
 STEP="${STEP:-}"                 # optional eval checkpoint step; inferred from eval artifacts if unset
 SOURCE="${SOURCE:-local}"        # local | modal — where the run artifacts live
 LOCAL_OUTPUTS="${LOCAL_OUTPUTS:-outputs}"  # base dir for local runs (SOURCE=local)
+LOG_NAME="${LOG_NAME:-}"         # explicit log_<hex>.txt to assemble from (default: newest attempt)
 VOL="${VOL:-nanochat-rl-hf}"     # shared with the LLM track (see modal_app_non_llm.VOLUME_NAME)
 VERIFY_OF="${VERIFY_OF:-}"       # if set, assemble as the verification of this record dir
 VERIFIER="${VERIFIER:-}"         # one-line attribution written to verification/verifier.txt
@@ -67,7 +72,7 @@ else
     exit 1
   }
   echo ">> local run dir: $run_dir"
-  listing="$(ls -1 "$run_dir")"
+  listing="$(ls -1t "$run_dir")"   # newest first, so the log pick below lands on the latest attempt
 fi
 fetch() {  # <relpath under the run dir> -> $stage/ (preserving subdirs)
   mkdir -p "$stage/$(dirname "$1")"
@@ -79,8 +84,28 @@ fetch() {  # <relpath under the run dir> -> $stage/ (preserving subdirs)
 }
 
 printf '%s\n' "$listing"
-log_name="$(printf '%s\n' "$listing" | grep -oE 'log_[0-9a-f]{8}\.txt' | head -1 || true)"
+# RunLogger opens a FRESH log_<uuid4-hex8>.txt per attempt, so a run dir that was relaunched
+# under the same name still holds the crashed attempt's log (that is deliberate — metrics.jsonl
+# is appended for the same reason). The hex carries no ordering, so picking the first match
+# assembles the record from an arbitrary attempt. Prefer the most recent one.
+logs="$(printf '%s\n' "$listing" | grep -oE 'log_[0-9a-f]{8}\.txt' || true)"
+n_logs="$(printf '%s\n' "$logs" | grep -c . || true)"
+if [ -n "$LOG_NAME" ]; then
+  printf '%s\n' "$logs" | grep -qxF "$LOG_NAME" || {
+    echo "ERROR: LOG_NAME='$LOG_NAME' is not under $SOURCE run $RUN"; exit 1; }
+  log_name="$LOG_NAME"
+elif [ "$n_logs" -gt 1 ] && [ "$SOURCE" = modal ]; then
+  # The volume listing is names only — it carries no timestamps to order attempts by.
+  echo "ERROR: $n_logs attempt logs under /outputs/$RUN:"
+  printf '%s\n' "$logs" | sed 's/^/         /'
+  echo "       The volume listing has no timestamps, so the latest attempt cannot be picked"
+  echo "       automatically. Re-run with LOG_NAME=<log_xxxxxxxx.txt> to choose one."
+  exit 1
+else
+  log_name="$(printf '%s\n' "$logs" | head -1)"   # listing is newest-first for SOURCE=local
+fi
 [ -n "$log_name" ] || { echo "ERROR: no log_*.txt under $SOURCE run $RUN"; exit 1; }
+[ "$n_logs" -gt 1 ] && echo ">> note: $n_logs attempts in this run dir — using $log_name"
 echo ">> run log: $log_name"
 
 if [ -n "$STEP" ]; then

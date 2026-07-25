@@ -20,6 +20,10 @@
 #   RUN=<VRUN> VERIFY_OF=records/<date>_01_<name> ./assemble_record.sh
 #   (seed is read from the run log; add VERIFIER="@me  PR#12" to attribute, or TRAIN_SEED= to override)
 #
+# A run dir relaunched under the same name holds one log_<hex>.txt per attempt; the newest is used.
+# Set LOG_NAME=log_<hex>.txt to assemble from a specific attempt (required with SOURCE=modal, whose
+# volume listing carries no timestamps).
+#
 # Collects only the record artifacts (not the multi-GB checkpoint), including the source snapshot
 # when present, renames to the seed convention, then regenerates the record report + verifies
 # (verify_record checks submission AND verification). A submission also inserts/refreshes this
@@ -34,6 +38,7 @@ STEP="${STEP:-}"                 # optional eval checkpoint step; inferred from 
 SOURCE="${SOURCE:-local}"        # local | modal — where the run artifacts live
 LOCAL_OUTPUTS="${LOCAL_OUTPUTS:-outputs}"  # base dir for local runs (SOURCE=local)
 EVAL_JSON="${EVAL_JSON:-}"       # SOURCE=local: explicit eval JSON path, overriding auto-detect
+LOG_NAME="${LOG_NAME:-}"         # explicit log_<hex>.txt to assemble from (default: newest attempt)
 VOL="${VOL:-nanochat-rl-hf}"
 VERIFY_OF="${VERIFY_OF:-}"       # if set, assemble as the verification of this record dir
 VERIFIER="${VERIFIER:-}"         # one-line attribution written to verification/verifier.txt
@@ -63,7 +68,24 @@ if [ "$SOURCE" = modal ]; then
   echo ">> volume listing /outputs/$RUN"
   volume_listing="$(modal volume ls "$VOL" "/outputs/$RUN")"
   printf '%s\n' "$volume_listing"
-  log_name="$(printf '%s\n' "$volume_listing" | grep -oE 'log_[0-9a-f]{8}\.txt' | head -1 || true)"
+  # A relaunch under the same run name writes a second log_<uuid4-hex8>.txt beside the crashed
+  # attempt's. The hex carries no ordering and the volume listing carries no timestamps, so an
+  # ambiguous dir has to be resolved explicitly rather than picked alphabetically.
+  logs="$(printf '%s\n' "$volume_listing" | grep -oE 'log_[0-9a-f]{8}\.txt' || true)"
+  n_logs="$(printf '%s\n' "$logs" | grep -c . || true)"
+  if [ -n "$LOG_NAME" ]; then
+    printf '%s\n' "$logs" | grep -qxF "$LOG_NAME" || {
+      echo "ERROR: LOG_NAME='$LOG_NAME' is not under /outputs/$RUN"; exit 1; }
+    log_name="$LOG_NAME"
+  elif [ "$n_logs" -gt 1 ]; then
+    echo "ERROR: $n_logs attempt logs under /outputs/$RUN:"
+    printf '%s\n' "$logs" | sed 's/^/         /'
+    echo "       The volume listing has no timestamps, so the latest attempt cannot be picked"
+    echo "       automatically. Re-run with LOG_NAME=<log_xxxxxxxx.txt> to choose one."
+    exit 1
+  else
+    log_name="$(printf '%s\n' "$logs" | head -1)"
+  fi
   [ -n "$log_name" ] || { echo "ERROR: no log_*.txt under /outputs/$RUN"; exit 1; }
   echo ">> run log: $log_name"
 
@@ -111,9 +133,20 @@ else
     exit 1
   }
   echo ">> local run dir: $run_dir"
-  log_path="$(ls -1 "$run_dir"/log_*.txt 2>/dev/null | head -1 || true)"
+  # Newest first: a relaunch reusing the run name leaves the crashed attempt's log in place,
+  # and its uuid4 hex sorts arbitrarily against the real one (same idiom as the eval pick below).
+  log_path="$(ls -1t "$run_dir"/log_*.txt 2>/dev/null | head -1 || true)"
+  if [ -n "$LOG_NAME" ]; then
+    log_path="$run_dir/$LOG_NAME"
+    [ -f "$log_path" ] || { echo "ERROR: LOG_NAME='$LOG_NAME' is not in $run_dir"; exit 1; }
+  fi
   [ -n "$log_path" ] || { echo "ERROR: no log_*.txt in $run_dir"; exit 1; }
+  n_logs=0
+  for f in "$run_dir"/log_*.txt; do
+    if [ -f "$f" ]; then n_logs=$((n_logs + 1)); fi
+  done
   log_name="$(basename "$log_path")"
+  [ "$n_logs" -gt 1 ] && echo ">> note: $n_logs attempts in this run dir — using $log_name"
   echo ">> run log: $log_name"
 
   # Eval usually lands in a sibling dir (e.g. <RUN>-final-eval) named eval_step<N>.json with no seed
