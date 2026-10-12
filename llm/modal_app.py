@@ -69,31 +69,10 @@ app = modal.App(APP_NAME)
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 
 
-def _dotenv_values(path: str) -> dict[str, str]:
-    """Minimal .env parser (`KEY=VALUE` / `export KEY=VALUE`), read locally at launch time."""
-    values: dict[str, str] = {}
-    if not os.path.exists(path):
-        return values
-    with open(path) as fh:
-        for raw in fh:
-            line = raw.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            if line.startswith("export "):
-                line = line[len("export "):]
-            key, val = line.split("=", 1)
-            values[key.strip()] = val.strip().strip('"').strip("'")
-    return values
-
-
-# Forward ONLY what the training container needs — HF for fast model downloads, W&B for logging.
-# Read the local environment first, then fall back to the gitignored .env. (Deliberately excludes
-# the MODAL_* tokens in .env: the container doesn't need them.)
-_FORWARD_KEYS = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "WANDB_API_KEY", "WANDB_ENTITY")
-_dotenv = _dotenv_values(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
-_forward = {k: (os.environ.get(k) or _dotenv.get(k)) for k in _FORWARD_KEYS}
-_forward = {k: v for k, v in _forward.items() if v}
-runtime_secrets = [modal.Secret.from_dict(_forward)] if _forward else [
+# Declare the same dependency graph locally and remotely. Credential environment
+# variables are populated by Modal inside the container; branching on their
+# presence would change the number of Secret dependencies during remote import.
+runtime_secrets = [
     modal.Secret.from_name(os.environ.get("HF_SECRET_NAME", "huggingface-secret"),
                            required_keys=["HF_TOKEN"]),
     modal.Secret.from_name(os.environ.get("WANDB_SECRET_NAME", "wandb-secret"),
