@@ -83,12 +83,9 @@ WANDB_PROJECT = "sokoban-speedrun-llm"
 # --seed are deliberately NOT here (they vary per launch); --max-steps IS here (= the current
 # record's step count) so it stays a CLI override for probes and longer runs.
 # --eval-data stays in the recipe because --verify-datasets-only validates both train and eval sets.
-# TRAINER COUNT: the 8-GPU node runs NTRAINERS=3 (3 trainer ranks + 5 vLLM generators) — the sweet
-# spot: generation keeps the async buffer full while the trainer is compute-bound, and a 4th trainer
-# starves generation. That is a torchrun launch param, NOT a speedrun CLI arg, so modal_app.py
-# defaults it from the GPU count (3 on 8-GPU nodes, 1 on smaller boxes), not in this list. Local
-# record runs should use `cd llm` then
-# `NODE_GPUS=8 uv run torchrun --standalone --nproc_per_node=3 -m speedrun ...`.
+# TRAINER COUNT: four trainer ranks + four BF16-weight/FP8-KV vLLM generators on 8xH100.
+# This is a torchrun launch parameter, not a speedrun argument; modal_app.py defaults to four.
+# Local: `NODE_GPUS=8 uv run torchrun --standalone --nproc_per_node=4 -m speedrun`.
 RECIPE = [
     "--dtype", "float32",       # load trainer params/head fp32; train autocast runs body bf16, head/logits fp32
     "--train-data", "datasets/sokoban_train.jsonl",
@@ -100,7 +97,7 @@ RECIPE = [
     "--max-new-tokens", "4800",  # record 5: shorter thinking budget is the speed lever (~32.5s/step vs ~39s)
     "--max-model-len", "6144",
     "--device-batch-size", "2",   # 4B fp32 params+grads+optimizer fit one 80GB H100 at db=2 (microbatch only, grad-identical)
-    "--logits-chunk-size", "2048",
+    "--logits-chunk-size", "1024",
     "--gradient-checkpointing",
     "--no-log-entropy",           # the entropy softmax temp would OOM 4B at the memory ceiling
     "--interruption",
@@ -111,14 +108,15 @@ RECIPE = [
     "--lr-schedule", "linear",
     "--min-lr-frac", "0.15",
     "--lr-decay-steps", "60",
-    "--max-steps", "35",          # the record's step count; override on the CLI for probes/longer runs
+    "--max-steps", "33",
     "--grad-clip", "1.0",
-    "--loss-fn", "cispo",        # record 6: CISPO (advantage-mode auto-resolves to 'centered')
+    "--loss-fn", "reinforce",    # no importance weighting; keep the record's shaped advantages
+    "--advantage-mode", "centered",
     "--adv-centered-blend", "0.04",    # record 6: Weco advantage shaping (see shape_group_advantages)
     "--adv-difficulty-weight", "0.18",
     "--adv-difficulty-ramp", "1.0",
+    "--adv-difficulty-schedule-steps", "35",  # stop early without compressing the ramp
     "--adv-variance-boost", "1.1",
-    "--cispo-eps", "4.0",
     "--loss-normalization", "sequence",  # sample-level objective normalization.
     "--max-staleness", "4",          # less off-policy than ScaleRL's 8; a proven stability lever
     "--inflight-requests", "64",     # outstanding-group tickets, reissued at CONSUME time: pins total unconsumed
@@ -127,12 +125,17 @@ RECIPE = [
                                      # generating; the rest of the old 96 sat finished in result_q) and the engine
                                      # still sees up to 64*8 = 512 seqs = --vllm-max-num-seqs at cold start.
     "--vllm-gpu-mem-util", "0.9",
+    "--vllm-kv-cache-dtype", "fp8",  # sampler weights remain BF16
+    "--behavior-logprobs-mode", "processed",  # mismatch diagnostics only for REINFORCE
     "--vllm-stream-interval", "8",   # buffer token streaming to cut host/IPC overhead; no sampling/budget change
     "--vllm-max-num-batched-tokens", "8192",
     "--vllm-max-num-seqs", "512",
     "--save-every", "0",
     "--save-final",
-    "--wandb-rollout-samples", "20",  # rollouts/step logged to the wandb "rollouts_live" + final "rollouts" tables
+    "--no-wandb",
+    "--no-save-rollouts",
+    "--final-rollout-steps", "0",
+    "--wandb-rollout-samples", "0",
 ]
 # ============================================================================================
 # ============================ SOKOBAN DOMAIN: prompt, answer extraction, scoring, dataset ============================
@@ -610,6 +613,7 @@ VLLM_TUNE_KEYS = (
     "scheduler_reserve_full_isl",
     "stream_interval",
     "performance_mode",
+    "kv_cache_dtype",
 )
 
 
@@ -627,6 +631,7 @@ def build_async_engine(
     gpu_memory_utilization: float = 0.85,
     seed: int = 0,
     enforce_eager: bool = False,
+    logprobs_mode: str = "raw_logprobs",
     **tuning,
 ):
     """Construct the in-process vLLM AsyncLLM with native NCCL weight transfer enabled.
@@ -653,12 +658,9 @@ def build_async_engine(
         "enable_log_requests": False,
         "seed": seed,
         "weight_transfer_config": WeightTransferConfig(backend="nccl"),
-        # CISPO behavior logprobs must be PRE-temperature/top-p (the trainer recomputes
-        # log pi at temperature 1.0, so the IS ratio is only consistent against raw
-        # logprobs). This is vLLM's current default; pin it so an upstream default flip
-        # to processed_logprobs can't silently bake a temperature offset into every IS
-        # weight and the mismatch/ESS diagnostics.
-        "logprobs_mode": "raw_logprobs",
+        # Raw remains the engine default for historical CISPO/eval. The REINFORCE
+        # recipe logs the actual sampling distribution for diagnostics, not weighting.
+        "logprobs_mode": logprobs_mode,
     }
     engine_kwargs.update({key: value for key, value in tuning.items() if value is not None})
     engine_args = AsyncEngineArgs(**engine_kwargs)
@@ -957,6 +959,7 @@ async def _child_main_async(cfg, prompt_q, result_q, control_q, status_q):
         gpu_memory_utilization=cfg["gpu_memory_utilization"],
         seed=cfg["seed"],
         enforce_eager=cfg.get("enforce_eager", False),
+        logprobs_mode=cfg.get("logprobs_mode", "raw_logprobs"),
         **{key: cfg.get(key) for key in VLLM_TUNE_KEYS},
     )
     state = {"weight_version": 0, "paused": False, "stop": False}
@@ -1827,7 +1830,7 @@ def policy_gradient_loss_from_token_logprobs(
 ) -> torch.Tensor:
     """Each loss variant builds a per-token OBJECTIVE tensor J (to be maximized); the
     token/sequence/prompt aggregation below is shared and identical across variants.
-    CISPO is the only variant whose J is zero at IGNORE positions by construction
+    CISPO and REINFORCE have J zero at IGNORE positions by construction
     (token_logprobs is masked to 0 there); grpo/gspo objectives are exp(log_ratio)-shaped,
     which is A (not 0) at IGNORE positions (pads, injected interruption markers, where
     behavior holds 0.0 placeholders), so they MUST be explicitly masked."""
@@ -1843,7 +1846,12 @@ def policy_gradient_loss_from_token_logprobs(
     if behavior_logprobs is not None:
         log_ratio = token_logprobs - behavior_logprobs.to(token_logprobs.dtype)
         valid = labels != IGNORE_INDEX
-        if loss_fn == "cispo":
+        if loss_fn == "reinforce":
+            # Group-centered, shaped advantages; behavior probabilities are diagnostic
+            # only. No importance ratio, clipping, or differentiated gate in the loss.
+            per_token_objective = token_logprobs * advantage_weight
+            clip_active = torch.zeros_like(valid)
+        elif loss_fn == "cispo":
             if cispo_eps is None or cispo_eps <= 0:
                 raise ValueError("cispo_eps must be a positive float for the cispo loss")
             # CISPO: stop-grad clipped importance weight min(rho, eps_max) multiplies the
@@ -2069,6 +2077,7 @@ def shape_group_advantages(
     *,
     step: int,
     num_steps: int,
+    schedule_steps: int | None = None,
     centered_blend: float = 0.0,
     difficulty_weight: float = 0.0,
     difficulty_ramp: float = 1.0,
@@ -2082,7 +2091,8 @@ def shape_group_advantages(
        reward-centered signal, re-injecting the reward-scale information the grpo per-group
        std division discards.
     2. difficulty_weight w: adv *= 1 + w*ramp*(1 - mean(r)) with ramp = (1-difficulty_ramp)
-       + difficulty_ramp*(step+1)/num_steps — up-weights hard (low-mean-reward) groups for
+       + difficulty_ramp*(step+1)/horizon, where horizon is schedule_steps if set,
+       otherwise num_steps — up-weights hard (low-mean-reward) groups for
        w > 0, increasingly so through training when difficulty_ramp is 1.
     3. variance_boost v: adv *= 1 + v*var(r) (unbiased) — up-weights mixed success/failure
        groups, prioritizing the learning frontier where the model is uncertain.
@@ -2090,11 +2100,13 @@ def shape_group_advantages(
     The scales in 2/3 are >= 1 for non-negative w/v and the blend in 1 preserves each
     group's signal/no-signal status, so the zero-variance filter's group_has_signal(rewards)
     decision is unaffected by shaping."""
+    if schedule_steps is not None and schedule_steps < 1:
+        raise ValueError("schedule_steps must be positive")
     out = advantages
     if centered_blend:
         out = (1.0 - centered_blend) * out + centered_blend * (rewards - rewards.mean())
     if difficulty_weight:
-        progress = (step + 1) / max(1, num_steps)
+        progress = (step + 1) / max(1, num_steps if schedule_steps is None else schedule_steps)
         ramp = (1.0 - difficulty_ramp) + difficulty_ramp * progress
         out = out * (1.0 + difficulty_weight * ramp * (1.0 - rewards.mean()))
     if variance_boost and rewards.numel() > 1:
@@ -2730,10 +2742,11 @@ def run_pipeline(
         visible = layout.visible_gpus
         cfg = dict(
             model=args.model, num_dp=vllm_dp,
-            dtype="bfloat16",  # vLLM generates in bf16; the trainer may be fp32 (CISPO + FP32 logits head absorb the mismatch)
+            dtype="bfloat16",  # sampler weights remain BF16 even with FP8 KV cache
             max_model_len=args.max_model_len, gpu_memory_utilization=args.vllm_gpu_mem_util,
             seed=args.seed, inflight=args.inflight_requests, visible_gpus=visible,
             enforce_eager=args.vllm_enforce_eager,
+            logprobs_mode=f"{args.behavior_logprobs_mode}_logprobs",
             **vllm_tuning_from_args(args),
         )
         child = ctx.Process(target=engine_child_main, args=(cfg, prompt_q, result_q, control_q, status_q))
@@ -2933,6 +2946,7 @@ def run_pipeline(
             adv = compute_group_advantages(rewards_t, args.advantage_mode)
             adv = shape_group_advantages(
                 rewards_t, adv, step=step, num_steps=num_steps,
+                schedule_steps=args.adv_difficulty_schedule_steps,
                 centered_blend=args.adv_centered_blend,
                 difficulty_weight=args.adv_difficulty_weight,
                 difficulty_ramp=args.adv_difficulty_ramp,
@@ -3691,6 +3705,8 @@ def _add_vllm_tuning_args(parser: argparse.ArgumentParser, *, prefix: str, ctx: 
     parser.add_argument(flag("performance_mode"), choices=["balanced", "interactivity", "throughput"],
                         default=None,
                         help=f"Optional vLLM performance_mode for {ctx}. Unset preserves vLLM's default.")
+    parser.add_argument(flag("kv_cache_dtype"), choices=["auto", "bfloat16", "fp8"], default=None,
+                        help=f"KV-cache precision for {ctx}; does not quantize model weights.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3876,8 +3892,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="After each optimizer step (first few steps), assert all trainer-rank "
                              "model replicas are bit-identical via an all-reduce MIN==MAX checksum. "
                              "Debug guard; small overhead. No-op at world_size==1.")
-    parser.add_argument("--loss-fn", choices=["cispo", "grpo", "gspo"], default="cispo",
-                        help="Policy loss. 'cispo' (default, record 1): stop-grad clipped IS weight times "
+    parser.add_argument("--loss-fn", choices=["reinforce", "cispo", "grpo", "gspo"], default="cispo",
+                        help="Policy loss. 'reinforce': advantage times log-prob without importance "
+                             "weighting. 'cispo': stop-grad clipped IS weight times "
                              "log-prob — clipped tokens keep a capped gradient. 'grpo': PPO-clip surrogate "
                              "(gradient through the ratio; clipped tokens get ZERO gradient), DAPO = grpo + "
                              "--clip-eps-high 0.28 + --loss-normalization token. 'gspo': length-normalized "
@@ -3911,6 +3928,13 @@ def build_parser() -> argparse.ArgumentParser:
                              "is w*((1-ramp) + ramp*(step+1)/num_steps). In [0, 1]; 1.0 (default) "
                              "ramps from ~0 to full strength across the run, 0.0 applies w at full "
                              "strength from step 1.")
+    parser.add_argument("--adv-difficulty-schedule-steps", type=int, default=None,
+                        help="Fixed difficulty-ramp horizon, independent of early stopping. "
+                             "Defaults to the actual number of training steps.")
+    parser.add_argument("--behavior-logprobs-mode", choices=["raw", "processed"], default="raw",
+                        help="Sampler log-probability convention. Raw preserves historical CISPO; "
+                             "processed includes sampling transforms. REINFORCE uses these "
+                             "only for diagnostics when --kl-tau is zero.")
     parser.add_argument("--adv-variance-boost", type=float, default=0.0,
                         help="Advantage shaping: scale each group's advantages by "
                              "1 + v*var(rewards) (unbiased sample variance), boosting mixed "
@@ -4029,6 +4053,9 @@ def _resolve_loss_args(args: argparse.Namespace) -> None:
         args.advantage_mode = "grpo" if args.loss_fn == "grpo" else "centered"
     if args.clip_ratio_c is not None and args.clip_ratio_c <= 0:
         args.clip_ratio_c = None  # documented disable switch
+    if args.loss_fn == "reinforce":
+        args.clip_ratio_c = None
+        return
     if args.loss_fn == "cispo":
         if args.cispo_eps is None or args.cispo_eps <= 0:
             raise ValueError("--cispo-eps must be positive for --loss-fn cispo")
@@ -4069,6 +4096,8 @@ def _validate_pipeline_args(args: argparse.Namespace) -> None:
         raise ValueError("--adv-centered-blend must be in [0, 1]")
     if not (0.0 <= args.adv_difficulty_ramp <= 1.0):
         raise ValueError("--adv-difficulty-ramp must be in [0, 1]")
+    if args.adv_difficulty_schedule_steps is not None and args.adv_difficulty_schedule_steps < 1:
+        raise ValueError("--adv-difficulty-schedule-steps must be positive")
     if args.interrupt_min_tokens is not None or args.interrupt_max_tokens is not None:
         if not args.interruption:
             raise ValueError("--interrupt-min-tokens/--interrupt-max-tokens require --interruption")

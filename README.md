@@ -42,8 +42,8 @@ Fastest wall-clock run wins: one run on one 8xH100 node, from training step 1 th
 ```bash
 cd llm
 uv sync
-NODE_GPUS=8 uv run torchrun --standalone --nproc_per_node=3 -m speedrun
-uv run python -m eval_speedrun --eval-checkpoint outputs/<run>/step_000051
+NODE_GPUS=8 uv run torchrun --standalone --nproc_per_node=4 -m speedrun
+uv run python -m eval_speedrun --eval-checkpoint outputs/<run>/step_000032
 ```
 
 ## Non-LLM Track

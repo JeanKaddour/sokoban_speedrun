@@ -595,8 +595,8 @@ TRACKS = {
         "lb_out": "assets/llm_records.png",
         "reproduce": [
             "# train on one 8xH100 node (the recipe is baked into speedrun.py's RECIPE — no recipe flags)",
-            "NODE_GPUS=8 uv run torchrun --standalone --nproc_per_node=3 -m speedrun -- "
-            "--run <run> --seed <seed> --no-wandb --no-save-rollouts --final-rollout-steps 0",
+            "NODE_GPUS=8 uv run torchrun --standalone --nproc_per_node=4 -m speedrun "
+            "--run <run> --seed <seed>",
             "# eval the final checkpoint under the leaderboard protocol, then verify offline",
             "uv run python -m eval_speedrun --run <run>-final-eval "
             "--eval-checkpoint outputs/<run>/step_<final> --eval-k 8 --eval-seed 12345 "
