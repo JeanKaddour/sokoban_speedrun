@@ -25,6 +25,7 @@ Fastest recipes to RL models to solve Sokoban to a held-out target on one node:
 | 5 | 26:27 | rollout budget 5632 → 4800 tokens, 48 steps | 2026-07-02 | [llm/records/2026-07-02_03](llm/records/2026-07-02_03_grpo_48step/) | 0.815 | @lorenzflow |
 | 6 | 25:51 | GRPO → CISPO, same 48-step recipe | 2026-07-14 | [llm/records/2026-07-14_01](llm/records/2026-07-14_01_weco_cispo_48step/) | 0.804 | @lorenzflow |
 | 7 | 19:20 | earlier stop: 35 CISPO steps | 2026-07-15 | [llm/records/2026-07-15_01](llm/records/2026-07-15_01_weco_cispo_35step/) | 0.824 | @lorenzflow |
+| 8 | 17:02 | REINFORCE, FP8 KV cache, 4+4 topology, 33 steps | 2026-10-12 | [llm/records/2026-10-12_01](llm/records/2026-10-12_01_reinforce_fp8_33step/) | 0.817 | @lorenzflow |
 
 ### Rules
 

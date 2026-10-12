@@ -1,0 +1,1 @@
+@lorenzflow; independent seed43 rerun of the same baked 33-step REINFORCE recipe on Modal 8xH100, four trainers + four generators
