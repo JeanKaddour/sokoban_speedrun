@@ -248,5 +248,3 @@ uv run python verify_record.py records/2026-10-12_01_reinforce_fp8_33step
 ```
 
 <!-- END AUTO-GENERATED -->
-
-
