@@ -38,9 +38,8 @@ CPU_REQUEST = float(os.environ.get("CPU_REQUEST", "16"))
 # NUM_GPUS is resolved from the launch shell, then baked into the image env as NODE_GPUS (see
 # `image` below): the container re-imports this module with no launch env, so without the bake the
 # remote eval_commands/--eval-vllm-dp and speedrun's trainer/generator split would silently
-# mismatch the box. Default 8 = the 4B node: NTRAINERS defaults to 3 (3 trainers + 5 vLLM
-# generators) — the confirmed sweet spot (generation keeps the async buffer full at gen-wait ~3s
-# while the trainer is compute-bound at ~35s/step; nt4 drops to 4 generators and goes gen-bound).
+# mismatch the box. Default 8 = four trainers + four vLLM generators,
+# with FP8 KV cache enabled by speedrun.RECIPE to help the rollout side keep up.
 # A smaller NUM_GPUS (e.g. 4) just changes the split and defaults NTRAINERS to 1.
 def _strict_h100_type(raw: str) -> str:
     # Modal's plain H100 request can auto-upgrade to H200; H100! opts out for benchmark runs.
@@ -70,31 +69,15 @@ app = modal.App(APP_NAME)
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 
 
-def _dotenv_values(path: str) -> dict[str, str]:
-    """Minimal .env parser (`KEY=VALUE` / `export KEY=VALUE`), read locally at launch time."""
-    values: dict[str, str] = {}
-    if not os.path.exists(path):
-        return values
-    with open(path) as fh:
-        for raw in fh:
-            line = raw.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            if line.startswith("export "):
-                line = line[len("export "):]
-            key, val = line.split("=", 1)
-            values[key.strip()] = val.strip().strip('"').strip("'")
-    return values
-
-
-# Forward ONLY what the training container needs — HF for fast model downloads, W&B for logging.
-# Read the local environment first, then fall back to the gitignored .env. (Deliberately excludes
-# the MODAL_* tokens in .env: the container doesn't need them.)
-_FORWARD_KEYS = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "WANDB_API_KEY", "WANDB_ENTITY")
-_dotenv = _dotenv_values(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
-_forward = {k: (os.environ.get(k) or _dotenv.get(k)) for k in _FORWARD_KEYS}
-_forward = {k: v for k, v in _forward.items() if v}
-runtime_secrets = [modal.Secret.from_dict(_forward)] if _forward else []
+# Declare the same dependency graph locally and remotely. Credential environment
+# variables are populated by Modal inside the container; branching on their
+# presence would change the number of Secret dependencies during remote import.
+runtime_secrets = [
+    modal.Secret.from_name(os.environ.get("HF_SECRET_NAME", "huggingface-secret"),
+                           required_keys=["HF_TOKEN"]),
+    modal.Secret.from_name(os.environ.get("WANDB_SECRET_NAME", "wandb-secret"),
+                           required_keys=["WANDB_API_KEY", "WANDB_ENTITY"]),
+]
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -107,7 +90,7 @@ image = (
         # re-import resolves NUM_GPUS from it (the launch shell's NUM_GPUS never reaches Modal).
         "NODE_GPUS": str(NUM_GPUS),
     })
-    .add_local_python_source("speedrun")
+    .add_local_python_source("speedrun", "eval_speedrun")
 )
 
 
@@ -575,15 +558,14 @@ def main() -> None:
                         eval_vllm_max_num_seqs, eval_concurrency, eval_data)
         return
     # NTRAINERS=1 => single trainer + NUM_GPUS-1 vLLM; NTRAINERS=2 => 2 trainers + the rest (torchrun), etc.
-    # Default NTRAINERS=3 on the 8-GPU benchmark node: it is trainer-bound at inflight 96, so 3
-    # trainers is the sweet spot (~30% faster per step than 2 — fewer microbatches per rank). On
-    # smaller boxes default to 1 trainer (3 trainers + 1 generator would starve generation).
+    # The record uses four trainers and four generators on 8xH100. Smaller boxes
+    # retain the single-trainer fallback; they are not qualifying record hardware.
     # Trainer count is a torchrun launch param (not a speedrun CLI arg), so it lives here; the rest
     # of the recipe is speedrun.py RECIPE.
     # Bare launch runs speedrun.py's RECIPE. Set MAX_STEPS only for probes, smoke tests, or longer runs.
     max_steps_env = os.environ.get("MAX_STEPS")
     max_steps = int(max_steps_env) if max_steps_env else None
-    num_trainers = int(os.environ.get("NTRAINERS", "3" if NUM_GPUS >= 8 else "1"))
+    num_trainers = int(os.environ.get("NTRAINERS", "4" if NUM_GPUS >= 8 else "1"))
     extra_args = shlex.split(os.environ.get("EXTRA_ARGS", ""))
     # MODEL overrides the RECIPE/argparse base model (default Qwen/Qwen3-4B-Instruct-2507). Prepended
     # so an explicit --model in EXTRA_ARGS still wins (argparse last-wins).
